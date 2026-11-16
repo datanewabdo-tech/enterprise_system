@@ -1,0 +1,6 @@
+{
+  "name": "Enterprise Data Management, Mapping & Analytics Dashboard",
+  "description": "Enterprise-grade web application for managing, importing, visualizing, filtering, and analyzing structured mission-related datasets with maps, analytics, and bilingual Arabic/English support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

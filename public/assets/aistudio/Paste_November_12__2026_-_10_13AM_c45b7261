@@ -1,0 +1,1368 @@
+Project: Enterprise Data Management, Mapping & Analytics Dashboard
+1. Project Overview
+
+Build a complete, modern, enterprise-grade web application for managing, importing, visualizing, filtering, and analyzing structured mission-related datasets.
+
+The application must be built using:
+
+Frontend: React.js with TypeScript.
+Backend: Node.js with Express.js and TypeScript.
+Database: PostgreSQL.
+ORM: Prisma.
+Frontend styling: Tailwind CSS with shadcn/ui.
+Charts: Apache ECharts or Recharts.
+Maps: Leaflet with OpenStreetMap.
+Data processing: ExcelJS and CSV Parser.
+Authentication: JWT with secure session management.
+Deployment: Docker and Docker Compose.
+Reverse proxy: Nginx.
+
+The application must be fully Dockerized, including the frontend, backend, PostgreSQL database, and Nginx.
+
+The application should have a professional enterprise dashboard design, with a modern interface, responsive layouts, reusable components, and an intuitive navigation system.
+
+All data operations must be restricted to authorized datasets and users. Implement privacy controls, role-based access, audit logs, and configurable data retention policies.
+
+2. Main Application Layout
+
+Create a professional dashboard with:
+
+Sidebar Navigation
+
+The sidebar should contain the following sections:
+
+Dashboard
+Missions
+Registrations
+Targets
+Mission Extras
+Location Extras
+Mission Files
+Location Files
+Network Cells
+WiFi Access Points
+WiFi Access Point Clients
+GPS History
+Map Cell Databases
+Map Cells
+PLMN Storage
+SMS & Calls Records
+Map User Markers
+Map User Polygons
+Map User Circles
+Target Files
+Whitelist Targets
+TAC Numbers
+Scheduled Tasks
+Map Layers
+Interactive Map
+Analytics & Charts
+Data Import Center
+Data Export Center
+User Management
+Audit Logs
+Application Settings
+
+Each database table must have its own dedicated page.
+
+The sidebar must support:
+
+Expandable and collapsible sections.
+Icons for each section.
+Active page highlighting.
+Searchable navigation.
+Responsive mobile navigation.
+Arabic and English labels.
+Top Navigation Bar
+
+Include:
+
+Global search.
+Notifications.
+Current user profile.
+Language switcher (English / العربية).
+Light and dark mode.
+Quick import button.
+Breadcrumb navigation.
+3. Database Architecture
+
+Use PostgreSQL as the primary database.
+
+Create all the following tables with proper relationships, constraints, indexes, and migration scripts.
+
+Preserve the original columns and data types where possible. Do not discard columns represented by ellipses in the supplied schema; identify them from the original database during migration.
+
+Table 1: missions
+
+Columns:
+
+id
+mission
+location
+
+Page features:
+
+View all missions.
+Search by mission name.
+Filter by location.
+Add, edit, and delete missions.
+View mission details.
+View related records.
+Export mission data.
+Table 2: registrations
+
+Columns:
+
+id
+reg_id
+mission
+bts
+bts_name
+country
+tmsi
+imsi
+imei
+ue_model
+Other original columns.
+bts_location
+bts_altitude
+bts_location_outdated
+distance_min
+distance_max
+country_code
+device_location
+last_seen
+update
+action
+
+Page features:
+
+Advanced multi-column filtering.
+Searchable and sortable table.
+Pagination.
+Column visibility controls.
+Date range filtering.
+Mission filtering.
+Country filtering.
+BTS filtering.
+Device model filtering.
+Export selected records.
+View individual record details.
+
+Treat device identifiers and location information as sensitive data. Apply field-level permissions and masking.
+
+Table 3: targets
+
+Columns:
+
+id
+mission
+mission_name
+imsi
+imei
+name
+action
+redirect_tech
+redirect_bsic
+redirect_channel
+description
+is_p_c_s1900
+
+Features:
+
+Search and filter.
+View details.
+Manage descriptive metadata.
+Import and export.
+Restrict access according to user permissions.
+Table 4: mission_extras
+
+Columns:
+
+id
+mission_name
+description
+
+Features:
+
+Manage additional mission information.
+Search and filter.
+Link records to missions.
+Table 5: location_extras
+
+Columns:
+
+id
+mission_id
+description
+
+Features:
+
+Manage location descriptions.
+Link records to missions.
+Table 6: mission_files
+
+Columns:
+
+id
+mission_extra_id
+file_path
+file_type
+original_file_name
+added_at
+
+Features:
+
+File upload and download.
+File previews where supported.
+File type filtering.
+Upload date filtering.
+File size information.
+Secure file storage.
+Table 7: location_files
+
+Columns:
+
+id
+location_extra_id
+file_path
+file_type
+original_file_name
+added_at
+
+Features:
+
+File management.
+Upload and download.
+Preview supported documents.
+Search and filtering.
+Table 8: network_cells
+
+Columns:
+
+id
+mission
+channel
+lac
+mcc
+mnc
+rx_lev
+cell_id
+rat
+bsic
+Other original columns.
+pci
+is_pcs1900
+rx_lev_dbm
+downlink
+dl_bandwidth
+latitude
+longitude
+direction
+is_neighbour
+cid_lac_mnc
+
+Features:
+
+Advanced filtering.
+Geographic data visualization in an authorized map view.
+Country and network metadata management.
+Chart summaries.
+Export functionality.
+Table 9: wifi_access_points
+
+Columns:
+
+id
+mission
+bssid
+essid
+enc
+channel
+first_seen
+last_seen
+strength
+hidden
+manufacturer
+wanted
+essid_bssid_id
+
+Features:
+
+Data management.
+Search and filtering.
+Manufacturer statistics.
+Encryption type statistics.
+Date-based filtering.
+Table 10: wifi_access_point_clients
+
+Columns:
+
+id
+wifi_access_point_essid_bssid
+mac
+first_seen
+last_seen
+wants
+manufacturer
+
+Features:
+
+View records.
+Search.
+Filtering.
+Relationship with WiFi access points.
+Table 11: gps_history
+
+Columns:
+
+id
+mission
+bts_id
+silent_target_reg_id
+timestamp
+latitude
+longitude
+dl_pow
+ul_pow
+distance_min
+distance_max
+time_dl
+
+Features:
+
+Historical data visualization.
+Date range filtering.
+Mission filtering.
+Location data quality indicators.
+Aggregated geographic statistics.
+
+Location data must only be displayed to authorized users for approved purposes. Do not implement live covert tracking or automatic target-following functionality.
+
+Table 12: map_cell_databases
+
+Columns:
+
+id
+mission
+name
+header
+color
+
+Features:
+
+Manage map database metadata.
+Color selection.
+Search and filtering.
+Table 13: map_cells
+
+Columns:
+
+id
+db_id
+contents
+lat
+lng
+mcc
+mnc
+lac
+cid
+mcc_mnc_junction
+address
+direction
+format_hex
+opening_angle
+radius
+sc_pci
+channel
+antenna_type
+
+Features:
+
+Geographic visualization.
+Search and filter.
+Import and export.
+Map display for authorized geographic datasets.
+Table 14: plmn_storage
+
+Columns:
+
+mcc
+mnc
+country
+code
+name
+
+Features:
+
+Search by country.
+Search by network code.
+Manage network metadata.
+Excel import/export.
+Table 15: sms_calls
+
+Columns:
+
+id
+sms_id
+call_id
+mission
+incoming
+is_sms
+source
+destination
+bts_id
+bts_name
+status
+sms_content
+timestamp
+
+Features:
+
+Search and filter authorized records.
+Filter by date.
+Filter by record type.
+Filter by status.
+Restrict access to sensitive content.
+Mask sensitive fields by default.
+Table 16: map_user_markers
+
+Columns:
+
+id
+mission
+direction
+type
+description
+image
+color
+width
+height
+latitude
+longitude
+timestamp
+
+Features:
+
+Marker metadata management.
+Custom colors.
+Image attachments.
+Description management.
+Map visualization.
+Table 17: map_user_polygons
+
+Columns:
+
+id
+mission
+points
+label
+color
+description
+timestamp
+
+Features:
+
+Store polygon geometry.
+Display polygon shapes.
+Edit descriptive metadata.
+Validate coordinates.
+Table 18: map_user_circles
+
+Columns:
+
+id
+mission
+lat
+lng
+radius
+label
+color
+description
+timestamp
+
+Features:
+
+Circle visualization.
+Metadata management.
+Radius validation.
+Table 19: target_files
+
+Columns:
+
+id
+target_id
+file_path
+file_type
+original_file_name
+added_at
+
+Features:
+
+Secure attachment management.
+File previews.
+Download permissions.
+Upload history.
+Table 20: whitelist_targets
+
+Columns:
+
+id
+name
+imsi
+imei
+
+Features:
+
+Search and filter.
+Manage authorized reference records.
+Import and export.
+Restricted identifier visibility.
+Table 21: tac_numbers
+
+Columns:
+
+id
+tac_id
+name
+tac
+
+Features:
+
+Search TAC records.
+Manage device metadata.
+Import and export.
+Table 22: scheduled_tasks
+
+Columns:
+
+id
+task_type
+execution_time
+json_params
+prettified_params
+status
+
+Features:
+
+View scheduled task metadata.
+Filter by task type and status.
+View execution history.
+Manage scheduling permissions.
+
+Do not execute arbitrary imported SQL, commands, or JSON instructions.
+
+Table 23: map_layers
+
+Columns:
+
+id
+name
+type
+path
+
+Features:
+
+Manage map layer metadata.
+Enable and disable display layers.
+Layer color and visibility settings.
+Support GeoJSON and other validated geographic formats.
+4. Interactive Map Page
+
+Create a dedicated full-screen interactive map.
+
+Use Leaflet with OpenStreetMap.
+
+The map should have:
+
+Full-screen mode.
+Zoom controls.
+Layer control.
+Searchable map interface.
+Coordinate display.
+Map legend.
+Map type selection.
+Marker and polygon visualization.
+Circle visualization.
+GeoJSON import.
+Map screenshot/export where supported.
+Geographic Data Import
+
+The application must support multiple geographic coordinate formats.
+
+Some datasets contain latitude and longitude in separate columns:
+
+latitude
+longitude
+
+Other datasets contain coordinates in a single text column, for example:
+
+30.0444;31.2357
+
+Implement a configurable coordinate parser supporting:
+
+Latitude/longitude columns.
+Semicolon-separated coordinates.
+Comma-separated coordinates.
+WKT POINT format.
+GeoJSON Point geometry.
+Optional coordinate formats identified through user-selected import mappings.
+
+Important:
+
+Validate latitude between -90 and 90.
+Validate longitude between -180 and 180.
+Detect invalid or missing coordinates.
+Allow the user to select coordinate order.
+Show a preview before importing.
+Report invalid records.
+Never silently swap latitude and longitude.
+
+The map should support displaying authorized geographic datasets with appropriate access controls.
+
+5. Data Import Center
+
+This is one of the most important modules.
+
+Create a dedicated Data Import Center supporting:
+
+Supported Formats
+Excel (.xlsx)
+Excel (.xls)
+CSV (.csv)
+SQLite (.db, .sqlite, .sqlite3)
+Excel Import
+
+Implement a multi-step import wizard:
+
+Step 1: Upload Excel file.
+
+Step 2: Display available sheets.
+
+Step 3: Select the destination database table.
+
+Step 4: Automatically detect column names.
+
+Step 5: Map Excel columns to database columns.
+
+Step 6: Preview the first 100 records.
+
+Step 7: Validate the data.
+
+Step 8: Show errors and warnings.
+
+Step 9: Confirm import.
+
+Step 10: Display import results.
+
+SQLite Import
+
+Allow users to upload an SQLite database.
+
+The application must:
+
+Inspect SQLite tables.
+Display table names.
+Display table structures.
+Show row counts.
+Allow selection of one or multiple tables.
+Map SQLite tables to PostgreSQL tables.
+Detect compatible column types.
+Preview records.
+Validate relationships.
+Import selected tables.
+Generate an import report.
+
+SQLite databases must be opened in read-only mode where possible.
+
+Never execute arbitrary SQL statements contained in uploaded files.
+
+Import Features
+Duplicate detection.
+Configurable duplicate handling.
+Insert-only mode.
+Update-existing mode.
+Insert-or-update mode.
+Transactional imports.
+Background processing for large datasets.
+Progress indicator.
+Cancel import.
+Error report download.
+Import history.
+Rollback where transactionally possible.
+Import logs.
+
+Do not load all records into browser memory.
+
+Use streaming or batch processing for large files.
+
+6. Data Export Center
+
+Create a centralized export module.
+
+Allow users to export:
+
+Entire tables.
+Filtered records.
+Selected records.
+Mission-related datasets.
+Map data.
+Chart data.
+
+Supported formats:
+
+Excel.
+CSV.
+JSON.
+GeoJSON for supported geographic records.
+
+Include export progress, audit logging, and permission checks.
+
+7. Dashboard Home Page
+
+Create a modern dashboard with useful statistics and visual summaries.
+
+Display:
+
+Summary Cards
+Total missions.
+Total registrations.
+Total targets.
+Total network cell records.
+Total GPS history records.
+Total files.
+Total imported datasets.
+Total records across supported tables.
+Charts
+Records by mission.
+Records by country.
+Records by date.
+Registrations over time.
+Network cells by RAT.
+Network cells by country.
+Records by data source.
+Import activity over time.
+File types distribution.
+Data quality statistics.
+Dashboard Features
+Date range selector.
+Mission filter.
+Refresh button.
+Export chart data.
+Customizable dashboard widgets.
+Loading skeletons.
+Empty states.
+Responsive layout.
+
+All statistics must be generated from actual PostgreSQL data, not hardcoded sample numbers.
+
+8. Analytics & Charts Page
+
+Create a separate analytics section.
+
+Use Apache ECharts or Recharts.
+
+Support:
+
+Bar charts.
+Line charts.
+Pie charts.
+Donut charts.
+Area charts.
+Heatmaps for non-sensitive aggregate statistics.
+Time-series charts.
+Comparative charts.
+
+Allow users to:
+
+Select a database table.
+Select a column.
+Select a grouping dimension.
+Select an aggregation function.
+Filter by date.
+Filter by mission.
+Generate charts dynamically.
+Save chart configurations.
+Export chart images and data.
+
+Implement server-side aggregation for large datasets.
+
+Do not expose sensitive identifiers in aggregate chart labels.
+
+9. Advanced Filtering System
+
+Every table page must have its own advanced filtering interface.
+
+Implement a reusable dynamic filter builder.
+
+Supported operators:
+
+Equals.
+Not equals.
+Contains.
+Does not contain.
+Starts with.
+Ends with.
+Greater than.
+Less than.
+Between.
+Is empty.
+Is not empty.
+Before date.
+After date.
+Date range.
+
+Support:
+
+Multiple filters.
+AND / OR conditions.
+Search across selected columns.
+Sorting by multiple columns.
+Pagination.
+Configurable page size.
+Column visibility.
+Saved filters.
+Reset filters.
+Export filtered results.
+
+All filtering and pagination should happen on the backend for large datasets.
+
+Use parameterized SQL queries to prevent SQL injection.
+
+10. Arabic and English Language Support
+
+The application must be fully bilingual.
+
+Use i18next with react-i18next.
+
+Support:
+
+English.
+Arabic.
+
+Important requirements:
+
+Complete translation of menus.
+Complete translation of page titles.
+Complete translation of forms.
+Complete translation of buttons.
+Complete translation of validation messages.
+Complete translation of tables.
+Complete translation of notifications.
+Complete translation of dialogs.
+Complete translation of dashboard charts.
+
+Arabic mode must automatically switch the entire application to RTL.
+
+English mode must automatically switch to LTR.
+
+Use appropriate Arabic-compatible fonts such as Cairo or Tajawal.
+
+The language selection must persist between sessions.
+
+Dates, numbers, and currencies should use locale-aware formatting.
+
+11. Authentication and User Management
+
+Implement secure authentication.
+
+Pages:
+
+Login.
+Forgot password.
+Reset password.
+User management.
+Role management.
+Permission management.
+Profile settings.
+
+Roles:
+
+Super Administrator.
+Administrator.
+Data Manager.
+Data Analyst.
+Viewer.
+
+Permissions must be configurable per module.
+
+Implement:
+
+Password hashing.
+Secure session handling.
+JWT access tokens.
+Refresh token rotation.
+Rate limiting.
+Login attempt protection.
+Session expiration.
+Audit logs.
+Field-level access restrictions.
+
+Sensitive data must not be accessible simply because a user can access the dashboard.
+
+12. Audit Logs
+
+Create an audit log system recording:
+
+User login.
+User logout.
+Data imports.
+Data exports.
+Record creation.
+Record modification.
+Record deletion.
+File uploads.
+File downloads.
+Permission changes.
+Failed authentication attempts.
+
+Include:
+
+Username.
+Action.
+Affected module.
+Record ID where appropriate.
+Timestamp.
+IP address where available.
+Operation result.
+
+Audit records should be protected against unauthorized modification.
+
+Avoid storing sensitive identifiers or file contents in log messages.
+
+13. File Management
+
+Create a reusable file management system.
+
+Support:
+
+Excel files.
+CSV files.
+PDF files.
+Images.
+ZIP archives where appropriate.
+
+Features:
+
+Upload.
+Download.
+Preview.
+File metadata.
+File size.
+File type.
+Upload date.
+Search.
+Filtering.
+Permission checks.
+
+Store files outside the publicly accessible frontend directory.
+
+Use secure file names, validate MIME types, enforce file size limits, and prevent path traversal.
+
+14. Backend Architecture
+
+Use a modular Express.js architecture.
+
+Suggested structure:
+
+backend/ src/ config/ controllers/ services/ repositories/ routes/ middleware/ validators/ models/ utils/ jobs/ imports/ exports/ analytics/ security/ app.ts server.ts
+
+Requirements:
+
+REST API.
+Centralized error handling.
+Request validation with Zod.
+Prisma ORM.
+PostgreSQL transactions.
+API pagination.
+Structured logging.
+API documentation using Swagger/OpenAPI.
+Authentication middleware.
+Permission middleware.
+Rate limiting.
+Secure file handling.
+
+Use versioned endpoints:
+
+/api/v1/auth /api/v1/missions /api/v1/registrations /api/v1/targets /api/v1/network-cells /api/v1/gps-history /api/v1/imports /api/v1/exports /api/v1/analytics /api/v1/map /api/v1/users /api/v1/audit-logs
+
+Generate CRUD APIs for every table, respecting permissions and data sensitivity.
+
+15. Frontend Architecture
+
+Suggested structure:
+
+frontend/ src/ assets/ components/ common/ tables/ filters/ charts/ maps/ forms/ layout/ pages/ Dashboard/ Missions/ Registrations/ Targets/ MissionExtras/ LocationExtras/ MissionFiles/ LocationFiles/ NetworkCells/ WifiAccessPoints/ WifiClients/ GPSHistory/ MapCellDatabases/ MapCells/ PLMNStorage/ SMSCalls/ MapUserMarkers/ MapUserPolygons/ MapUserCircles/ TargetFiles/ WhitelistTargets/ TACNumbers/ ScheduledTasks/ MapLayers/ InteractiveMap/ Analytics/ ImportCenter/ ExportCenter/ Users/ AuditLogs/ Settings/ contexts/ hooks/ services/ locales/ en/ ar/ types/ utils/
+
+Use:
+
+React Router.
+TanStack Query.
+TanStack Table.
+React Hook Form.
+Zod.
+Axios.
+Tailwind CSS.
+shadcn/ui.
+
+Create reusable components rather than duplicating code on every page.
+
+16. PostgreSQL Database Design
+
+Use PostgreSQL as the main database.
+
+Requirements:
+
+Create Prisma schema.
+Generate migrations.
+Define primary keys.
+Define foreign keys where relationships are verified.
+Add appropriate indexes.
+Use appropriate PostgreSQL data types.
+Use JSONB for appropriate structured JSON fields.
+Use PostGIS as an optional extension for geographic datasets if required.
+Use database transactions.
+Avoid unnecessary duplication.
+Preserve original identifiers and data.
+
+Important:
+
+The original schema contains several tables with columns that have been abbreviated using "...".
+
+Do not invent these missing columns.
+
+First inspect the original SQLite database and retrieve the complete schema using SQLite metadata.
+
+Build a schema mapping report before migration.
+
+Preserve the original data and relationships wherever possible.
+
+For large tables, such as registrations and GPS history, use appropriate indexing and server-side pagination.
+
+17. Dockerization
+
+Dockerize the complete application.
+
+Create:
+
+Dockerfile.frontend
+Dockerfile.backend
+docker-compose.yml
+nginx.conf
+.env.example
+.dockerignore
+
+Docker Compose services:
+
+frontend
+backend
+postgres
+nginx
+
+Optional:
+
+redis for background job processing and caching.
+
+Requirements:
+
+Persistent PostgreSQL volume.
+Persistent file storage volume.
+Health checks.
+Automatic service restart.
+Environment variables.
+Internal Docker networking.
+Database migrations on deployment.
+Separate development and production configurations.
+Secure secret management.
+
+The application must start using:
+
+docker compose up -d --build
+
+Provide commands for:
+
+Starting the application.
+Stopping the application.
+Viewing logs.
+Running migrations.
+Backing up PostgreSQL.
+Restoring PostgreSQL.
+Importing the original SQLite database.
+
+Do not expose PostgreSQL directly to the public internet.
+
+18. Performance Requirements
+
+The application must be designed to handle large datasets.
+
+Expected dataset sizes include:
+
+54,833+ registration records.
+44,510+ GPS history records.
+4,777+ network cell records.
+Thousands of records in other tables.
+
+Implement:
+
+Server-side pagination.
+Database indexing.
+Efficient queries.
+Lazy loading.
+Background imports.
+Batch processing.
+Caching where appropriate.
+Virtualized large tables.
+Optimized chart queries.
+
+The application should remain responsive when working with large tables.
+
+19. Data Quality and Validation
+
+Create a Data Quality module.
+
+Check:
+
+Missing values.
+Duplicate records.
+Invalid dates.
+Invalid coordinates.
+Invalid numeric values.
+Incorrect data types.
+Missing relationships.
+Invalid identifiers.
+Inconsistent country codes.
+Invalid JSON fields.
+
+Show:
+
+Total valid records.
+Total invalid records.
+Duplicate records.
+Warnings.
+Validation errors.
+Suggested corrections.
+
+Never silently modify imported original data.
+
+Provide a preview and require confirmation before applying corrections.
+
+20. Backup and Recovery
+
+Implement database backup and recovery capabilities.
+
+Features:
+
+Manual backup.
+Scheduled backup.
+Backup history.
+Backup download for authorized administrators.
+Restore workflow.
+Backup integrity verification.
+
+Use PostgreSQL-native backup tools.
+
+Do not allow uploaded database files to overwrite the active database automatically.
+
+21. UI/UX Design Requirements
+
+The design should resemble a modern enterprise analytics platform.
+
+Visual style:
+
+Clean and professional.
+Modern sidebar.
+White or dark surfaces.
+Subtle shadows.
+Rounded cards.
+Consistent spacing.
+Professional typography.
+Clear status indicators.
+Minimal visual clutter.
+
+Use a consistent color palette:
+
+Primary: Indigo or Blue.
+Secondary: Slate.
+Success: Green.
+Warning: Amber.
+Error: Red.
+
+Every page must include:
+
+Loading state.
+Empty state.
+Error state.
+Success notification.
+Confirmation dialogs for destructive operations.
+Responsive design.
+22. Additional Features
+
+Add the following features to make the application more complete:
+
+A. Global Search
+
+Search across authorized tables using configurable searchable fields.
+
+B. Saved Views
+
+Allow users to save their table configurations, filters, sorting, and visible columns.
+
+C. Record Details
+
+Click a table row to open a detailed side panel showing the record and its authorized related metadata.
+
+D. Data Import History
+
+Show every previous import with:
+
+Filename.
+Destination table.
+Number of inserted records.
+Number of updated records.
+Number of skipped records.
+Number of errors.
+Import date.
+User.
+E. Data Dictionary
+
+Create a page documenting all database tables and columns, their types, descriptions, and relationships.
+
+F. System Health
+
+Create an administration page showing:
+
+Backend status.
+Database connection status.
+Disk usage.
+Storage usage.
+Background job status.
+Application version.
+G. Notifications
+
+Display import completion, export completion, validation errors, and administrative notifications.
+
+H. Localization
+
+Ensure all new modules are automatically translated into Arabic and English.
+
+I. Data Retention
+
+Provide configurable retention policies and deletion workflows with appropriate authorization and audit logging.
+
+J. API Documentation
+
+Generate interactive Swagger documentation for all API endpoints.
+
+23. Development and Delivery Strategy
+
+Do not attempt to generate the entire application in one unstructured step.
+
+Develop it in phases.
+
+Phase 1: Foundation
+Initialize frontend and backend.
+Configure TypeScript.
+Configure PostgreSQL.
+Configure Prisma.
+Create Docker infrastructure.
+Create authentication.
+Create dashboard layout.
+Implement Arabic and English support.
+Phase 2: Database and Migration
+Inspect the original SQLite schema.
+Generate a complete schema report.
+Create PostgreSQL models.
+Create migrations.
+Implement SQLite import.
+Validate migrated records.
+Phase 3: Table Management
+Build reusable data table components.
+Implement individual pages for all database tables.
+Add CRUD operations where permitted.
+Add advanced filters.
+Add pagination.
+Add Excel and CSV exports.
+Phase 4: Import and Export
+Build the import wizard.
+Implement Excel import.
+Implement CSV import.
+Implement SQLite import.
+Add validation and import history.
+Phase 5: Maps
+Implement the interactive map.
+Implement coordinate parsing.
+Add GeoJSON support.
+Add map layers and geographic metadata visualization.
+Phase 6: Analytics
+Build the dashboard statistics.
+Implement charts.
+Add dynamic analytics.
+Add export functionality.
+Phase 7: Administration
+User management.
+Roles and permissions.
+Audit logs.
+Backups.
+System health.
+Application settings.
+Phase 8: Testing and Deployment
+Backend unit tests.
+API integration tests.
+Frontend tests.
+Import tests.
+Database migration tests.
+Docker deployment tests.
+Performance tests.
+Security review.
+24. Final Deliverables
+
+Deliver a complete working project, not just a frontend mockup.
+
+The final project must include:
+
+Complete React frontend.
+Complete Node.js/Express backend.
+PostgreSQL database configuration.
+Complete Prisma schema.
+Database migrations.
+SQLite migration/import utility.
+Excel and CSV import functionality.
+Interactive map.
+Dashboard and analytics.
+Arabic and English translations.
+Authentication and authorization.
+Audit logging.
+Dockerfiles.
+Docker Compose configuration.
+Nginx configuration.
+Environment example file.
+API documentation.
+Automated tests.
+README installation guide.
+Backup and recovery instructions.
+Most Important Instructions
+Build actual working functionality, not static UI mockups.
+Every sidebar table must have its own functional page.
+All table pages must use real PostgreSQL data.
+Never hardcode dashboard statistics.
+Use reusable components and modular architecture.
+Preserve original database data during migration.
+Support importing large Excel, CSV, and SQLite datasets.
+Handle geographic coordinate formats correctly.
+Ensure Arabic RTL and English LTR work throughout the entire application.
+Make the complete application run through Docker Compose.
+Do not leave nonfunctional buttons or placeholder pages.
+Do not invent missing columns from the original schema.
+Implement security, authorization, audit logging, and privacy safeguards from the beginning.
+
+Before starting implementation, produce:
+
+System architecture diagram.
+Complete database relationship diagram.
+Complete PostgreSQL schema proposal.
+Frontend page structure.
+Backend API structure.
+Docker architecture.
+Implementation roadmap.
+
+Then begin implementation phase by phase, verifying each phase before proceeding to the next.

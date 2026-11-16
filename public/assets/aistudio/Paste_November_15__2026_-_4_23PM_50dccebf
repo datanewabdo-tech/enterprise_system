@@ -1,0 +1,799 @@
+# SECOND DEVELOPMENT PROMPT
+## Enterprise Data Management, Mapping & Analytics Dashboard – Advanced Analytics, Filters, SQLite Import, Mission Relationships & Dashboard Export
+
+Continue development of the existing Enterprise Data Management, Mapping & Analytics Dashboard application.
+
+This is the second development phase. Do not rebuild the application from scratch. First inspect the existing repository, Prisma schema, database migrations, backend APIs, frontend components, authentication, authorization, and existing dashboard implementation.
+
+**IMPORTANT:** The Prisma schema created in the first development phase is the source of truth for the current database structure. Use the actual model and field names. Do not invent fields or assume different models contain identical columns.
+
+Preserve the existing technology stack, architecture, application functionality, design system, and authentication system.
+
+---
+
+# 1. Database Schema Awareness
+
+Use the existing Prisma models and their actual fields.
+
+## 1.1 Mission
+
+Existing fields:
+- id
+- mission
+- missionName
+- location
+- createdAt
+
+The current schema defines `mission` as unique. The application needs to support duplicate mission labels where necessary.
+
+Implement a proper database migration:
+
+- Remove the uniqueness constraint from `Mission.mission`.
+- Use `Mission.id` as the primary relationship key for mission-related records.
+- Introduce or migrate to integer `missionId` foreign keys in related models.
+- Keep `mission` and `missionName` as descriptive/display fields where appropriate.
+- Update Prisma relations, database constraints, backend queries, APIs, imports, exports, and frontend selectors.
+- Do not merge records simply because their mission labels are identical.
+- Preserve all existing records and relationships.
+- If an existing string mission reference matches multiple missions, do not guess which mission it belongs to. Flag ambiguous records for explicit resolution.
+
+Review all mission-related models:
+- Registration
+- Target
+- MissionExtra
+- LocationExtra
+- NetworkCell
+- WifiAccessPoint
+- GpsHistory
+- MapCellDatabase
+- SmsCall
+- MapUserMarker
+- MapUserPolygon
+- MapUserCircle
+
+Also review `MissionExtra`, which currently references a mission using `missionName`, and make its relationship consistent with the new mission ID strategy.
+
+Update all existing queries and components to use `missionId` for filtering and relationships.
+
+Mission selectors must display enough information to distinguish duplicate mission labels, such as mission name, location, and ID.
+
+## 1.2 Registration
+
+Use the existing Registration model:
+
+- id
+- regId
+- mission / migrated missionId
+- bts
+- btsName
+- country
+- tmsi
+- imsi
+- imei
+- ueModel
+- btsLocation
+- btsAltitude
+- btsLocationOutdated
+- distanceMin
+- distanceMax
+- countryCode
+- deviceLocation
+- lastSeen
+- update
+- action
+
+Important:
+- Use `imsi` for unique subscriber identifier counts.
+- Use `lastSeen` for registration date/time filtering.
+- Use `btsLocation` as a possible coordinate source for the BTS map.
+- Use `country` and `countryCode` for country filtering and country-level analytics.
+- Do not assume Registration has MCC, MNC, RAT, LAC, or cellId fields unless the actual database contains them through another supported source.
+
+## 1.3 NetworkCell
+
+Use the existing NetworkCell model:
+
+- id
+- mission / migrated missionId
+- channel
+- lac
+- mcc
+- mnc
+- rxLev
+- cellId
+- rat
+- bsic
+- pci
+- isPcs1900
+- rxLevDbm
+- downlink
+- dlBandwidth
+- latitude
+- longitude
+- direction
+- isNeighbour
+- cidLacMnc
+
+Important:
+- `cellId` maps to the database column `cell_id`.
+- Use `cellId` when counting distinct cell identifiers.
+- MCC and MNC are integer fields.
+- Use `latitude` and `longitude` directly for map coordinates when available.
+- Do not assume this model has `createdAt` or a timestamp field.
+- Do not introduce date filtering for NetworkCell unless a valid timestamp field is added through a deliberate schema migration and populated appropriately.
+
+## 1.4 PLMN Storage
+
+Use the existing PlmnStorage model:
+
+- mcc
+- mnc
+- country
+- code
+- name
+
+Use this model to resolve MCC/MNC combinations into country, network code, and operator names where applicable.
+
+For the specifically requested military and civilian classifications below, use the explicit mappings provided in this prompt.
+
+---
+
+# 2. Advanced Dashboard Analytics
+
+Create a professional analytics dashboard using the existing frontend charting library and mapping technology.
+
+Use existing chart components and the application design system. Do not introduce a separate Python or Plotly runtime unless the project already uses it.
+
+All charts must:
+- Be responsive.
+- Support Arabic RTL and English LTR.
+- Have clear titles, labels, legends, and tooltips.
+- Respect active dashboard filters.
+- Display loading, empty, and error states.
+- Support appropriate sorting and aggregation.
+- Avoid loading the entire database into the browser.
+- Use backend aggregation APIs for large datasets.
+
+## 2.1 Registrations by Country
+
+**Data source:** Registration
+
+**Fields:** `country`, `imsi`
+
+Calculation:
+- Group registrations by country.
+- Count distinct IMSI values per country.
+- Exclude records with missing or empty country values.
+- Exclude countries with zero valid IMSI counts.
+- Exclude Egypt (`EG`) from the chart.
+- Sort by count descending.
+- Calculate percentage share and ranking.
+
+Appearance:
+- Vertical bar chart.
+- Top three countries: green `#00B894`.
+- Remaining countries: blue `#3977C3`.
+- Display country and distinct IMSI count.
+- Tooltip includes rank, count, and percentage share.
+
+Arabic title:
+
+أعداد شرائح الاتصال المرصودة لكل دولة
+
+Use the correct country representation in the actual data. Support country names and country codes where necessary.
+
+## 2.2 BTS Locations Map
+
+**Data sources:** Registration and NetworkCell.
+
+Coordinate sources:
+- Registration: `btsLocation`, a string that may contain latitude and longitude.
+- NetworkCell: `latitude` and `longitude`.
+
+Requirements:
+- Parse newline-separated, comma-separated, and whitespace-separated coordinate pairs.
+- Prefer valid explicit latitude/longitude fields when available.
+- Validate coordinate ranges.
+- Ignore invalid or incomplete coordinates.
+- Avoid duplicate map points where the same location is represented in both sources.
+- Use marker clustering for large datasets.
+- Provide an optional heatmap layer if supported.
+- Add zoom, layer visibility, and reset-view controls.
+- Support mission and dashboard filters.
+- Display aggregate counts in map popups.
+- Show available metadata such as BTS name, RAT, MCC, MNC, and cell ID.
+- Do not expose IMSI, IMEI, TMSI, or other individual subscriber identifiers in map popups.
+- Clearly distinguish registration-derived and network-cell-derived locations.
+
+## 2.3 Network Cells by MCC
+
+**Data source:** NetworkCell
+
+Fields: `mcc`, `cellId`.
+
+Calculation:
+- Group by MCC.
+- Count distinct `cellId` values.
+- Exclude null MCC values.
+- Do not count null cell IDs as distinct cells.
+- Sort descending by distinct cell count.
+
+Appearance:
+- Professional vertical bar chart.
+- Blue gradient.
+- Tooltip includes MCC, distinct cell count, and percentage share.
+
+Arabic title:
+
+إجمالي الخلايا المرصودة لكل دولة
+
+Clarify that MCC is being used as the country/network identifier. Resolve country names through PlmnStorage where possible.
+
+## 2.4 Military Mobile Networks
+
+**Data source:** NetworkCell
+
+Only include:
+
+| MCC | MNC | Operator |
+|---|---|---|
+| 602 | 10 | المحمول العسكري المصري |
+| 602 | 11 | المحمول العسكري المصري |
+| 425 | 25 | المحمول العسكري الإسرائيلي |
+
+Calculation:
+- Group by MCC and MNC.
+- Count distinct `cellId`.
+- Calculate total records per network.
+- Exclude invalid MCC/MNC combinations.
+- Sort by distinct cell count descending.
+
+Colors:
+- Egyptian networks (MCC 602): `#3498DB`.
+- Israeli network (MCC 425): `#27AE60`.
+
+Arabic title:
+
+شبكات الاتصال بالهواتف المحمولة العسكرية (الإسرائيلية والمصرية)
+
+Display operator name, MCC, MNC, distinct cell count, and total records.
+
+## 2.5 Civilian Mobile Networks
+
+**Data source:** NetworkCell
+
+Use these explicit mappings:
+
+| MCC | MNC | Operator | Country |
+|---|---|---|---|
+| 425 | 1 | Partner | Israel |
+| 425 | 2 | Cellcom | Israel |
+| 425 | 3 | Pelephone | Israel |
+| 425 | 7 | Hot Mobile | Israel |
+| 425 | 9 | We4G | Israel |
+| 425 | 25 | IMOD | Israel |
+| 425 | 28 | PHI Networks | Israel |
+| 425 | 29 | CG Networks | Israel |
+| 425 | 5 | Jawwal | Palestine |
+| 425 | 6 | Wataniya | Palestine |
+| 424 | 2 | Etisalat UAE (e&) | UAE |
+
+Explicitly excluded:
+- 602/1
+- 602/2
+- 602/3
+- 602/4
+- 602/10
+- 602/11
+- 425/24
+
+Calculation:
+- Group by MCC/MNC.
+- Count distinct `cellId`.
+- Calculate total records.
+- Sort by country, then by distinct cell count descending within each country.
+- Rank networks in descending order, with rank 1 being the largest count within its group.
+
+Colors:
+- Israel: `#2980B9`.
+- Palestine: `#27AE60`.
+- UAE: `#E67E22`.
+
+Arabic title:
+
+شبكات اتصالات الهواتف المحمولة المدنية (الإسرائيلية والفلسطينية والإماراتية)
+
+Display operator name, country, MCC, MNC, distinct cell count, total records, and rank.
+
+---
+
+# 3. Global Dashboard Filters
+
+Implement a comprehensive global filter system based on fields that actually exist in the relevant models.
+
+## 3.1 Mission Filters
+- Multi-select missions.
+- Searchable mission list.
+- Use mission IDs internally.
+- Display mission name, location, and ID to distinguish duplicate names.
+- Allow multiple selections.
+- Include an All Missions option.
+
+## 3.2 Registration Filters
+
+Based on Registration:
+- Country.
+- Country code.
+- IMSI.
+- IMEI.
+- TMSI.
+- BTS name.
+- BTS.
+- UE/device model.
+- Last seen date range.
+- BTS altitude range.
+- Minimum distance.
+- Maximum distance.
+- BTS location available/unavailable.
+- BTS location outdated/current.
+- Device location available/unavailable.
+- Action.
+- Update.
+
+Restrict access to sensitive subscriber identifiers according to existing RBAC permissions.
+
+## 3.3 NetworkCell Filters
+
+Based on NetworkCell:
+- RAT.
+- MCC.
+- MNC.
+- LAC.
+- Cell ID.
+- Channel.
+- BSIC.
+- PCI.
+- RX level.
+- RX level in dBm.
+- Downlink.
+- Downlink bandwidth.
+- Direction.
+- Neighbor/non-neighbor.
+- PCS1900/non-PCS1900.
+- Latitude available/unavailable.
+- Longitude available/unavailable.
+
+Allow numeric ranges for appropriate fields.
+
+## 3.4 PLMN Filters and Lookups
+
+Use PlmnStorage to support:
+- Country.
+- MCC.
+- MNC.
+- Network code.
+- Operator name.
+
+Allow searching by operator name or country and resolve corresponding MCC/MNC values.
+
+## 3.5 Filter Behavior
+
+All filters must:
+- Support multiple selections where appropriate.
+- Support searchable dropdowns.
+- Support cascading selections where meaningful.
+- Use AND logic by default across different filter dimensions.
+- Provide individual filter clearing.
+- Provide Clear All / Reset Filters.
+- Display active filters as removable chips.
+- Update all compatible dashboard KPIs, charts, and map layers.
+- Preserve filter state between dashboard sections where practical.
+- Support saved filter presets using the existing SavedView model where appropriate.
+- Apply filters server-side.
+- Avoid loading all records into the frontend.
+
+Registration filters must apply to Registration-based analytics, and NetworkCell filters must apply to NetworkCell-based analytics. Never apply an unsupported filter to a data source simply because it exists in another model.
+
+---
+
+# 4. Dashboard KPI Cards
+
+Create or enhance KPI cards using actual database aggregations.
+
+Suggested metrics:
+- Total registrations.
+- Distinct IMSIs.
+- Distinct IMEIs.
+- Total network-cell records.
+- Distinct network cells.
+- Total missions.
+- Countries represented.
+- Total BTS locations.
+- Network cells with valid coordinates.
+- Military network cells.
+- Civilian network cells.
+
+All metrics must respond to applicable filters. Use distinct counts where required and handle null values correctly.
+
+---
+
+# 5. SQLite Multi-Table Import
+
+Enhance the existing import module to support importing multiple tables from a SQLite database.
+
+## 5.1 Database Inspection
+
+When a user uploads a SQLite file:
+- Inspect its schema.
+- Retrieve all table names.
+- Exclude SQLite internal tables such as `sqlite_sequence` from normal import selection unless explicitly needed.
+- Show table names and record counts.
+- Allow inspection of columns and sample records.
+
+## 5.2 Table Selection
+
+Provide:
+- Select All.
+- Deselect All.
+- Import All.
+- Individual table selection.
+- Clear selection.
+
+Allow multiple tables to be selected in one import operation.
+
+## 5.3 Preview and Mapping
+
+For each selected table:
+- Show source columns.
+- Show destination model/table.
+- Display sample rows.
+- Identify matching and unmatched fields.
+- Allow column mapping where appropriate.
+- Validate data types.
+- Identify required fields and missing values.
+- Show estimated insert, update, skip, and error counts where possible.
+
+Do not assume SQLite table names and Prisma model names always match.
+
+## 5.4 Import Processing
+
+Implement dependency-aware import ordering based on actual Prisma foreign-key relationships.
+
+Requirements:
+- Use transactions where supported.
+- Preserve valid IDs and relationships when safe.
+- Handle duplicate records.
+- Provide explicit conflict handling: skip, update, or replace where safe.
+- Never silently overwrite existing records.
+- Provide per-table progress.
+- Provide clear error messages.
+- Allow review of the import summary.
+- Record import details in ImportHistory.
+- Respect existing role permissions and upload limits.
+
+If a table cannot be imported because of an unresolved relationship or schema mismatch, report it clearly rather than silently skipping it.
+
+---
+
+# 6. Dashboard Export & Reporting
+
+**This is a required feature. I want users to be able to export the dashboard and its analytics in PDF, Excel, and Word formats.**
+
+Implement a complete dashboard export and reporting system integrated into the existing application.
+
+## 6.1 Export Options
+
+Add a clearly visible **Export Dashboard** button to the dashboard.
+
+When clicked, display these export formats:
+
+1. PDF
+2. Excel (.xlsx)
+3. Word (.docx)
+
+Use recognizable format icons and clear labels.
+
+## 6.2 Export Scope
+
+Allow users to choose between:
+
+- Export the entire dashboard.
+- Export only selected dashboard sections.
+- Export selected charts.
+- Export KPI cards and summary statistics.
+- Export the analytics data behind the charts.
+- Export filtered results only.
+
+Include a convenient Select All option for dashboard sections.
+
+## 6.3 Respect Active Filters
+
+Exports must reflect the dashboard's current state.
+
+For example:
+- Selected missions.
+- Selected countries.
+- MCC/MNC selections.
+- Registration filters.
+- NetworkCell filters.
+- Date range where applicable.
+- Other active filter selections.
+
+The exported report must contain the same filtered results shown in the dashboard.
+
+Include an export summary identifying the applied filters, selected missions, and reporting period where applicable.
+
+Do not export unfiltered data when the user expects the currently filtered dashboard.
+
+## 6.4 PDF Export
+
+Generate a professional PDF dashboard report.
+
+The PDF should support:
+- Dashboard title.
+- Application branding/logo.
+- Report generation date and time.
+- Selected missions.
+- Active filters.
+- KPI summary cards.
+- Charts and visualizations.
+- Data tables supporting the charts.
+- BTS/network-cell map snapshot where applicable.
+- Page numbers.
+- Headers and footers.
+- Clear section headings.
+- Summary and explanatory notes where useful.
+
+Requirements:
+- Use a clean enterprise-report design.
+- Preserve chart readability and legends.
+- Avoid cutting off charts or tables between pages.
+- Support Arabic and English content.
+- Support Arabic RTL text shaping and appropriate Arabic fonts.
+- Handle long tables with repeated headers and page breaks.
+- Use appropriate page sizes and orientation.
+- Ensure the PDF is readable when printed.
+
+## 6.5 Excel Export
+
+Generate a real Excel workbook (`.xlsx`), not a CSV file with an Excel extension.
+
+Organize the workbook into meaningful worksheets, such as:
+- Dashboard Summary.
+- KPI Metrics.
+- Registrations by Country.
+- Network Cells by MCC.
+- Military Networks.
+- Civilian Networks.
+- BTS Locations.
+- Applied Filters.
+- Other selected datasets.
+
+Requirements:
+- Use clear worksheet names.
+- Include descriptive column headers.
+- Apply appropriate data types.
+- Format dates and numeric values correctly.
+- Include totals and summary rows where appropriate.
+- Apply readable column widths and header formatting.
+- Freeze header rows where useful.
+- Enable filters on tabular data.
+- Preserve identifiers accurately and avoid unintended conversion of long numeric identifiers into scientific notation.
+- Keep leading zeros in codes where applicable.
+- Include the export generation date and selected filter information.
+
+Do not include sensitive IMSI, IMEI, or TMSI values unless the user has the necessary permission and explicitly selects an authorized detailed-data export.
+
+## 6.6 Word Export
+
+Generate a formatted Word document (`.docx`) suitable for professional reporting.
+
+Include:
+- Report title and branding.
+- Generation date and time.
+- Executive summary.
+- Selected missions and active filters.
+- KPI summary.
+- Selected charts and analytics.
+- Supporting data tables.
+- Map snapshots where applicable.
+- Section headings and captions.
+- Page numbers and headers/footers.
+
+Requirements:
+- Use a professional report template.
+- Keep charts and tables properly aligned.
+- Support Arabic RTL and English LTR.
+- Use appropriate Arabic fonts.
+- Ensure tables do not overflow page boundaries.
+- Provide a polished document suitable for editing, printing, and sharing.
+
+## 6.7 Chart and Map Export Quality
+
+- Export actual rendered chart data and visualizations.
+- Use high-resolution chart images where image-based export is required.
+- Preserve chart titles, labels, legends, and colors.
+- Include the map's currently visible filtered data and relevant map layers.
+- Handle large maps and charts without freezing the browser.
+- Do not use low-quality screenshots when a direct chart export is available.
+- Ensure exported charts correspond to the same data and filters as the dashboard.
+
+## 6.8 Export Architecture
+
+Implement export generation using the existing application architecture.
+
+Requirements:
+- Use suitable libraries compatible with the existing Node.js backend and frontend.
+- Generate Excel as a real `.xlsx` workbook.
+- Generate Word as a real `.docx` document.
+- Generate PDF using a suitable PDF generation approach.
+- Avoid adding a separate Python runtime just for exports.
+- Use server-side generation for large datasets and complex reports.
+- Use frontend generation only where it is efficient and appropriate.
+- Validate export requests.
+- Enforce RBAC and data permissions.
+- Apply the same server-side filters and aggregation logic used by the dashboard.
+- Avoid exposing unauthorized records through exports.
+- Handle large exports safely using streaming or background processing where appropriate.
+- Provide export progress or loading feedback.
+- Display clear success and error messages.
+- Use safe temporary file handling and cleanup.
+- Avoid leaving sensitive report files publicly accessible.
+
+## 6.9 Export History
+
+Where appropriate, extend the existing import/export history architecture or introduce a dedicated export history model.
+
+Record:
+- User.
+- Export format.
+- Export date/time.
+- Selected missions.
+- Applied filters.
+- Export scope.
+- Export status.
+- Error details where applicable.
+
+Allow authorized users to view export history and download available reports according to existing permissions.
+
+---
+
+# 7. Backend API and Performance
+
+Create or update backend endpoints for:
+- Dashboard KPI aggregation.
+- Registrations by country.
+- Network cells by MCC.
+- Military network aggregation.
+- Civilian network aggregation.
+- BTS/network-cell map data.
+- Global filter options.
+- Filtered dashboard data.
+- SQLite table inspection.
+- Multi-table import and progress.
+- Import history.
+- PDF dashboard export.
+- Excel dashboard export.
+- Word dashboard export.
+- Export history and report download.
+
+Requirements:
+- Use Prisma efficiently.
+- Perform grouping and distinct counts in the database where practical.
+- Use pagination for record-level data.
+- Validate filters with Zod.
+- Use parameterized queries.
+- Add appropriate indexes for frequently filtered and grouped fields.
+- Avoid N+1 queries.
+- Enforce authentication and role-based authorization.
+- Do not return unnecessary sensitive identifiers.
+- Handle empty results and database errors consistently.
+
+---
+
+# 8. Frontend Design and User Experience
+
+Preserve the existing dashboard design and improve it consistently.
+
+Requirements:
+- Professional enterprise dashboard appearance.
+- Responsive desktop, tablet, and mobile layouts.
+- Arabic RTL and English LTR support.
+- Arabic chart titles as specified.
+- Consistent typography, spacing, and chart colors.
+- Searchable filter controls.
+- Clear filter chips.
+- Useful tooltips.
+- Loading skeletons.
+- Empty states.
+- Error states with retry actions.
+- Accessible controls and keyboard navigation.
+- Clear separation between registration and network-cell analytics.
+
+Add a dashboard filter panel that can collapse or expand.
+
+Add an accessible Export Dashboard control with format and export-scope selection.
+
+Do not overload the dashboard with every filter permanently visible. Group related filters into logical sections and allow advanced filters to expand when needed.
+
+---
+
+# 9. Data Integrity, Privacy, and Security
+
+- Preserve all existing records during schema migrations.
+- Do not silently discard data.
+- Do not merge duplicate missions.
+- Use mission IDs for relationships after migration.
+- Keep sensitive IMSI, IMEI, and TMSI values out of public chart labels and map popups.
+- Enforce role-based permissions for dashboard data and exports.
+- Record important import, export, and administrative actions in AuditLog where appropriate.
+- Validate imported data before committing it.
+- Protect against SQL injection and invalid filter input.
+- Avoid exposing raw database errors to ordinary users.
+- Secure generated reports and temporary files.
+- Prevent users from downloading data they are not authorized to access.
+
+---
+
+# 10. Testing and Verification
+
+Before completing development, verify:
+
+1. Existing functionality continues working.
+2. Prisma schema validates.
+3. Database migrations run successfully.
+4. Existing mission relationships remain intact.
+5. Duplicate mission labels work correctly after migration.
+6. Registration analytics count distinct IMSIs correctly.
+7. Country filtering and Egypt exclusion work correctly.
+8. MCC aggregation counts distinct cell IDs correctly.
+9. Military network mappings are accurate.
+10. Civilian network mappings and exclusions are accurate.
+11. Ranking is descending and rank 1 is the largest value.
+12. BTS coordinate parsing works with supported formats.
+13. NetworkCell coordinates appear correctly on the map.
+14. Compatible dashboard filters update charts and KPIs.
+15. SQLite multi-table import handles dependencies and conflicts correctly.
+16. PDF export generates a valid, readable report.
+17. Excel export generates a valid workbook with the expected worksheets and data.
+18. Word export generates a valid, editable DOCX report.
+19. All export formats respect active filters and selected missions.
+20. Exported charts and KPI values match the dashboard.
+21. Arabic RTL and English LTR exports render correctly.
+22. Export permissions prevent unauthorized data downloads.
+23. Large exports do not cause excessive frontend loading or performance problems.
+24. RBAC permissions are enforced throughout the application.
+
+Add unit tests and integration tests for aggregation, import, and export logic.
+
+---
+
+# 11. Final Development Instructions
+
+Before modifying files:
+
+1. Inspect the existing repository.
+2. Inspect the complete Prisma schema.
+3. Inspect current migrations and actual database constraints.
+4. Inspect the existing dashboard, import system, map components, APIs, and export functionality if any.
+5. Identify existing features that can be extended rather than duplicated.
+6. Prepare a safe implementation plan for schema changes.
+
+Then implement the complete second phase.
+
+Do not provide only mockups, placeholder charts, static data, or demonstration values. All analytics, imports, and exports must work with actual application data.
+
+Do not remove existing application features or change the technology stack unnecessarily.
+
+At completion, provide:
+- Summary of implemented features.
+- List of changed files.
+- Prisma schema changes.
+- Database migration instructions.
+- New and updated API endpoints.
+- Export libraries and implementation approach.
+- Tests performed and their results.
+- Any unresolved data-migration issues.
+- Any assumptions made because the existing database does not contain a required field.
+
+**The final result must be a fully integrated, functional enhancement of the existing application, including PDF, Excel, and Word dashboard exports—not a separate dashboard or a standalone prototype.**

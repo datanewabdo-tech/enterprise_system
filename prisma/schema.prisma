@@ -1,0 +1,586 @@
+// Prisma schema for Enterprise Data Management, Mapping & Analytics Dashboard
+// Database: PostgreSQL (Phase 2: Mission ID Foreign Key Architecture & Export History)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// 1. Missions (supports duplicate mission labels; id is the authoritative PK)
+model Mission {
+  id          Int      @id @default(autoincrement())
+  mission     String
+  missionName String?  @map("mission_name")
+  location    String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  registrations     Registration[]
+  targets           Target[]
+  missionExtras     MissionExtra[]
+  locationExtras    LocationExtra[]
+  networkCells      NetworkCell[]
+  wifiAccessPoints  WifiAccessPoint[]
+  gpsHistory        GpsHistory[]
+  mapCellDatabases  MapCellDatabase[]
+  smsCalls          SmsCall[]
+  mapUserMarkers    MapUserMarker[]
+  mapUserPolygons   MapUserPolygon[]
+  mapUserCircles    MapUserCircle[]
+
+  @@index([mission])
+  @@index([location])
+  @@map("missions")
+}
+
+// 2. Registrations
+model Registration {
+  id                    Int       @id @default(autoincrement())
+  regId                 String?   @map("reg_id")
+  missionId             Int?      @map("mission_id")
+  mission               String?
+  bts                   String?
+  btsName               String?   @map("bts_name")
+  country               String?
+  tmsi                  String?
+  imsi                  String?
+  imei                  String?
+  ueModel               String?   @map("ue_model")
+  btsLocation           String?   @map("bts_location")
+  btsAltitude           Float?    @map("bts_altitude")
+  btsLocationOutdated   Boolean?  @default(false) @map("bts_location_outdated")
+  distanceMin           Float?    @map("distance_min")
+  distanceMax           Float?    @map("distance_max")
+  countryCode           String?   @map("country_code")
+  deviceLocation        String?   @map("device_location")
+  lastSeen              DateTime? @map("last_seen")
+  update                String?
+  action                String?
+
+  missionRel            Mission?  @relation(fields: [missionId], references: [id], onDelete: SetNull)
+
+  @@index([missionId])
+  @@index([mission])
+  @@index([country])
+  @@index([countryCode])
+  @@index([imsi])
+  @@index([imei])
+  @@index([lastSeen])
+  @@index([btsName])
+  @@index([ueModel])
+  @@map("registrations")
+}
+
+// 3. Targets
+model Target {
+  id              Int      @id @default(autoincrement())
+  missionId       Int?     @map("mission_id")
+  mission         String?
+  missionName     String?  @map("mission_name")
+  imsi            String?
+  imei            String?
+  name            String
+  action          String?
+  redirectTech    String?  @map("redirect_tech")
+  redirectBsic    String?  @map("redirect_bsic")
+  redirectChannel String?  @map("redirect_channel")
+  description     String?
+  isPcs1900       Boolean? @default(false) @map("is_p_c_s1900")
+
+  missionRel      Mission? @relation(fields: [missionId], references: [id], onDelete: SetNull)
+  targetFiles     TargetFile[]
+
+  @@index([missionId])
+  @@index([mission])
+  @@index([imsi])
+  @@index([imei])
+  @@map("targets")
+}
+
+// 4. Mission Extras
+model MissionExtra {
+  id          Int      @id @default(autoincrement())
+  missionId   Int?     @map("mission_id")
+  missionName String?  @map("mission_name")
+  description String
+
+  missionRel   Mission? @relation(fields: [missionId], references: [id], onDelete: SetNull)
+  missionFiles MissionFile[]
+
+  @@index([missionId])
+  @@map("mission_extras")
+}
+
+// 5. Location Extras
+model LocationExtra {
+  id          Int      @id @default(autoincrement())
+  missionId   Int      @map("mission_id")
+  description String
+
+  missionRel    Mission       @relation(fields: [missionId], references: [id], onDelete: Cascade)
+  locationFiles LocationFile[]
+
+  @@index([missionId])
+  @@map("location_extras")
+}
+
+// 6. Mission Files
+model MissionFile {
+  id               Int      @id @default(autoincrement())
+  missionExtraId   Int      @map("mission_extra_id")
+  filePath         String   @map("file_path")
+  fileType         String   @map("file_type")
+  originalFileName String   @map("original_file_name")
+  addedAt          DateTime @default(now()) @map("added_at")
+
+  missionExtraRel  MissionExtra @relation(fields: [missionExtraId], references: [id], onDelete: Cascade)
+
+  @@map("mission_files")
+}
+
+// 7. Location Files
+model LocationFile {
+  id               Int      @id @default(autoincrement())
+  locationExtraId  Int      @map("location_extra_id")
+  filePath         String   @map("file_path")
+  fileType         String   @map("file_type")
+  originalFileName String   @map("original_file_name")
+  addedAt          DateTime @default(now()) @map("added_at")
+
+  locationExtraRel LocationExtra @relation(fields: [locationExtraId], references: [id], onDelete: Cascade)
+
+  @@map("location_files")
+}
+
+// 8. Network Cells (Note: no createdAt column by schema specification)
+model NetworkCell {
+  id          Int      @id @default(autoincrement())
+  missionId   Int?     @map("mission_id")
+  mission     String?
+  channel     Int?
+  lac         Int?
+  mcc         Int?
+  mnc         Int?
+  rxLev       Float?   @map("rx_lev")
+  cellId      Int?     @map("cell_id")
+  rat         String?
+  bsic        Int?
+  pci         Int?
+  isPcs1900   Boolean? @default(false) @map("is_pcs1900")
+  rxLevDbm    Float?   @map("rx_lev_dbm")
+  downlink    Float?
+  dlBandwidth Float?   @map("dl_bandwidth")
+  latitude    Float?
+  longitude   Float?
+  direction   Float?
+  isNeighbour Boolean? @default(false) @map("is_neighbour")
+  cidLacMnc   String?  @map("cid_lac_mnc")
+
+  missionRel  Mission? @relation(fields: [missionId], references: [id], onDelete: SetNull)
+
+  @@index([missionId])
+  @@index([mission])
+  @@index([mcc])
+  @@index([mcc, mnc])
+  @@index([cellId])
+  @@index([rat])
+  @@index([lac])
+  @@map("network_cells")
+}
+
+// 9. WiFi Access Points
+model WifiAccessPoint {
+  id            Int       @id @default(autoincrement())
+  missionId     Int?      @map("mission_id")
+  mission       String?
+  bssid         String    @unique
+  essid         String?
+  enc           String?
+  channel       Int?
+  firstSeen     DateTime? @map("first_seen")
+  lastSeen      DateTime? @map("last_seen")
+  strength      Float?
+  hidden        Boolean?  @default(false)
+  manufacturer  String?
+  wanted        Boolean?  @default(false)
+  essidBssidId  String?   @map("essid_bssid_id")
+
+  missionRel    Mission?  @relation(fields: [missionId], references: [id], onDelete: SetNull)
+
+  @@index([missionId])
+  @@index([mission])
+  @@index([bssid])
+  @@map("wifi_access_points")
+}
+
+// 10. WiFi Access Point Clients
+model WifiAccessPointClient {
+  id                         Int       @id @default(autoincrement())
+  wifiAccessPointEssidBssid  String    @map("wifi_access_point_essid_bssid")
+  mac                        String
+  firstSeen                  DateTime? @map("first_seen")
+  lastSeen                   DateTime? @map("last_seen")
+  wants                      String?
+  manufacturer               String?
+
+  @@index([mac])
+  @@index([wifiAccessPointEssidBssid])
+  @@map("wifi_access_point_clients")
+}
+
+// 11. GPS History
+model GpsHistory {
+  id                Int      @id @default(autoincrement())
+  missionId         Int?     @map("mission_id")
+  mission           String?
+  btsId             String?  @map("bts_id")
+  silentTargetRegId String?  @map("silent_target_reg_id")
+  timestamp         DateTime @default(now())
+  latitude          Float
+  longitude         Float
+  dlPow             Float?   @map("dl_pow")
+  ulPow             Float?   @map("ul_pow")
+  distanceMin       Float?   @map("distance_min")
+  distanceMax       Float?   @map("distance_max")
+  timeDl            Float?   @map("time_dl")
+
+  missionRel        Mission? @relation(fields: [missionId], references: [id], onDelete: SetNull)
+
+  @@index([missionId])
+  @@index([mission])
+  @@index([timestamp])
+  @@map("gps_history")
+}
+
+// 12. Map Cell Databases
+model MapCellDatabase {
+  id        Int      @id @default(autoincrement())
+  missionId Int?     @map("mission_id")
+  mission   String?
+  name      String
+  header    String?
+  color     String?  @default("#3b82f6")
+
+  missionRel Mission? @relation(fields: [missionId], references: [id], onDelete: SetNull)
+  mapCells   MapCell[]
+
+  @@index([missionId])
+  @@map("map_cell_databases")
+}
+
+// 13. Map Cells
+model MapCell {
+  id              Int      @id @default(autoincrement())
+  dbId            Int      @map("db_id")
+  contents        String?
+  lat             Float
+  lng             Float
+  mcc             Int?
+  mnc             Int?
+  lac             Int?
+  cid             Int?
+  mccMncJunction  String?  @map("mcc_mnc_junction")
+  address         String?
+  direction       Float?
+  formatHex       String?  @map("format_hex")
+  openingAngle    Float?   @map("opening_angle")
+  radius          Float?
+  scPci           Int?     @map("sc_pci")
+  channel         Int?
+  antennaType     String?  @map("antenna_type")
+
+  databaseRel     MapCellDatabase @relation(fields: [dbId], references: [id], onDelete: Cascade)
+
+  @@index([dbId])
+  @@index([lat, lng])
+  @@map("map_cells")
+}
+
+// 14. PLMN Storage
+model PlmnStorage {
+  mcc     Int
+  mnc     Int
+  country String
+  code    String
+  name    String
+
+  @@id([mcc, mnc])
+  @@index([country])
+  @@index([code])
+  @@map("plmn_storage")
+}
+
+// 15. SMS & Calls Records
+model SmsCall {
+  id          Int      @id @default(autoincrement())
+  smsId       String?  @map("sms_id")
+  callId      String?  @map("call_id")
+  missionId   Int?     @map("mission_id")
+  mission     String?
+  incoming    Boolean  @default(true)
+  isSms       Boolean  @default(true) @map("is_sms")
+  source      String?
+  destination String?
+  btsId       String?  @map("bts_id")
+  btsName     String?  @map("bts_name")
+  status      String?
+  smsContent  String?  @map("sms_content")
+  timestamp   DateTime @default(now())
+
+  missionRel  Mission? @relation(fields: [missionId], references: [id], onDelete: SetNull)
+
+  @@index([missionId])
+  @@index([mission])
+  @@index([timestamp])
+  @@map("sms_calls")
+}
+
+// 16. Map User Markers
+model MapUserMarker {
+  id          Int      @id @default(autoincrement())
+  missionId   Int?     @map("mission_id")
+  mission     String?
+  direction   Float?
+  type        String?
+  description String?
+  image       String?
+  color       String?  @default("#ef4444")
+  width       Float?   @default(32)
+  height      Float?   @default(32)
+  latitude    Float
+  longitude   Float
+  timestamp   DateTime @default(now())
+
+  missionRel  Mission? @relation(fields: [missionId], references: [id], onDelete: SetNull)
+
+  @@index([missionId])
+  @@index([mission])
+  @@map("map_user_markers")
+}
+
+// 17. Map User Polygons
+model MapUserPolygon {
+  id          Int      @id @default(autoincrement())
+  missionId   Int?     @map("mission_id")
+  mission     String?
+  points      String
+  label       String
+  color       String?  @default("#8b5cf6")
+  description String?
+  timestamp   DateTime @default(now())
+
+  missionRel  Mission? @relation(fields: [missionId], references: [id], onDelete: SetNull)
+
+  @@index([missionId])
+  @@index([mission])
+  @@map("map_user_polygons")
+}
+
+// 18. Map User Circles
+model MapUserCircle {
+  id          Int      @id @default(autoincrement())
+  missionId   Int?     @map("mission_id")
+  mission     String?
+  lat         Float
+  lng         Float
+  radius      Float
+  label       String
+  color       String?  @default("#10b981")
+  description String?
+  timestamp   DateTime @default(now())
+
+  missionRel  Mission? @relation(fields: [missionId], references: [id], onDelete: SetNull)
+
+  @@index([missionId])
+  @@index([mission])
+  @@map("map_user_circles")
+}
+
+// 19. Target Files
+model TargetFile {
+  id               Int      @id @default(autoincrement())
+  targetId         Int      @map("target_id")
+  filePath         String   @map("file_path")
+  fileType         String   @map("file_type")
+  originalFileName String   @map("original_file_name")
+  addedAt          DateTime @default(now()) @map("added_at")
+
+  targetRel        Target   @relation(fields: [targetId], references: [id], onDelete: Cascade)
+
+  @@map("target_files")
+}
+
+// 20. Whitelist Targets
+model WhitelistTarget {
+  id   Int     @id @default(autoincrement())
+  name String
+  imsi String?
+  imei String?
+
+  @@index([imsi])
+  @@index([imei])
+  @@map("whitelist_targets")
+}
+
+// 21. TAC Numbers
+model TacNumber {
+  id    Int     @id @default(autoincrement())
+  tacId String? @map("tac_id")
+  name  String
+  tac   String  @unique
+
+  @@map("tac_numbers")
+}
+
+// 22. Scheduled Tasks
+model ScheduledTask {
+  id               Int      @id @default(autoincrement())
+  taskType         String   @map("task_type")
+  executionTime    DateTime @map("execution_time")
+  jsonParams       String   @map("json_params")
+  prettifiedParams String?  @map("prettified_params")
+  status           String   @default("PENDING")
+
+  @@map("scheduled_tasks")
+}
+
+// 23. Map Layers
+model MapLayer {
+  id        Int      @id @default(autoincrement())
+  name      String
+  type      String
+  path      String
+
+  @@map("map_layers")
+}
+
+// --- Supporting Enterprise Models ---
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  DATA_MANAGER
+  DATA_ANALYST
+  VIEWER
+}
+
+model User {
+  id            Int       @id @default(autoincrement())
+  username      String    @unique
+  email         String    @unique
+  passwordHash  String    @map("password_hash")
+  fullName      String    @map("full_name")
+  role          Role      @default(VIEWER)
+  status        String    @default("ACTIVE")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  lastLogin     DateTime? @map("last_login")
+
+  auditLogs     AuditLog[]
+  importHistory ImportHistory[]
+  exportHistory ExportHistory[]
+  savedViews    SavedView[]
+
+  @@map("users")
+}
+
+model AuditLog {
+  id        Int      @id @default(autoincrement())
+  userId    Int?     @map("user_id")
+  username  String
+  action    String
+  module    String
+  recordId  String?  @map("record_id")
+  ipAddress String?  @map("ip_address")
+  result    String   @default("SUCCESS")
+  details   String?
+  timestamp DateTime @default(now())
+
+  userRel   User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([username])
+  @@index([module])
+  @@index([timestamp])
+  @@map("audit_logs")
+}
+
+model ImportHistory {
+  id               Int      @id @default(autoincrement())
+  filename         String
+  fileType         String   @map("file_type")
+  destinationTable String   @map("destination_table")
+  insertedCount    Int      @default(0) @map("inserted_count")
+  updatedCount     Int      @default(0) @map("updated_count")
+  skippedCount     Int      @default(0) @map("skipped_count")
+  errorCount       Int      @default(0) @map("error_count")
+  errorLog         String?  @map("error_log")
+  userId           Int?     @map("user_id")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  userRel          User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@map("import_history")
+}
+
+model ExportHistory {
+  id               Int      @id @default(autoincrement())
+  userId           Int?     @map("user_id")
+  username         String
+  format           String
+  scope            String
+  selectedMissions String?  @map("selected_missions")
+  appliedFilters   String?  @map("applied_filters")
+  status           String   @default("COMPLETED")
+  filePath         String?  @map("file_path")
+  fileName         String?  @map("file_name")
+  fileSize         Int?     @map("file_size")
+  errorDetails     String?  @map("error_details")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  userRel          User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([createdAt])
+  @@map("export_history")
+}
+
+model MigrationAmbiguity {
+  id                  Int      @id @default(autoincrement())
+  tableName           String   @map("table_name")
+  recordId            Int      @map("record_id")
+  missionLabel        String   @map("mission_label")
+  candidateMissionIds String   @map("candidate_mission_ids")
+  resolvedMissionId   Int?     @map("resolved_mission_id")
+  status              String   @default("PENDING")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  @@index([tableName, status])
+  @@map("migration_ambiguities")
+}
+
+model SavedView {
+  id           Int      @id @default(autoincrement())
+  userId       Int      @map("user_id")
+  tableName    String   @map("table_name")
+  viewName     String   @map("view_name")
+  filtersJson  String   @map("filters_json")
+  sortJson     String?  @map("sort_json")
+  columnsJson  String?  @map("columns_json")
+  isDefault    Boolean  @default(false) @map("is_default")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  userRel      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("saved_views")
+}
+
+model AppSetting {
+  key         String   @id
+  value       String
+  description String?
+  updatedAt   DateTime @default(now()) @map("updated_at")
+
+  @@map("app_settings")
+}
