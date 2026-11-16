@@ -57,6 +57,14 @@ export function initDatabase(targetDb: DatabaseSync = db) {
       imsi TEXT,
       imei TEXT,
       ue_model TEXT,
+      mcc TEXT,
+      mnc TEXT,
+      lac INTEGER,
+      rat INTEGER,
+      last_event TEXT,
+      time INTEGER,
+      target_name TEXT,
+      uplink_power REAL,
       bts_location TEXT,
       bts_altitude REAL,
       bts_location_outdated INTEGER DEFAULT 0,
@@ -104,7 +112,7 @@ export function initDatabase(targetDb: DatabaseSync = db) {
     -- 6. Mission Files
     CREATE TABLE IF NOT EXISTS mission_files (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      mission_extra_id INTEGER NOT NULL,
+      mission_extra_id INTEGER NOT NULL REFERENCES mission_extras(id) ON DELETE CASCADE,
       file_path TEXT NOT NULL,
       file_type TEXT NOT NULL,
       original_file_name TEXT NOT NULL,
@@ -114,7 +122,7 @@ export function initDatabase(targetDb: DatabaseSync = db) {
     -- 7. Location Files
     CREATE TABLE IF NOT EXISTS location_files (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      location_extra_id INTEGER NOT NULL,
+      location_extra_id INTEGER NOT NULL REFERENCES location_extras(id) ON DELETE CASCADE,
       file_path TEXT NOT NULL,
       file_type TEXT NOT NULL,
       original_file_name TEXT NOT NULL,
@@ -127,14 +135,15 @@ export function initDatabase(targetDb: DatabaseSync = db) {
       mission_id INTEGER REFERENCES missions(id) ON DELETE SET NULL,
       mission TEXT,
       channel INTEGER,
-      lac INTEGER,
-      mcc INTEGER,
-      mnc INTEGER,
+      lac TEXT,
+      mcc TEXT,
+      mnc TEXT,
       rx_lev REAL,
-      cell_id INTEGER,
+      cell_id TEXT,
       rat TEXT,
-      bsic INTEGER,
-      pci INTEGER,
+      bsic TEXT,
+      psc TEXT,
+      pci TEXT,
       is_pcs1900 INTEGER DEFAULT 0,
       rx_lev_dbm REAL,
       downlink REAL,
@@ -205,14 +214,14 @@ export function initDatabase(targetDb: DatabaseSync = db) {
     -- 13. Map Cells
     CREATE TABLE IF NOT EXISTS map_cells (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      db_id INTEGER NOT NULL,
+      db_id INTEGER NOT NULL REFERENCES map_cell_databases(id) ON DELETE CASCADE,
       contents TEXT,
       lat REAL NOT NULL,
       lng REAL NOT NULL,
-      mcc INTEGER,
-      mnc INTEGER,
-      lac INTEGER,
-      cid INTEGER,
+      mcc TEXT,
+      mnc TEXT,
+      lac TEXT,
+      cid TEXT,
       mcc_mnc_junction TEXT,
       address TEXT,
       direction REAL,
@@ -226,8 +235,8 @@ export function initDatabase(targetDb: DatabaseSync = db) {
 
     -- 14. PLMN Storage
     CREATE TABLE IF NOT EXISTS plmn_storage (
-      mcc INTEGER NOT NULL,
-      mnc INTEGER NOT NULL,
+      mcc TEXT NOT NULL,
+      mnc TEXT NOT NULL,
       country TEXT NOT NULL,
       code TEXT NOT NULL,
       name TEXT NOT NULL,
@@ -259,7 +268,7 @@ export function initDatabase(targetDb: DatabaseSync = db) {
       mission TEXT,
       direction REAL,
       type TEXT,
-      description String,
+      description TEXT,
       image TEXT,
       color TEXT DEFAULT '#ef4444',
       width REAL DEFAULT 32,
@@ -298,7 +307,7 @@ export function initDatabase(targetDb: DatabaseSync = db) {
     -- 19. Target Files
     CREATE TABLE IF NOT EXISTS target_files (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      target_id INTEGER NOT NULL,
+      target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
       file_path TEXT NOT NULL,
       file_type TEXT NOT NULL,
       original_file_name TEXT NOT NULL,
@@ -427,6 +436,7 @@ export function initDatabase(targetDb: DatabaseSync = db) {
   `);
 
   runMissionIdMigration(targetDb);
+  runPhase3TypeAlignmentMigration(targetDb);
   ensurePhase2Indexes(targetDb);
 
   if (targetDb === db) {
@@ -532,6 +542,254 @@ export function runMissionIdMigration(targetDb: DatabaseSync = db) {
   }
 }
 
+/**
+ * Phase 3 Non-Destructive Type & Foreign-Key Alignment Migration:
+ * - Adds missing source columns on registrations (mcc, mnc, lac, rat, last_event, time, target_name, uplink_power)
+ * - Adds missing psc column on network_cells
+ * - Converts network_cells (lac, mcc, mnc, cell_id, bsic, pci), plmn_storage (mcc, mnc),
+ *   and map_cells (mcc, mnc, lac, cid) to TEXT losslessly (preserving NULLs and identifiers)
+ * - Restores missing SQLite foreign keys and fixes map_user_markers.description TEXT
+ * - Idempotent and verifies row counts before & after any table rebuild
+ */
+export function runPhase3TypeAlignmentMigration(targetDb: DatabaseSync = db) {
+  const getColInfos = (tbl: string) =>
+    targetDb.prepare(`PRAGMA table_info("${tbl}")`).all() as Array<{ name: string; type: string }>;
+  const getFks = (tbl: string) =>
+    targetDb.prepare(`PRAGMA foreign_key_list("${tbl}")`).all() as Array<{ table: string; from: string; to: string }>;
+
+  // 1. Add missing registrations columns
+  const regCols = new Set(getColInfos('registrations').map(c => c.name));
+  const regAdditions: Array<[string, string]> = [
+    ['mcc', 'TEXT'],
+    ['mnc', 'TEXT'],
+    ['lac', 'INTEGER'],
+    ['rat', 'INTEGER'],
+    ['last_event', 'TEXT'],
+    ['time', 'INTEGER'],
+    ['target_name', 'TEXT'],
+    ['uplink_power', 'REAL'],
+  ];
+  for (const [col, type] of regAdditions) {
+    if (!regCols.has(col)) {
+      targetDb.exec(`ALTER TABLE registrations ADD COLUMN "${col}" ${type};`);
+    }
+  }
+
+  // 2. Add missing network_cells.psc
+  const ncInfos = getColInfos('network_cells');
+  if (!ncInfos.some(c => c.name === 'psc')) {
+    targetDb.exec(`ALTER TABLE network_cells ADD COLUMN psc TEXT;`);
+  }
+
+  const rebuildTable = (tableName: string, createV2Sql: string, insertCols: string[], selectExprs: string[]) => {
+    const beforeCount = (targetDb.prepare(`SELECT COUNT(*) as c FROM "${tableName}"`).get() as { c: number }).c;
+    const tempName = `${tableName}_p3_v2`;
+    targetDb.exec('PRAGMA foreign_keys = OFF;');
+    targetDb.exec('BEGIN TRANSACTION;');
+    try {
+      targetDb.exec(`DROP TABLE IF EXISTS "${tempName}";`);
+      targetDb.exec(createV2Sql.replace(`"${tableName}"`, `"${tempName}"`));
+      targetDb.exec(`
+        INSERT INTO "${tempName}" (${insertCols.map(c => `"${c}"`).join(', ')})
+        SELECT ${selectExprs.join(', ')} FROM "${tableName}";
+      `);
+      const afterCount = (targetDb.prepare(`SELECT COUNT(*) as c FROM "${tempName}"`).get() as { c: number }).c;
+      if (afterCount !== beforeCount) {
+        throw new Error(`Phase 3 migration row count mismatch for ${tableName}: before=${beforeCount}, after=${afterCount}`);
+      }
+      targetDb.exec(`DROP TABLE "${tableName}";`);
+      targetDb.exec(`ALTER TABLE "${tempName}" RENAME TO "${tableName}";`);
+      targetDb.exec('COMMIT;');
+    } catch (e) {
+      targetDb.exec('ROLLBACK;');
+      throw e;
+    } finally {
+      targetDb.exec('PRAGMA foreign_keys = ON;');
+    }
+  };
+
+  // 3. Align network_cells identifier columns (lac, mcc, mnc, cell_id, bsic, pci) to TEXT
+  const ncTypeMap = new Map(getColInfos('network_cells').map(c => [c.name, c.type.toUpperCase()]));
+  const ncNeedsText = ['lac', 'mcc', 'mnc', 'cell_id', 'bsic', 'pci'].some(c => ncTypeMap.get(c) !== 'TEXT');
+  if (ncNeedsText) {
+    const cols = [
+      'id', 'mission_id', 'mission', 'channel', 'lac', 'mcc', 'mnc', 'rx_lev',
+      'cell_id', 'rat', 'bsic', 'psc', 'pci', 'is_pcs1900', 'rx_lev_dbm',
+      'downlink', 'dl_bandwidth', 'latitude', 'longitude', 'direction', 'is_neighbour', 'cid_lac_mnc',
+    ];
+    const castCols = new Set(['lac', 'mcc', 'mnc', 'cell_id', 'bsic', 'psc', 'pci']);
+    rebuildTable(
+      'network_cells',
+      `CREATE TABLE "network_cells" (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mission_id INTEGER REFERENCES missions(id) ON DELETE SET NULL,
+        mission TEXT,
+        channel INTEGER,
+        lac TEXT,
+        mcc TEXT,
+        mnc TEXT,
+        rx_lev REAL,
+        cell_id TEXT,
+        rat TEXT,
+        bsic TEXT,
+        psc TEXT,
+        pci TEXT,
+        is_pcs1900 INTEGER DEFAULT 0,
+        rx_lev_dbm REAL,
+        downlink REAL,
+        dl_bandwidth REAL,
+        latitude REAL,
+        longitude REAL,
+        direction REAL,
+        is_neighbour INTEGER DEFAULT 0,
+        cid_lac_mnc TEXT
+      );`,
+      cols,
+      cols.map(c => (castCols.has(c) ? `CASE WHEN "${c}" IS NULL THEN NULL ELSE CAST("${c}" AS TEXT) END` : `"${c}"`))
+    );
+  }
+
+  // 4. Align plmn_storage composite PK (mcc, mnc) to TEXT
+  const plmnTypeMap = new Map(getColInfos('plmn_storage').map(c => [c.name, c.type.toUpperCase()]));
+  if (plmnTypeMap.get('mcc') !== 'TEXT' || plmnTypeMap.get('mnc') !== 'TEXT') {
+    rebuildTable(
+      'plmn_storage',
+      `CREATE TABLE "plmn_storage" (
+        mcc TEXT NOT NULL,
+        mnc TEXT NOT NULL,
+        country TEXT NOT NULL,
+        code TEXT NOT NULL,
+        name TEXT NOT NULL,
+        PRIMARY KEY (mcc, mnc)
+      );`,
+      ['mcc', 'mnc', 'country', 'code', 'name'],
+      ['CAST("mcc" AS TEXT)', 'CAST("mnc" AS TEXT)', '"country"', '"code"', '"name"']
+    );
+  }
+
+  // 5. Align map_cells (mcc, mnc, lac, cid -> TEXT) + FK db_id -> map_cell_databases(id)
+  const mcTypeMap = new Map(getColInfos('map_cells').map(c => [c.name, c.type.toUpperCase()]));
+  const mcHasFk = getFks('map_cells').some(f => f.from === 'db_id' && f.table === 'map_cell_databases');
+  if (['mcc', 'mnc', 'lac', 'cid'].some(c => mcTypeMap.get(c) !== 'TEXT') || !mcHasFk) {
+    const cols = [
+      'id', 'db_id', 'contents', 'lat', 'lng', 'mcc', 'mnc', 'lac', 'cid',
+      'mcc_mnc_junction', 'address', 'direction', 'format_hex', 'opening_angle',
+      'radius', 'sc_pci', 'channel', 'antenna_type',
+    ];
+    const castCols = new Set(['mcc', 'mnc', 'lac', 'cid']);
+    rebuildTable(
+      'map_cells',
+      `CREATE TABLE "map_cells" (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        db_id INTEGER NOT NULL REFERENCES map_cell_databases(id) ON DELETE CASCADE,
+        contents TEXT,
+        lat REAL NOT NULL,
+        lng REAL NOT NULL,
+        mcc TEXT,
+        mnc TEXT,
+        lac TEXT,
+        cid TEXT,
+        mcc_mnc_junction TEXT,
+        address TEXT,
+        direction REAL,
+        format_hex TEXT,
+        opening_angle REAL,
+        radius REAL,
+        sc_pci INTEGER,
+        channel INTEGER,
+        antenna_type TEXT
+      );`,
+      cols,
+      cols.map(c => (castCols.has(c) ? `CASE WHEN "${c}" IS NULL THEN NULL ELSE CAST("${c}" AS TEXT) END` : `"${c}"`))
+    );
+  }
+
+  // 6. Ensure missing SQLite foreign keys on location_extras, mission_files, location_files, target_files
+  if (!getFks('location_extras').some(f => f.from === 'mission_id' && f.table === 'missions')) {
+    rebuildTable(
+      'location_extras',
+      `CREATE TABLE "location_extras" (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mission_id INTEGER NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        description TEXT NOT NULL
+      );`,
+      ['id', 'mission_id', 'description'],
+      ['"id"', '"mission_id"', '"description"']
+    );
+  }
+  if (!getFks('mission_files').some(f => f.from === 'mission_extra_id' && f.table === 'mission_extras')) {
+    rebuildTable(
+      'mission_files',
+      `CREATE TABLE "mission_files" (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mission_extra_id INTEGER NOT NULL REFERENCES mission_extras(id) ON DELETE CASCADE,
+        file_path TEXT NOT NULL,
+        file_type TEXT NOT NULL,
+        original_file_name TEXT NOT NULL,
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );`,
+      ['id', 'mission_extra_id', 'file_path', 'file_type', 'original_file_name', 'added_at'],
+      ['"id"', '"mission_extra_id"', '"file_path"', '"file_type"', '"original_file_name"', '"added_at"']
+    );
+  }
+  if (!getFks('location_files').some(f => f.from === 'location_extra_id' && f.table === 'location_extras')) {
+    rebuildTable(
+      'location_files',
+      `CREATE TABLE "location_files" (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        location_extra_id INTEGER NOT NULL REFERENCES location_extras(id) ON DELETE CASCADE,
+        file_path TEXT NOT NULL,
+        file_type TEXT NOT NULL,
+        original_file_name TEXT NOT NULL,
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );`,
+      ['id', 'location_extra_id', 'file_path', 'file_type', 'original_file_name', 'added_at'],
+      ['"id"', '"location_extra_id"', '"file_path"', '"file_type"', '"original_file_name"', '"added_at"']
+    );
+  }
+  if (!getFks('target_files').some(f => f.from === 'target_id' && f.table === 'targets')) {
+    rebuildTable(
+      'target_files',
+      `CREATE TABLE "target_files" (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+        file_path TEXT NOT NULL,
+        file_type TEXT NOT NULL,
+        original_file_name TEXT NOT NULL,
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );`,
+      ['id', 'target_id', 'file_path', 'file_type', 'original_file_name', 'added_at'],
+      ['"id"', '"target_id"', '"file_path"', '"file_type"', '"original_file_name"', '"added_at"']
+    );
+  }
+
+  // 7. Fix map_user_markers.description column type if declared as 'String'
+  const markerDesc = getColInfos('map_user_markers').find(c => c.name === 'description');
+  if (markerDesc && markerDesc.type.toUpperCase() !== 'TEXT') {
+    const cols = ['id', 'mission_id', 'mission', 'direction', 'type', 'description', 'image', 'color', 'width', 'height', 'latitude', 'longitude', 'timestamp'];
+    rebuildTable(
+      'map_user_markers',
+      `CREATE TABLE "map_user_markers" (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mission_id INTEGER REFERENCES missions(id) ON DELETE SET NULL,
+        mission TEXT,
+        direction REAL,
+        type TEXT,
+        description TEXT,
+        image TEXT,
+        color TEXT DEFAULT '#ef4444',
+        width REAL DEFAULT 32,
+        height REAL DEFAULT 32,
+        latitude REAL NOT NULL,
+        longitude REAL NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      );`,
+      cols,
+      cols.map(c => `"${c}"`)
+    );
+  }
+}
+
 export function ensurePhase2Indexes(targetDb: DatabaseSync = db) {
   targetDb.exec(`
     CREATE INDEX IF NOT EXISTS idx_missions_mission ON missions(mission);
@@ -543,6 +801,8 @@ export function ensurePhase2Indexes(targetDb: DatabaseSync = db) {
     CREATE INDEX IF NOT EXISTS idx_reg_country_code ON registrations(country_code);
     CREATE INDEX IF NOT EXISTS idx_reg_imsi ON registrations(imsi);
     CREATE INDEX IF NOT EXISTS idx_reg_imei ON registrations(imei);
+    CREATE INDEX IF NOT EXISTS idx_reg_mcc ON registrations(mcc);
+    CREATE INDEX IF NOT EXISTS idx_reg_lac ON registrations(lac);
     CREATE INDEX IF NOT EXISTS idx_reg_last_seen ON registrations(last_seen);
     CREATE INDEX IF NOT EXISTS idx_reg_bts_name ON registrations(bts_name);
     CREATE INDEX IF NOT EXISTS idx_reg_ue_model ON registrations(ue_model);
@@ -612,17 +872,17 @@ function seedDefaultData() {
 
     // Seed PLMN Storage
     const plmns = [
-      { mcc: 602, mnc: 1, country: 'Egypt', code: 'EGY', name: 'Vodafone Egypt' },
-      { mcc: 602, mnc: 2, country: 'Egypt', code: 'EGY', name: 'Orange Egypt' },
-      { mcc: 602, mnc: 3, country: 'Egypt', code: 'EGY', name: 'Etisalat Egypt' },
-      { mcc: 602, mnc: 4, country: 'Egypt', code: 'EGY', name: 'Telecom Egypt (WE)' },
-      { mcc: 420, mnc: 1, country: 'Saudi Arabia', code: 'SAU', name: 'STC' },
-      { mcc: 420, mnc: 3, country: 'Saudi Arabia', code: 'SAU', name: 'Mobily' },
-      { mcc: 424, mnc: 2, country: 'United Arab Emirates', code: 'ARE', name: 'Etisalat UAE (e&)' },
-      { mcc: 424, mnc: 3, country: 'United Arab Emirates', code: 'ARE', name: 'du' },
-      { mcc: 208, mnc: 1, country: 'France', code: 'FRA', name: 'Orange France' },
-      { mcc: 234, mnc: 15, country: 'United Kingdom', code: 'GBR', name: 'Vodafone UK' },
-      { mcc: 310, mnc: 410, country: 'United States', code: 'USA', name: 'AT&T Mobility' },
+      { mcc: '602', mnc: '1', country: 'Egypt', code: 'EGY', name: 'Vodafone Egypt' },
+      { mcc: '602', mnc: '2', country: 'Egypt', code: 'EGY', name: 'Orange Egypt' },
+      { mcc: '602', mnc: '3', country: 'Egypt', code: 'EGY', name: 'Etisalat Egypt' },
+      { mcc: '602', mnc: '4', country: 'Egypt', code: 'EGY', name: 'Telecom Egypt (WE)' },
+      { mcc: '420', mnc: '1', country: 'Saudi Arabia', code: 'SAU', name: 'STC' },
+      { mcc: '420', mnc: '3', country: 'Saudi Arabia', code: 'SAU', name: 'Mobily' },
+      { mcc: '424', mnc: '2', country: 'United Arab Emirates', code: 'ARE', name: 'Etisalat UAE (e&)' },
+      { mcc: '424', mnc: '3', country: 'United Arab Emirates', code: 'ARE', name: 'du' },
+      { mcc: '208', mnc: '1', country: 'France', code: 'FRA', name: 'Orange France' },
+      { mcc: '234', mnc: '15', country: 'United Kingdom', code: 'GBR', name: 'Vodafone UK' },
+      { mcc: '310', mnc: '410', country: 'United States', code: 'USA', name: 'AT&T Mobility' },
     ];
     const insertPlmn = db.prepare('INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES (?, ?, ?, ?, ?)');
     for (const p of plmns) insertPlmn.run(p.mcc, p.mnc, p.country, p.code, p.name);
@@ -687,13 +947,13 @@ function seedDefaultData() {
     `).run();
 
     const mapCells = [
-      { db_id: 1, contents: 'Downtown Macro Cell Sector 1', lat: 30.0444, lng: 31.2357, mcc: 602, mnc: 1, lac: 1045, cid: 20491, address: 'Tahrir Square Central Hub', direction: 120, radius: 850, sc_pci: 312, channel: 1850 },
-      { db_id: 1, contents: 'Downtown Macro Cell Sector 2', lat: 30.0489, lng: 31.2401, mcc: 602, mnc: 1, lac: 1045, cid: 20492, address: 'Nile Corniche Tower', direction: 240, radius: 950, sc_pci: 313, channel: 1850 },
-      { db_id: 1, contents: 'Downtown Macro Cell Sector 3', lat: 30.0521, lng: 31.2312, mcc: 602, mnc: 1, lac: 1045, cid: 20493, address: 'Opera Island Relay', direction: 350, radius: 780, sc_pci: 314, channel: 1850 },
-      { db_id: 2, contents: 'Highway Toll Station Mast', lat: 30.1205, lng: 31.3504, mcc: 602, mnc: 2, lac: 2033, cid: 45012, address: 'Desert Road Gate KM 14', direction: 45, radius: 1500, sc_pci: 188, channel: 2100 },
-      { db_id: 2, contents: 'Industrial Depot Microcell', lat: 30.1450, lng: 31.3780, mcc: 602, mnc: 2, lac: 2033, cid: 45015, address: 'Logistics Park Tower 4', direction: 180, radius: 1200, sc_pci: 190, channel: 2100 },
-      { db_id: 3, contents: 'Port Entry Light Tower Cell', lat: 31.2001, lng: 29.9187, mcc: 602, mnc: 3, lac: 5010, cid: 33100, address: 'Alexandria Harbor Gate 2', direction: 290, radius: 2200, sc_pci: 94, channel: 2600 },
-      { db_id: 3, contents: 'Maritime Terminal Cell', lat: 31.2150, lng: 29.9320, mcc: 602, mnc: 3, lac: 5010, cid: 33105, address: 'Dry Dock Station B', direction: 60, radius: 1800, sc_pci: 96, channel: 2600 },
+      { db_id: 1, contents: 'Downtown Macro Cell Sector 1', lat: 30.0444, lng: 31.2357, mcc: '602', mnc: '1', lac: '1045', cid: '20491', address: 'Tahrir Square Central Hub', direction: 120, radius: 850, sc_pci: 312, channel: 1850 },
+      { db_id: 1, contents: 'Downtown Macro Cell Sector 2', lat: 30.0489, lng: 31.2401, mcc: '602', mnc: '1', lac: '1045', cid: '20492', address: 'Nile Corniche Tower', direction: 240, radius: 950, sc_pci: 313, channel: 1850 },
+      { db_id: 1, contents: 'Downtown Macro Cell Sector 3', lat: 30.0521, lng: 31.2312, mcc: '602', mnc: '1', lac: '1045', cid: '20493', address: 'Opera Island Relay', direction: 350, radius: 780, sc_pci: 314, channel: 1850 },
+      { db_id: 2, contents: 'Highway Toll Station Mast', lat: 30.1205, lng: 31.3504, mcc: '602', mnc: '2', lac: '2033', cid: '45012', address: 'Desert Road Gate KM 14', direction: 45, radius: 1500, sc_pci: 188, channel: 2100 },
+      { db_id: 2, contents: 'Industrial Depot Microcell', lat: 30.1450, lng: 31.3780, mcc: '602', mnc: '2', lac: '2033', cid: '45015', address: 'Logistics Park Tower 4', direction: 180, radius: 1200, sc_pci: 190, channel: 2100 },
+      { db_id: 3, contents: 'Port Entry Light Tower Cell', lat: 31.2001, lng: 29.9187, mcc: '602', mnc: '3', lac: '5010', cid: '33100', address: 'Alexandria Harbor Gate 2', direction: 290, radius: 2200, sc_pci: 94, channel: 2600 },
+      { db_id: 3, contents: 'Maritime Terminal Cell', lat: 31.2150, lng: 29.9320, mcc: '602', mnc: '3', lac: '5010', cid: '33105', address: 'Dry Dock Station B', direction: 60, radius: 1800, sc_pci: 96, channel: 2600 },
     ];
     const insertMapCell = db.prepare(`
       INSERT INTO map_cells (db_id, contents, lat, lng, mcc, mnc, lac, cid, address, direction, radius, sc_pci, channel)
@@ -705,11 +965,11 @@ function seedDefaultData() {
 
     // Seed Network Cells
     const netCells = [
-      { mission_id: 1, mission: 'ALPHA_RED_01', channel: 1850, lac: 1045, mcc: 602, mnc: 1, rx_lev: 42.5, cell_id: 20491, rat: 'LTE', bsic: 45, pci: 312, is_pcs1900: 0, rx_lev_dbm: -68.4, downlink: 1805.0, dl_bandwidth: 20.0, latitude: 30.0444, longitude: 31.2357, direction: 120, is_neighbour: 0, cid_lac_mnc: '20491-1045-1' },
-      { mission_id: 1, mission: 'ALPHA_RED_01', channel: 1850, lac: 1045, mcc: 602, mnc: 1, rx_lev: 38.0, cell_id: 20492, rat: 'LTE', bsic: 45, pci: 313, is_pcs1900: 0, rx_lev_dbm: -75.1, downlink: 1805.0, dl_bandwidth: 20.0, latitude: 30.0489, longitude: 31.2401, direction: 240, is_neighbour: 1, cid_lac_mnc: '20492-1045-1' },
-      { mission_id: 2, mission: 'BRAVO_SURVEIL_04', channel: 2100, lac: 2033, mcc: 602, mnc: 2, rx_lev: 50.2, cell_id: 45012, rat: 'UMTS', bsic: 22, pci: 188, is_pcs1900: 0, rx_lev_dbm: -61.2, downlink: 2110.0, dl_bandwidth: 15.0, latitude: 30.1205, longitude: 31.3504, direction: 45, is_neighbour: 0, cid_lac_mnc: '45012-2033-2' },
-      { mission_id: 3, mission: 'DELTA_SENTINEL_09', channel: 2600, lac: 5010, mcc: 602, mnc: 3, rx_lev: 32.1, cell_id: 33100, rat: 'LTE', bsic: 18, pci: 94, is_pcs1900: 0, rx_lev_dbm: -82.6, downlink: 2620.0, dl_bandwidth: 20.0, latitude: 31.2001, longitude: 29.9187, direction: 290, is_neighbour: 0, cid_lac_mnc: '33100-5010-3' },
-      { mission_id: 4, mission: 'ECHO_SHADOW_12', channel: 900, lac: 3012, mcc: 602, mnc: 4, rx_lev: 44.0, cell_id: 11200, rat: 'GSM', bsic: 31, pci: 0, is_pcs1900: 0, rx_lev_dbm: -65.0, downlink: 935.2, dl_bandwidth: 5.0, latitude: 30.0820, longitude: 31.3120, direction: 90, is_neighbour: 0, cid_lac_mnc: '11200-3012-4' },
+      { mission_id: 1, mission: 'ALPHA_RED_01', channel: 1850, lac: '1045', mcc: '602', mnc: '1', rx_lev: 42.5, cell_id: '20491', rat: 'LTE', bsic: '45', pci: '312', is_pcs1900: 0, rx_lev_dbm: -68.4, downlink: 1805.0, dl_bandwidth: 20.0, latitude: 30.0444, longitude: 31.2357, direction: 120, is_neighbour: 0, cid_lac_mnc: '20491-1045-1' },
+      { mission_id: 1, mission: 'ALPHA_RED_01', channel: 1850, lac: '1045', mcc: '602', mnc: '1', rx_lev: 38.0, cell_id: '20492', rat: 'LTE', bsic: '45', pci: '313', is_pcs1900: 0, rx_lev_dbm: -75.1, downlink: 1805.0, dl_bandwidth: 20.0, latitude: 30.0489, longitude: 31.2401, direction: 240, is_neighbour: 1, cid_lac_mnc: '20492-1045-1' },
+      { mission_id: 2, mission: 'BRAVO_SURVEIL_04', channel: 2100, lac: '2033', mcc: '602', mnc: '2', rx_lev: 50.2, cell_id: '45012', rat: 'UMTS', bsic: '22', pci: '188', is_pcs1900: 0, rx_lev_dbm: -61.2, downlink: 2110.0, dl_bandwidth: 15.0, latitude: 30.1205, longitude: 31.3504, direction: 45, is_neighbour: 0, cid_lac_mnc: '45012-2033-2' },
+      { mission_id: 3, mission: 'DELTA_SENTINEL_09', channel: 2600, lac: '5010', mcc: '602', mnc: '3', rx_lev: 32.1, cell_id: '33100', rat: 'LTE', bsic: '18', pci: '94', is_pcs1900: 0, rx_lev_dbm: -82.6, downlink: 2620.0, dl_bandwidth: 20.0, latitude: 31.2001, longitude: 29.9187, direction: 290, is_neighbour: 0, cid_lac_mnc: '33100-5010-3' },
+      { mission_id: 4, mission: 'ECHO_SHADOW_12', channel: 900, lac: '3012', mcc: '602', mnc: '4', rx_lev: 44.0, cell_id: '11200', rat: 'GSM', bsic: '31', pci: '0', is_pcs1900: 0, rx_lev_dbm: -65.0, downlink: 935.2, dl_bandwidth: 5.0, latitude: 30.0820, longitude: 31.3120, direction: 90, is_neighbour: 0, cid_lac_mnc: '11200-3012-4' },
     ];
     const insertNetCell = db.prepare(`
       INSERT INTO network_cells (mission_id, mission, channel, lac, mcc, mnc, rx_lev, cell_id, rat, bsic, pci, is_pcs1900, rx_lev_dbm, downlink, dl_bandwidth, latitude, longitude, direction, is_neighbour, cid_lac_mnc)
@@ -865,20 +1125,20 @@ function seedPhase2Enrichment() {
 
   // Ensure PLMN entries cover all Phase 2 countries/operators
   const phase2Plmns = [
-    { mcc: 602, mnc: 10, country: 'Egypt', code: 'EGY', name: 'المحمول العسكري المصري' },
-    { mcc: 602, mnc: 11, country: 'Egypt', code: 'EGY', name: 'المحمول العسكري المصري' },
-    { mcc: 425, mnc: 1, country: 'Israel', code: 'ISR', name: 'Partner' },
-    { mcc: 425, mnc: 2, country: 'Israel', code: 'ISR', name: 'Cellcom' },
-    { mcc: 425, mnc: 3, country: 'Israel', code: 'ISR', name: 'Pelephone' },
-    { mcc: 425, mnc: 5, country: 'Palestine', code: 'PSE', name: 'Jawwal' },
-    { mcc: 425, mnc: 6, country: 'Palestine', code: 'PSE', name: 'Wataniya' },
-    { mcc: 425, mnc: 7, country: 'Israel', code: 'ISR', name: 'Hot Mobile' },
-    { mcc: 425, mnc: 9, country: 'Israel', code: 'ISR', name: 'We4G' },
-    { mcc: 425, mnc: 24, country: 'Israel', code: 'ISR', name: 'Excluded Operator 24' },
-    { mcc: 425, mnc: 25, country: 'Israel', code: 'ISR', name: 'IMOD' },
-    { mcc: 425, mnc: 28, country: 'Israel', code: 'ISR', name: 'PHI Networks' },
-    { mcc: 425, mnc: 29, country: 'Israel', code: 'ISR', name: 'CG Networks' },
-    { mcc: 416, mnc: 1, country: 'Jordan', code: 'JOR', name: 'Zain Jordan' },
+    { mcc: '602', mnc: '10', country: 'Egypt', code: 'EGY', name: 'المحمول العسكري المصري' },
+    { mcc: '602', mnc: '11', country: 'Egypt', code: 'EGY', name: 'المحمول العسكري المصري' },
+    { mcc: '425', mnc: '1', country: 'Israel', code: 'ISR', name: 'Partner' },
+    { mcc: '425', mnc: '2', country: 'Israel', code: 'ISR', name: 'Cellcom' },
+    { mcc: '425', mnc: '3', country: 'Israel', code: 'ISR', name: 'Pelephone' },
+    { mcc: '425', mnc: '5', country: 'Palestine', code: 'PSE', name: 'Jawwal' },
+    { mcc: '425', mnc: '6', country: 'Palestine', code: 'PSE', name: 'Wataniya' },
+    { mcc: '425', mnc: '7', country: 'Israel', code: 'ISR', name: 'Hot Mobile' },
+    { mcc: '425', mnc: '9', country: 'Israel', code: 'ISR', name: 'We4G' },
+    { mcc: '425', mnc: '24', country: 'Israel', code: 'ISR', name: 'Excluded Operator 24' },
+    { mcc: '425', mnc: '25', country: 'Israel', code: 'ISR', name: 'IMOD' },
+    { mcc: '425', mnc: '28', country: 'Israel', code: 'ISR', name: 'PHI Networks' },
+    { mcc: '425', mnc: '29', country: 'Israel', code: 'ISR', name: 'CG Networks' },
+    { mcc: '416', mnc: '1', country: 'Jordan', code: 'JOR', name: 'Zain Jordan' },
   ];
   const upsertPlmn = db.prepare(`
     INSERT INTO plmn_storage (mcc, mnc, country, code, name)
@@ -890,7 +1150,7 @@ function seedPhase2Enrichment() {
   }
 
   // Only add Phase 2 operational dataset once
-  const hasPhase2Cells = db.prepare(`SELECT COUNT(*) as c FROM network_cells WHERE mcc = 425`).get() as { c: number };
+  const hasPhase2Cells = db.prepare(`SELECT COUNT(*) as c FROM network_cells WHERE mcc = '425'`).get() as { c: number };
   if (hasPhase2Cells.c > 0) return;
 
   // Add two missions sharing the exact same mission label at distinct locations (demonstrates duplicate mission labels)

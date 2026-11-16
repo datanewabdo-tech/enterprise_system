@@ -63,10 +63,12 @@ export const InteractiveMap: React.FC = () => {
 
   // Fetch all spatial layers from backend
   useEffect(() => {
+    if (!authToken) return;
     const params = activeMission && activeMission !== 'ALL' ? `?mission=${activeMission}` : '';
     apiFetch(`/api/v1/map/all-layers${params}`)
-      .then(res => res.json())
+      .then(res => (res.ok ? res.json() : null))
       .then(data => {
+        if (!data) return;
         setSpatialData({
           mapCells: data.mapCells || [],
           netCells: data.netCells || [],
@@ -77,7 +79,7 @@ export const InteractiveMap: React.FC = () => {
         });
       })
       .catch(err => console.error('Failed to load spatial layers:', err));
-  }, [activeMission, apiFetch]);
+  }, [activeMission, authToken, apiFetch]);
 
   // Initialize Leaflet Map
   useEffect(() => {
@@ -88,13 +90,24 @@ export const InteractiveMap: React.FC = () => {
       center: [30.0444, 31.2357],
       zoom: 12,
       zoomControl: false,
+      preferCanvas: true,
     });
 
-    // Dark Tile Layer (OpenStreetMap / Carto Dark Matter style)
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+    // Same-origin cached OpenStreetMap tile proxy (no API key required)
+    const primaryTiles = L.tileLayer('/api/v1/map/tiles/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors',
       maxZoom: 19,
-    }).addTo(map);
+      crossOrigin: 'anonymous',
+    });
+
+    let switchedToFallback = false;
+    primaryTiles.on('tileerror', () => {
+      if (switchedToFallback) return;
+      switchedToFallback = true;
+      primaryTiles.setUrl('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png');
+    });
+
+    primaryTiles.addTo(map);
 
     // Zoom controls at top right
     L.control.zoom({ position: 'topright' }).addTo(map);

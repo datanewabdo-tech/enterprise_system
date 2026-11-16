@@ -13,13 +13,13 @@ import {
 } from 'lucide-react';
 
 export const SystemHealth: React.FC = () => {
-  const { t } = useApp();
+  const { t, apiFetch } = useApp();
   const [health, setHealth] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
   const fetchHealth = () => {
     setLoading(true);
-    fetch('/api/v1/system/health')
+    apiFetch('/api/v1/system/health')
       .then(r => r.json())
       .then(data => setHealth(data))
       .catch(() => {})

@@ -65,13 +65,14 @@ export const DashboardFilterSchema = z.object({
 
   // NetworkCell-only Filters (strictly no timestamp/createdAt filters)
   rat: stringArray,
-  mcc: numberArray,
-  mnc: numberArray,
-  lac: optionalInt,
-  cellId: optionalInt,
+  mcc: stringArray,
+  mnc: stringArray,
+  lac: z.string().trim().optional(),
+  cellId: z.string().trim().optional(),
   channel: optionalInt,
-  bsic: optionalInt,
-  pci: optionalInt,
+  bsic: z.string().trim().optional(),
+  psc: z.string().trim().optional(),
+  pci: z.string().trim().optional(),
   rxLevMin: optionalNumber,
   rxLevMax: optionalNumber,
   rxLevDbmMin: optionalNumber,
@@ -120,19 +121,21 @@ export const DashboardExportScopeSchema = z.object({
   includeSensitiveIdentifiers: z.boolean().default(false),
 });
 
+const defaultFiltersObj = {
+  hasBtsLocation: 'all' as const,
+  btsLocationOutdated: 'all' as const,
+  hasDeviceLocation: 'all' as const,
+  isNeighbour: 'all' as const,
+  isPcs1900: 'all' as const,
+  hasCoordinates: 'all' as const,
+  hasLatitude: 'all' as const,
+  hasLongitude: 'all' as const,
+};
+
 export const DashboardExportRequestSchema = z.object({
   format: z.enum(['pdf', 'xlsx', 'docx']),
   language: z.enum(['en', 'ar']).default('en'),
-  filters: DashboardFilterSchema.optional().default({
-    hasBtsLocation: 'all',
-    btsLocationOutdated: 'all',
-    hasDeviceLocation: 'all',
-    isNeighbour: 'all',
-    isPcs1900: 'all',
-    hasCoordinates: 'all',
-    hasLatitude: 'all',
-    hasLongitude: 'all',
-  }),
+  filters: DashboardFilterSchema.optional().default(defaultFiltersObj),
   scope: DashboardExportScopeSchema.optional().default({
     kpis: true,
     appliedFilters: true,
@@ -145,4 +148,18 @@ export const DashboardExportRequestSchema = z.object({
     includeSensitiveIdentifiers: false,
   }),
   chartImages: z.record(z.string(), z.string()).optional(),
+});
+
+export const ChartExportRequestSchema = z.object({
+  chartId: z.enum([
+    'registrationsByCountry',
+    'networkCellsByMcc',
+    'militaryNetworks',
+    'civilianNetworks',
+    'btsMap',
+  ]),
+  format: z.enum(['png', 'pdf', 'xlsx', 'csv', 'geojson']),
+  language: z.enum(['en', 'ar']).default('en'),
+  filters: DashboardFilterSchema.optional().default(defaultFiltersObj),
+  chartImage: z.string().optional(),
 });

@@ -49,6 +49,14 @@ model Registration {
   imsi                  String?
   imei                  String?
   ueModel               String?   @map("ue_model")
+  mcc                   String?
+  mnc                   String?
+  lac                   Int?
+  rat                   Int?
+  lastEvent             String?   @map("last_event")
+  time                  BigInt?
+  targetName            String?   @map("target_name")
+  uplinkPower           Float?    @map("uplink_power")
   btsLocation           String?   @map("bts_location")
   btsAltitude           Float?    @map("bts_altitude")
   btsLocationOutdated   Boolean?  @default(false) @map("bts_location_outdated")
@@ -68,6 +76,8 @@ model Registration {
   @@index([countryCode])
   @@index([imsi])
   @@index([imei])
+  @@index([mcc])
+  @@index([lac])
   @@index([lastSeen])
   @@index([btsName])
   @@index([ueModel])
@@ -161,14 +171,15 @@ model NetworkCell {
   missionId   Int?     @map("mission_id")
   mission     String?
   channel     Int?
-  lac         Int?
-  mcc         Int?
-  mnc         Int?
+  lac         String?
+  mcc         String?
+  mnc         String?
   rxLev       Float?   @map("rx_lev")
-  cellId      Int?     @map("cell_id")
+  cellId      String?  @map("cell_id")
   rat         String?
-  bsic        Int?
-  pci         Int?
+  bsic        String?
+  psc         String?
+  pci         String?
   isPcs1900   Boolean? @default(false) @map("is_pcs1900")
   rxLevDbm    Float?   @map("rx_lev_dbm")
   downlink    Float?
@@ -278,10 +289,10 @@ model MapCell {
   contents        String?
   lat             Float
   lng             Float
-  mcc             Int?
-  mnc             Int?
-  lac             Int?
-  cid             Int?
+  mcc             String?
+  mnc             String?
+  lac             String?
+  cid             String?
   mccMncJunction  String?  @map("mcc_mnc_junction")
   address         String?
   direction       Float?
@@ -301,8 +312,8 @@ model MapCell {
 
 // 14. PLMN Storage
 model PlmnStorage {
-  mcc     Int
-  mnc     Int
+  mcc     String
+  mnc     String
   country String
   code    String
   name    String

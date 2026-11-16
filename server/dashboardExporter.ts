@@ -265,6 +265,548 @@ function cleanupOldExports() {
   }
 }
 
+export type ExportableChartId =
+  | 'registrationsByCountry'
+  | 'networkCellsByMcc'
+  | 'militaryNetworks'
+  | 'civilianNetworks'
+  | 'btsMap';
+
+export type ChartExportFormat = 'png' | 'pdf' | 'xlsx' | 'csv' | 'geojson';
+
+export interface ChartExportOptions {
+  chartId: ExportableChartId;
+  format: ChartExportFormat;
+  language: 'en' | 'ar';
+  filters: Partial<DashboardFilters>;
+  chartImage?: string;
+  userId?: number;
+  username: string;
+}
+
+function escapeCsvCell(val: any): string {
+  const str = String(val ?? '');
+  if (/[",\r\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function getChartExportMeta(chartId: ExportableChartId, dashboard: any, language: 'en' | 'ar') {
+  const isAr = language === 'ar';
+  switch (chartId) {
+    case 'registrationsByCountry': {
+      const items = dashboard.registrationsByCountry?.items || [];
+      return {
+        title: isAr ? dashboard.registrationsByCountry.titleAr : dashboard.registrationsByCountry.titleEn,
+        sheetName: isAr ? 'الشرائح لكل دولة' : 'Registrations by Country',
+        headers: [
+          isAr ? 'الترتيب' : 'Rank',
+          isAr ? 'الدولة' : 'Country',
+          isAr ? 'شرائح IMSI الفريدة' : 'Distinct IMSIs',
+          isAr ? 'إجمالي السجلات' : 'Total Records',
+          isAr ? 'النسبة %' : 'Share (%)',
+        ],
+        colWidths: [12, 30, 22, 20, 16],
+        colRatios: [0.12, 0.36, 0.2, 0.18, 0.14],
+        textCols: [] as number[],
+        rows: items.map((i: any) => [i.rank, i.country, i.distinctImsiCount, i.totalRecords, i.percentageShare]),
+        totalsRow: [
+          '',
+          isAr ? 'الإجمالي' : 'TOTAL',
+          dashboard.registrationsByCountry?.totalDistinctImsis ?? 0,
+          items.reduce((s: number, i: any) => s + Number(i.totalRecords || 0), 0),
+          100,
+        ],
+      };
+    }
+    case 'networkCellsByMcc': {
+      const items = dashboard.networkCellsByMcc?.items || [];
+      return {
+        title: isAr ? dashboard.networkCellsByMcc.titleAr : dashboard.networkCellsByMcc.titleEn,
+        sheetName: isAr ? 'الخلايا لكل دولة MCC' : 'Network Cells by MCC',
+        headers: [
+          isAr ? 'الترتيب' : 'Rank',
+          'MCC',
+          isAr ? 'الدولة' : 'Country',
+          isAr ? 'الخلايا الفريدة' : 'Distinct Cells',
+          isAr ? 'إجمالي السجلات' : 'Total Records',
+          isAr ? 'النسبة %' : 'Share (%)',
+        ],
+        colWidths: [12, 14, 30, 20, 18, 16],
+        colRatios: [0.1, 0.14, 0.34, 0.16, 0.14, 0.12],
+        textCols: [2],
+        rows: items.map((i: any) => [i.rank, String(i.mcc), i.country, i.distinctCellCount, i.totalRecords, i.percentageShare]),
+        totalsRow: [
+          '',
+          '',
+          isAr ? 'الإجمالي' : 'TOTAL',
+          dashboard.networkCellsByMcc?.totalDistinctCells ?? 0,
+          items.reduce((s: number, i: any) => s + Number(i.totalRecords || 0), 0),
+          100,
+        ],
+      };
+    }
+    case 'militaryNetworks': {
+      const items = dashboard.militaryNetworks?.items || [];
+      return {
+        title: isAr ? dashboard.militaryNetworks.titleAr : dashboard.militaryNetworks.titleEn,
+        sheetName: isAr ? 'الشبكات العسكرية' : 'Military Networks',
+        headers: [
+          isAr ? 'الترتيب' : 'Rank',
+          isAr ? 'المشغل' : 'Operator',
+          isAr ? 'الدولة' : 'Country',
+          'MCC',
+          'MNC',
+          'MCC/MNC',
+          isAr ? 'الخلايا الفريدة' : 'Distinct Cells',
+          isAr ? 'إجمالي السجلات' : 'Total Records',
+        ],
+        colWidths: [10, 32, 18, 12, 12, 16, 18, 18],
+        colRatios: [0.08, 0.28, 0.14, 0.09, 0.09, 0.12, 0.1, 0.1],
+        textCols: [4, 5, 6],
+        rows: items.map((i: any) => [
+          i.rank,
+          i.operator,
+          i.country,
+          String(i.mcc),
+          String(i.mnc),
+          `${i.mcc}/${i.mnc}`,
+          i.distinctCellCount,
+          i.totalRecords,
+        ]),
+        totalsRow: [
+          '',
+          isAr ? 'الإجمالي' : 'TOTAL',
+          '',
+          '',
+          '',
+          '',
+          dashboard.militaryNetworks?.totalDistinctCells ?? 0,
+          dashboard.militaryNetworks?.totalRecords ?? 0,
+        ],
+      };
+    }
+    case 'civilianNetworks': {
+      const items = dashboard.civilianNetworks?.items || [];
+      return {
+        title: isAr ? dashboard.civilianNetworks.titleAr : dashboard.civilianNetworks.titleEn,
+        sheetName: isAr ? 'الشبكات المدنية' : 'Civilian Networks',
+        headers: [
+          isAr ? 'الترتيب بالمجموعة' : 'Group Rank',
+          isAr ? 'الدولة' : 'Country',
+          isAr ? 'المشغل' : 'Operator',
+          'MCC',
+          'MNC',
+          'MCC/MNC',
+          isAr ? 'الخلايا الفريدة' : 'Distinct Cells',
+          isAr ? 'إجمالي السجلات' : 'Total Records',
+        ],
+        colWidths: [14, 22, 26, 12, 12, 16, 18, 18],
+        colRatios: [0.1, 0.18, 0.24, 0.08, 0.08, 0.12, 0.1, 0.1],
+        textCols: [4, 5, 6],
+        rows: items.map((i: any) => [
+          i.rank,
+          i.country,
+          i.operator,
+          String(i.mcc),
+          String(i.mnc),
+          String(i.plmn || `${i.mcc}/${i.mnc}`),
+          i.distinctCellCount,
+          i.totalRecords,
+        ]),
+        totalsRow: [
+          '',
+          isAr ? 'الإجمالي' : 'TOTAL',
+          '',
+          '',
+          '',
+          '',
+          dashboard.civilianNetworks?.totalDistinctCells ?? 0,
+          dashboard.civilianNetworks?.totalRecords ?? 0,
+        ],
+      };
+    }
+    case 'btsMap': {
+      const locs = dashboard.btsMap?.locations || [];
+      return {
+        title: isAr ? 'توزيع مواقع الأبراج وخلايا الشبكة (BTS)' : 'BTS & Network Cell Geographic Map',
+        sheetName: isAr ? 'مواقع الأبراج BTS' : 'BTS Map Locations',
+        headers: [
+          isAr ? 'خط العرض' : 'Latitude',
+          isAr ? 'خط الطول' : 'Longitude',
+          isAr ? 'المصدر' : 'Source',
+          isAr ? 'عدد التسجيلات' : 'Registrations Count',
+          isAr ? 'عدد الخلايا' : 'Network Cells Count',
+          isAr ? 'أسماء الأبراج' : 'BTS Names',
+          isAr ? 'الدول' : 'Countries',
+          'MCC',
+          'MNC',
+          'Cell IDs',
+          'RATs',
+        ],
+        colWidths: [13, 13, 18, 18, 18, 28, 20, 14, 14, 24, 16],
+        colRatios: [0.09, 0.09, 0.1, 0.08, 0.08, 0.16, 0.11, 0.06, 0.06, 0.1, 0.07],
+        textCols: [8, 9, 10],
+        rows: locs.map((l: any) => [
+          l.lat,
+          l.lng,
+          l.source,
+          l.registrationCount,
+          l.networkCellCount,
+          (l.btsNames || []).join(', '),
+          (l.countries || []).join(', '),
+          (l.mccs || []).map(String).join(', '),
+          (l.mncs || []).map(String).join(', '),
+          (l.cellIds || []).map(String).join(', '),
+          (l.rats || []).join(', '),
+        ]),
+        totalsRow: [
+          '',
+          '',
+          isAr ? 'الإجمالي' : 'TOTAL',
+          dashboard.btsMap?.stats?.totalRegistrationLocations ?? 0,
+          dashboard.btsMap?.stats?.totalNetworkCellLocations ?? 0,
+          `${dashboard.btsMap?.stats?.uniqueLocations ?? locs.length} locations`,
+          '',
+          '',
+          '',
+          '',
+          '',
+        ],
+      };
+    }
+  }
+}
+
+export async function generateChartExport(options: ChartExportOptions) {
+  if (options.format === 'geojson' && options.chartId !== 'btsMap') {
+    throw new Error('GeoJSON export is only supported for the geographic BTS map');
+  }
+
+  const dashboard = getDashboardKPIs(options.filters);
+  const meta = getChartExportMeta(options.chartId, dashboard, options.language);
+  const filterRows = summarizeAppliedFilters(options.filters, options.language);
+  const isAr = options.language === 'ar';
+  const generatedAt = new Date().toISOString();
+
+  let buffer: Buffer;
+  let contentType = 'application/octet-stream';
+  const ext = options.format;
+
+  if (options.format === 'png') {
+    const imgBuf = decodeBase64Png(options.chartImage);
+    if (!imgBuf) {
+      throw new Error('Rendered PNG snapshot image is required for PNG export');
+    }
+    buffer = imgBuf;
+    contentType = 'image/png';
+  } else if (options.format === 'geojson') {
+    const locs = dashboard.btsMap?.locations || [];
+    const geojson = {
+      type: 'FeatureCollection',
+      crs: {
+        type: 'name',
+        properties: { name: 'EPSG:4326' },
+      },
+      metadata: {
+        title: meta.title,
+        generatedAt,
+        attribution: '© OpenStreetMap contributors',
+        coordinateReferenceSystem: 'WGS84 / EPSG:4326',
+        stats: dashboard.btsMap?.stats || {},
+        appliedFilters: filterRows,
+      },
+      features: locs.map((l: any) => ({
+        type: 'Feature',
+        geometry: {
+          type: 'Point',
+          coordinates: [l.lng, l.lat],
+        },
+        properties: {
+          locationKey: l.locationKey,
+          source: l.source,
+          registrationCount: l.registrationCount,
+          networkCellCount: l.networkCellCount,
+          btsNames: l.btsNames || [],
+          countries: l.countries || [],
+          rats: l.rats || [],
+          mccs: (l.mccs || []).map(String),
+          mncs: (l.mncs || []).map(String),
+          cellIds: (l.cellIds || []).map(String),
+        },
+      })),
+    };
+    buffer = Buffer.from(JSON.stringify(geojson, null, 2), 'utf8');
+    contentType = 'application/geo+json; charset=utf-8';
+  } else if (options.format === 'csv') {
+    const lines = [
+      meta.headers.map(escapeCsvCell).join(','),
+      ...meta.rows.map((r: any[]) => r.map(escapeCsvCell).join(',')),
+    ];
+    buffer = Buffer.from('\uFEFF' + lines.join('\r\n'), 'utf8');
+    contentType = 'text/csv; charset=utf-8';
+  } else if (options.format === 'xlsx') {
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'Enterprise Mission Intelligence Platform';
+    wb.created = new Date();
+    const ws = wb.addWorksheet(meta.sheetName.slice(0, 31));
+    ws.views = [{ state: 'frozen', ySplit: 4, rightToLeft: isAr }];
+
+    const colCount = Math.max(2, meta.headers.length);
+    ws.mergeCells(1, 1, 1, colCount);
+    const titleCell = ws.getCell(1, 1);
+    titleCell.value = meta.title;
+    titleCell.font = { bold: true, size: 13, color: { argb: 'FFFFFFFF' } };
+    titleCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } };
+    titleCell.alignment = { vertical: 'middle', horizontal: isAr ? 'right' : 'left' };
+    ws.getRow(1).height = 26;
+
+    const filterSummary = filterRows.map(f => `${f.key}: ${f.value}`).join(' | ') || (isAr ? 'بدون تصفية' : 'None');
+    ws.mergeCells(2, 1, 2, colCount);
+    const metaCell = ws.getCell(2, 1);
+    metaCell.value = `${isAr ? 'تاريخ التصدير' : 'Generated'}: ${generatedAt}  |  ${isAr ? 'الفلاتر' : 'Filters'}: ${filterSummary}`;
+    metaCell.font = { size: 9, color: { argb: 'FF475569' } };
+    metaCell.alignment = { vertical: 'middle', horizontal: isAr ? 'right' : 'left' };
+    ws.getRow(2).height = 18;
+
+    ws.getRow(3).height = 8;
+
+    const headerRow = ws.getRow(4);
+    meta.headers.forEach((h, i) => {
+      const cell = headerRow.getCell(i + 1);
+      cell.value = h;
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F172A' } };
+      cell.alignment = { vertical: 'middle', horizontal: isAr ? 'right' : 'left' };
+      ws.getColumn(i + 1).width = meta.colWidths[i] || 18;
+    });
+    headerRow.height = 22;
+
+    meta.rows.forEach((r: any[], rIdx: number) => {
+      const row = ws.getRow(5 + rIdx);
+      r.forEach((val, cIdx) => {
+        const cell = row.getCell(cIdx + 1);
+        const colNum = cIdx + 1;
+        if (meta.textCols.includes(colNum)) {
+          cell.value = String(val ?? '');
+          cell.numFmt = '@';
+        } else {
+          cell.value = val;
+        }
+        cell.alignment = { vertical: 'middle', horizontal: isAr ? 'right' : 'left' };
+      });
+    });
+
+    const totRow = ws.getRow(5 + meta.rows.length);
+    meta.totalsRow.forEach((val, cIdx) => {
+      const cell = totRow.getCell(cIdx + 1);
+      cell.value = val;
+      cell.font = { bold: true };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
+    });
+
+    if (options.chartId === 'btsMap') {
+      const attrRow = ws.getRow(6 + meta.rows.length);
+      attrRow.getCell(1).value = 'CRS: WGS84 / EPSG:4326 | Attribution: © OpenStreetMap contributors';
+      attrRow.getCell(1).font = { italic: true, size: 9, color: { argb: 'FF64748B' } };
+    }
+
+    const arrayBuffer = await wb.xlsx.writeBuffer();
+    buffer = Buffer.from(arrayBuffer);
+    contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  } else {
+    // PDF export (A4 Landscape with embedded chart/map PNG snapshot + aggregated table)
+    buffer = await new Promise<Buffer>((resolve, reject) => {
+      const doc = new PDFDocument({
+        size: 'A4',
+        layout: 'landscape',
+        margin: 36,
+        bufferPages: true,
+        info: {
+          Title: meta.title,
+          Author: options.username,
+        },
+      });
+      const chunks: Buffer[] = [];
+      doc.on('data', c => chunks.push(c));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
+
+      const hasLatin = fs.existsSync(FONT_PATHS.latinRegular) && fs.existsSync(FONT_PATHS.latinBold);
+      const hasArabic = fs.existsSync(FONT_PATHS.arabicRegular) && fs.existsSync(FONT_PATHS.arabicBold);
+      if (hasLatin) {
+        doc.registerFont('Latin', FONT_PATHS.latinRegular);
+        doc.registerFont('LatinBold', FONT_PATHS.latinBold);
+      }
+      if (hasArabic) {
+        doc.registerFont('Arabic', FONT_PATHS.arabicRegular);
+        doc.registerFont('ArabicBold', FONT_PATHS.arabicBold);
+      }
+
+      const pageW = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+      const pageBottom = doc.page.height - doc.page.margins.bottom - 20;
+
+      const pickFont = (text: string, bold = false) => {
+        if (hasArabicChars(text) && hasArabic) return bold ? 'ArabicBold' : 'Arabic';
+        if (hasLatin) return bold ? 'LatinBold' : 'Latin';
+        return bold ? 'Helvetica-Bold' : 'Helvetica';
+      };
+
+      const drawText = (text: string, x: number, y: number, opts: any = {}) => {
+        const str = String(text ?? '');
+        const dir = hasArabicChars(str) ? 'rtl' : 'ltr';
+        const shaped = shapePdfText(str, dir);
+        doc.font(pickFont(str, Boolean(opts.bold))).text(shaped, x, y, opts);
+      };
+
+      // Header Banner
+      doc.rect(doc.page.margins.left, doc.y, pageW, 46).fill('#1E3A8A');
+      doc.fillColor('#FFFFFF').fontSize(14);
+      drawText(meta.title, doc.page.margins.left + 12, doc.y + 8, {
+        width: pageW - 24,
+        align: isAr ? 'right' : 'left',
+        bold: true,
+      });
+      doc.fontSize(8.5).fillColor('#CBD5E1');
+      const filterLine = filterRows.slice(0, 6).map(f => `${f.key}: ${f.value}`).join('  |  ');
+      drawText(
+        `${isAr ? 'تاريخ التوليد' : 'Generated'}: ${generatedAt}  |  ${isAr ? 'المستخدم' : 'User'}: ${options.username}  |  ${filterLine}`,
+        doc.page.margins.left + 12,
+        doc.y + 28,
+        { width: pageW - 24, align: isAr ? 'right' : 'left', lineBreak: false }
+      );
+      doc.y += 56;
+
+      // Embedded chart / map snapshot
+      const imgBuf = decodeBase64Png(options.chartImage);
+      if (imgBuf) {
+        try {
+          doc.image(imgBuf, doc.page.margins.left, doc.y, { fit: [pageW, 250], align: 'center' });
+          doc.y += 258;
+        } catch {
+          // continue cleanly with tabular summary
+        }
+      }
+
+      if (options.chartId === 'btsMap') {
+        doc.fontSize(8).fillColor('#475569');
+        drawText(
+          `Coordinate Reference: WGS84 / EPSG:4326  |  Map Attribution: © OpenStreetMap contributors  |  Unique Locations: ${dashboard.btsMap?.stats?.uniqueLocations ?? 0}`,
+          doc.page.margins.left,
+          doc.y,
+          { width: pageW, align: isAr ? 'right' : 'left' }
+        );
+        doc.y += 16;
+      }
+
+      // Data table
+      const colWidths = meta.colRatios.map(r => r * pageW);
+      const rowHeight = 18;
+      const drawHeaderRow = (y: number) => {
+        doc.rect(doc.page.margins.left, y, pageW, rowHeight).fill('#1E293B');
+        let cx = doc.page.margins.left;
+        doc.fillColor('#FFFFFF').fontSize(7.5);
+        for (let i = 0; i < meta.headers.length; i++) {
+          drawText(meta.headers[i], cx + 3, y + 4, {
+            width: colWidths[i] - 6,
+            align: isAr ? 'right' : 'left',
+            bold: true,
+            lineBreak: false,
+          });
+          cx += colWidths[i];
+        }
+        return y + rowHeight;
+      };
+
+      if (doc.y + rowHeight * 2 > pageBottom) {
+        doc.addPage();
+      }
+      let y = drawHeaderRow(doc.y);
+      const rowsToRender = meta.rows.slice(0, 250);
+      for (let rIdx = 0; rIdx < rowsToRender.length; rIdx++) {
+        if (y + rowHeight > pageBottom) {
+          doc.addPage();
+          y = drawHeaderRow(doc.page.margins.top);
+        }
+        if (rIdx % 2 === 1) {
+          doc.rect(doc.page.margins.left, y, pageW, rowHeight).fill('#F8FAFC');
+        }
+        doc.rect(doc.page.margins.left, y, pageW, rowHeight).strokeColor('#E2E8F0').lineWidth(0.5).stroke();
+        let cx = doc.page.margins.left;
+        doc.fillColor('#1E293B').fontSize(7.5);
+        for (let cIdx = 0; cIdx < meta.headers.length; cIdx++) {
+          const val = String(rowsToRender[rIdx][cIdx] ?? '-').slice(0, 36);
+          drawText(val, cx + 3, y + 4, {
+            width: colWidths[cIdx] - 6,
+            align: isAr ? 'right' : 'left',
+            lineBreak: false,
+          });
+          cx += colWidths[cIdx];
+        }
+        y += rowHeight;
+      }
+
+      const range = doc.bufferedPageRange();
+      for (let i = range.start; i < range.start + range.count; i++) {
+        doc.switchToPage(i);
+        doc.font(hasLatin ? 'Latin' : 'Helvetica').fontSize(8).fillColor('#64748B');
+        doc.text(
+          `Page ${i + 1} of ${range.count} — Enterprise Mission Analytics Platform`,
+          doc.page.margins.left,
+          doc.page.height - 26,
+          { width: pageW, align: 'center' }
+        );
+      }
+      doc.end();
+    });
+    contentType = 'application/pdf';
+  }
+
+  const timestamp = Date.now();
+  const fileName = `chart_${options.chartId}_${options.language}_${timestamp}.${ext}`;
+  const filePath = path.join(EXPORTS_DIR, fileName);
+  fs.writeFileSync(filePath, buffer);
+
+  const scopeLabel = `chart:${options.chartId}`;
+  const info = db
+    .prepare(`
+      INSERT INTO export_history (user_id, username, format, scope, selected_missions, applied_filters, status, file_path, file_name, file_size)
+      VALUES (?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?, ?)
+    `)
+    .run(
+      options.userId || null,
+      options.username,
+      options.format.toUpperCase(),
+      scopeLabel,
+      JSON.stringify(options.filters.missionIds || []),
+      JSON.stringify(options.filters),
+      filePath,
+      fileName,
+      buffer.length
+    );
+
+  db.prepare(`
+    INSERT INTO audit_logs (user_id, username, action, module, record_id, ip_address, result, details)
+    VALUES (?, ?, 'CHART_EXPORT', 'export_history', ?, '127.0.0.1', 'SUCCESS', ?)
+  `).run(
+    options.userId || null,
+    options.username,
+    String(info.lastInsertRowid),
+    `Exported ${options.chartId} as ${options.format.toUpperCase()} (${options.language.toUpperCase()})`
+  );
+
+  cleanupOldExports();
+
+  return {
+    exportId: Number(info.lastInsertRowid),
+    fileName,
+    filePath,
+    contentType,
+    buffer,
+  };
+}
+
 async function buildExcelReport(
   dashboard: any,
   filterRows: Array<{ key: string; value: string }>,

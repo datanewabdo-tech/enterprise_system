@@ -1,0 +1,1078 @@
+# THIRD DEVELOPMENT PROMPT — Prisma/SQLite Type Alignment, Dashboard Export, Map Tile Repair, Full Integration Audit & Production Readiness
+
+## 1. GENERAL INSTRUCTIONS
+
+The Second Development Prompt has been implemented. Now perform the third development phase of the existing Enterprise Data Management, Mapping & Analytics Dashboard.
+
+**Do not rebuild the application. Do not remove existing functionality.**
+
+This phase has four main objectives:
+
+1. Ensure Prisma models and PostgreSQL columns correctly represent the original SQLite database types and values.
+2. Implement functional exports for all dashboard charts and the geographic map.
+3. Fix the BTS and Network Cell map's missing tile/API-key problem.
+4. Perform a complete application audit, fix defects, run tests, and verify production readiness.
+
+Inspect the actual existing project before making changes. Reuse existing components, libraries, APIs, and architecture wherever practical.
+
+Do not stop after producing a plan or report. Implement, test, fix, and retest.
+
+---
+
+# 2. CRITICAL REQUIREMENT — SQLITE AND PRISMA TYPE ALIGNMENT
+
+I want the Prisma schema and PostgreSQL database to represent the original SQLite database as accurately as possible.
+
+**Do not arbitrarily change the source data types or convert identifiers into numbers.**
+
+The SQLite database is the source of truth for the original data representation.
+
+The following table information was extracted from my SQLite database using Python/Pandas. Use it as a reference for your inspection.
+
+Important: Pandas `int64`, `float64`, and `object` are inferred DataFrame types. They are not necessarily the declared SQLite column types. Inspect the original SQLite database directly before deciding the final Prisma types.
+
+## 2.1 Source database structure
+
+### missions
+
+| Column | Observed type |
+|---|---|
+| id | int64 |
+| mission | object |
+| location | object |
+
+Sample:
+- 29 records.
+- `id` is an integer.
+- `mission` is text.
+- `location` is text.
+
+The `mission` field must allow duplicate values. Use `id` as the primary key and actual relationship key.
+
+### registrations
+
+The source contains 28 columns and approximately 54,833 records.
+
+| Column | Observed type |
+|---|---|
+| id | int64 |
+| reg_id | object |
+| mission | int64 |
+| bts | object |
+| bts_name | object |
+| country | object |
+| tmsi | object |
+| imsi | object |
+| imei | object |
+| ue_model | object |
+| mcc | object |
+| mnc | object |
+| lac | int64 |
+| rat | int64 |
+| last_event | object |
+| time | int64 |
+| target_name | object |
+| uplink_power | float64 |
+| bts_location | object |
+| bts_altitude | float64 |
+| bts_location_outdated | int64 |
+| distance_min | int64 |
+| distance_max | int64 |
+| country_code | object |
+| device_location | object |
+| last_seen | object |
+| update | int64 |
+| action | object |
+
+The exact column names and complete types must be verified against the actual SQLite file.
+
+Important requirements:
+- `mission` is an integer source field.
+- `reg_id` is an identifier, not a numeric quantity.
+- IMSI, IMEI, and TMSI must preserve their original string representation.
+- MCC and MNC must preserve leading zeros.
+- `bts_location` must remain capable of storing its original coordinate text.
+- Do not convert empty or NULL values into arbitrary values.
+
+### targets
+
+| Column | Observed type |
+|---|---|
+| id | int64 |
+| mission | int64 |
+| mission_name | object |
+| imsi | object |
+| imei | object |
+| name | object |
+| action | int64 |
+| redirect_tech | int64 |
+| redirect_bsic | int64 |
+| redirect_channel | int64 |
+| description | object |
+| is_p_c_s1900 | int64 |
+
+Approximately 31 records.
+
+### mission_extras
+
+| Column | Observed type |
+|---|---|
+| id | int64 |
+| mission_name | object |
+| description | object |
+
+Approximately 8 records.
+
+### location_extras
+
+| Column | Observed type |
+|---|---|
+| id | int64 |
+| mission_id | int64 |
+| description | object |
+
+Approximately 7 records.
+
+### mission_files
+
+| Column | Observed type |
+|---|---|
+| id | int64 |
+| mission_extra_id | int64 |
+| file_path | object |
+| file_type | int64 |
+| original_file_name | object |
+| added_at | int64 |
+
+### location_files
+
+| Column | Observed type |
+|---|---|
+| id | int64 |
+| location_extra_id | int64 |
+| file_path | object |
+| file_type | int64 |
+| original_file_name | object |
+| added_at | int64 |
+
+### network_cells
+
+The source contains 21 columns and approximately 4,777 records.
+
+| Column | Observed type |
+|---|---|
+| id | int64 |
+| mission | int64 |
+| channel | int64 |
+| lac | object |
+| mcc | object |
+| mnc | object |
+| rx_lev | object |
+| cell_id | object |
+| rat | int64 |
+| bsic | object |
+| psc | object |
+| pci | object |
+| is_pcs1900 | int64 |
+| rx_lev_dbm | object |
+| downlink | object |
+| dl_bandwidth | object |
+| latitude | object |
+| longitude | object |
+| direction | object |
+| is_neighbour | int64 |
+| cid_lac_mnc | object |
+
+Important:
+- MCC is text in the observed source data.
+- MNC is text in the observed source data.
+- LAC is text in the observed source data.
+- `cell_id` is text in the observed source data.
+- Do not convert these identifiers to integers without a demonstrated requirement.
+- Preserve leading zeros.
+- Preserve the original values and formatting.
+
+### gps_history
+
+Approximately 44,510 records.
+
+| Column | Observed type |
+|---|---|
+| id | int64 |
+| mission | int64 |
+| bts_id | object |
+| silent_target_reg_id | object |
+| timestamp | int64 |
+| latitude | object |
+| longitude | object |
+| dl_pow | object |
+| ul_pow | object |
+| distance_min | int64 |
+| distance_max | int64 |
+| time_dl | object |
+
+### Other source tables
+
+Inspect and align the Prisma models for all remaining tables, including:
+
+- wifi_access_points
+- wifi_access_point_clients
+- map_cell_databases
+- map_cells
+- plmn_storage
+- sms_calls
+- map_user_markers
+- map_user_polygons
+- map_user_circles
+- target_files
+- whitelist_targets
+- tac_numbers
+- scheduled_tasks
+- map_layers
+
+Do not ignore empty tables. Their schemas must also be compatible with future imports.
+
+## 2.2 Required SQLite inspection
+
+Inspect the original SQLite file directly.
+
+For every table:
+
+1. Execute read-only schema inspection using `PRAGMA table_info`.
+2. Inspect primary keys.
+3. Inspect indexes.
+4. Inspect foreign keys using `PRAGMA foreign_key_list`.
+5. Inspect actual stored values.
+6. Inspect SQLite storage-class distributions using `typeof(column)` where useful.
+7. Identify columns containing mixed storage types.
+8. Identify NULL and empty-string patterns.
+9. Identify identifier columns that must remain strings.
+10. Identify relationships represented by integer IDs or text values.
+
+Do not rely exclusively on the Python/Pandas report.
+
+## 2.3 Prisma and PostgreSQL alignment
+
+Compare three things:
+
+- Original SQLite schema and stored values.
+- Current PostgreSQL schema.
+- Current Prisma schema.
+
+Produce a complete type comparison before modifying anything.
+
+Use appropriate Prisma types and PostgreSQL column types that preserve the original SQLite data semantics.
+
+Examples of expected mapping decisions:
+
+| Source data | Expected representation |
+|---|---|
+| Integer IDs | Int or appropriate larger integer type |
+| Text identifiers | String |
+| MCC/MNC identifiers | String |
+| Cell IDs | String where source values are text |
+| Floating-point measurements | Float or appropriate numeric type |
+| Text coordinates | String when preserving original coordinate text |
+| Integer timestamps | Preserve integer representation unless a deliberate, documented conversion is required |
+| Nullable source fields | Nullable Prisma fields |
+
+These are guidelines, not permission to ignore actual source declarations or stored values.
+
+SQLite is dynamically typed. Where a column contains mixed values, document the issue and choose a lossless representation.
+
+Do not silently convert:
+- `"03"` into `3`.
+- Large identifiers into floating-point numbers.
+- NULL into zero.
+- Empty strings into NULL without an explicit, justified conversion.
+- Text timestamps into unrelated date formats.
+- Numeric-looking identifiers into numbers.
+
+## 2.4 Mission relationships
+
+The migration to allow duplicate mission names has already been executed.
+
+Do not repeat it or reset the database.
+
+Verify that:
+- `missions.mission` is not unique.
+- `missions.id` is the primary key.
+- Integer mission relationships are correctly implemented.
+- All child records retain their correct mission associations.
+- Duplicate mission names do not cause incorrect record matching.
+
+For source tables that contain integer `mission` references, use the correct integer mission relationship.
+
+For tables that contain mission names or other legacy references, inspect the data and preserve the correct association.
+
+Do not guess relationships based on duplicate mission names.
+
+## 2.5 Safe schema changes
+
+If type corrections are required:
+
+- Create a safe, versioned migration.
+- Preserve all existing records.
+- Preserve primary keys.
+- Preserve foreign-key relationships.
+- Preserve original identifier values.
+- Use temporary columns or controlled conversion steps where needed.
+- Verify row counts and values before and after migration.
+- Provide rollback or recovery instructions.
+- Never reset the production database.
+
+Update Prisma Client and all affected backend/frontend code after the schema changes.
+
+---
+
+# 3. DASHBOARD EXPORT — CHARTS AND MAP
+
+I want to export the actual visualizations displayed on the dashboard.
+
+The export controls must work. They must not simply display buttons without implementing export functionality.
+
+Add export controls to every chart and the BTS/Network Cell map.
+
+## 3.1 Chart image exports
+
+For each of the five visualizations, support:
+
+- PNG image export.
+- SVG export where supported by the existing chart library.
+- PDF export.
+
+Charts included:
+
+1. Unique IMSI subscribers by country.
+2. Unique network cells by MCC.
+3. Military mobile networks.
+4. Civilian mobile networks.
+5. BTS geographic map as a separate map export.
+
+For charts, the exported image must preserve:
+- Chart title.
+- Axis labels.
+- Data labels.
+- Legend where applicable.
+- Chart colors.
+- Current filter context.
+- Arabic or English labels according to the selected language.
+
+Use the actual chart rendering implementation.
+
+Do not recreate charts using unrelated sample data during export.
+
+## 3.2 Chart data exports
+
+Allow users to export the underlying aggregated chart data as:
+
+- CSV.
+- Excel `.xlsx`.
+
+Export only the aggregated data needed for the selected visualization.
+
+Include useful columns such as:
+- Country.
+- MCC.
+- MNC.
+- Operator.
+- Unique count.
+- Total records.
+- Percentage.
+- Ranking.
+
+Only include fields relevant to each chart.
+
+Preserve identifiers as text in Excel, especially MCC, MNC, IMSI-related values, and cell identifiers.
+
+Do not expose raw IMSI, IMEI, or TMSI values in chart exports.
+
+## 3.3 Map exports
+
+The geographic BTS and Network Cell map must support:
+
+- Export map as PNG.
+- Export map as PDF.
+- Export visible aggregated map data as CSV.
+- Export geographic points as GeoJSON where appropriate.
+
+The exported map must include:
+- Visible map layers.
+- Markers.
+- Clusters where supported.
+- Legend.
+- Map title.
+- Current map filters.
+- Coordinate reference information.
+- Appropriate map attribution.
+
+The export must represent the actual map currently displayed, not a blank background or a placeholder image.
+
+If map tiles cannot be captured because of cross-origin restrictions, use a compatible tile provider or an appropriate map export approach.
+
+Do not silently produce an incomplete map image.
+
+## 3.4 Export behavior
+
+Add export menus or buttons to the relevant chart and map components.
+
+Support:
+
+- Export current chart.
+- Export current map.
+- Export chart data.
+- Export all dashboard visualizations.
+- Export selected dashboard components.
+- Respect active filters.
+- Respect user permissions.
+- Respect field-level masking.
+- Show export progress for larger reports.
+- Show clear success or error messages.
+
+Where practical, create a professional PDF dashboard report containing:
+- Report title.
+- Generation date.
+- Selected missions.
+- Active filters.
+- Summary KPIs.
+- Charts.
+- Map.
+- Relevant tables.
+- Page numbers and headers/footers.
+
+Support Arabic RTL and English LTR output.
+
+## 3.5 Export implementation requirements
+
+Inspect the existing project dependencies before adding libraries.
+
+Reuse existing chart export capabilities where possible.
+
+Use suitable libraries compatible with the current React, Node.js, and TypeScript versions.
+
+For large exports:
+- Generate files server-side where appropriate.
+- Avoid loading excessive data into browser memory.
+- Stream large outputs where practical.
+- Clean temporary files securely.
+- Apply authentication and authorization.
+- Record export audit events.
+
+Do not require a Python runtime just to export dashboard charts or reports.
+
+---
+
+# 4. CRITICAL MAP REPAIR — API KEY REQUIRED / MISSING TILES
+
+The current BTS and Network Cell map displays a black or empty background with messages similar to:
+
+`API KEY REQUIRED`
+
+`carto.com/basemaps/...`
+
+The map controls and markers appear, but the underlying map tiles are not loading correctly.
+
+This must be fixed.
+
+## 4.1 Diagnose the current implementation
+
+Inspect:
+- Leaflet initialization.
+- Tile layer URL.
+- Tile provider.
+- Provider authentication requirements.
+- Environment variables.
+- API-key configuration.
+- Browser console errors.
+- Network requests for map tiles.
+- Tile attribution.
+
+Determine exactly why the current map is displaying the API-key message.
+
+Do not assume the problem is with the marker data.
+
+## 4.2 Preferred solution: no-key map tiles
+
+If the current CARTO provider requires an API key, replace it with a suitable tile provider that does not require a paid API key.
+
+Prefer standard OpenStreetMap tiles where appropriate.
+
+Example Leaflet tile configuration:
+
+`https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png`
+
+Use correct attribution:
+
+`© OpenStreetMap contributors`
+
+Respect the selected provider's tile usage policy, caching rules, and rate limits.
+
+Do not use a provider that requires an API key while leaving its key missing.
+
+Do not embed fake API keys.
+
+## 4.3 Alternative: configured provider
+
+If the existing application intentionally depends on CARTO or another authenticated provider:
+
+- Implement proper environment-variable configuration.
+- Document where the key must be configured.
+- Validate configuration at application startup.
+- Never hardcode secrets.
+- Never expose private API credentials in frontend source code.
+- Provide a clear fallback if the provider is unavailable.
+
+However, the map should not require a paid API key just to display a basic geographic background when a suitable no-key provider is available.
+
+## 4.4 Map functionality verification
+
+After fixing the tiles, verify:
+
+- Actual geographic map tiles load.
+- Zoom works.
+- Pan works.
+- Markers display at the correct coordinates.
+- Registration BTS layer works.
+- Network Cell layer works.
+- Shared/overlapping markers work.
+- Marker clustering works.
+- Heatmap works.
+- Layer controls work.
+- Reset View works.
+- Full-screen mode works.
+- Map filters work.
+- Map legend works.
+- Map exports work.
+
+Test with the actual coordinate data.
+
+The current screenshot shows approximately:
+- Unique Locations: 33.
+- Parsed Registration Records: 17.
+- Network Cells: 29.
+- Invalid Skipped: 0.
+
+Use these as screenshot reference values only. Do not hardcode them.
+
+Verify that the map correctly displays the real locations and reports live counts.
+
+---
+
+# 5. COMPLETE SQLITE BATCH IMPORT AUDIT
+
+Audit the SQLite batch import implemented in the previous phase.
+
+Verify actual behavior, not just the user interface.
+
+Test:
+
+- `.db` uploads.
+- `.sqlite` uploads.
+- `.sqlite3` uploads.
+- Table discovery.
+- Column discovery.
+- Automatic mapping.
+- Manual mapping.
+- Type compatibility checks.
+- Multiple-table selection.
+- Import All.
+- Import Selected.
+- Dependency-aware imports.
+- Duplicate detection.
+- Insert only.
+- Update existing.
+- Insert or update.
+- Skip duplicates.
+- Staging-area import.
+- Progress reporting.
+- Cancellation.
+- Import error reports.
+
+Verify that:
+- The original SQLite file is never modified.
+- Source databases are opened read-only wherever possible.
+- Arbitrary SQL from uploaded databases is never executed.
+- Browser memory is not used to hold the entire database.
+- Failed records are reported.
+- Missing foreign keys are reported.
+- Imported values preserve source representation.
+- Mission relationships use the correct IDs.
+
+Test with the supplied SQLite dataset and realistic larger batches.
+
+Do not claim successful import without checking destination records and relationships.
+
+---
+
+# 6. DASHBOARD ANALYTICS VERIFICATION
+
+Verify all five dashboard visualizations using real database aggregation.
+
+## Chart 1 — Unique IMSI subscribers by country
+
+Verify:
+- Distinct IMSI counting.
+- Null country exclusion.
+- EG exclusion by default.
+- Country trimming.
+- Zero-count exclusion.
+- Correct percentages.
+- Correct rankings.
+- Top-three coloring.
+- Tooltip accuracy.
+
+Title:
+
+`أعداد شرائح الاتصال المرصودة لكل دولة`
+
+## Chart 2 — Unique network cells by MCC
+
+Verify:
+- Grouping by MCC.
+- Distinct `cell_id` counting.
+- Null cell ID exclusion.
+- Total record counts.
+- Leading-zero preservation.
+- Sorting.
+- Tooltip accuracy.
+
+Title:
+
+`إجمالي الخلايا المرصودة لكل دولة`
+
+## Chart 3 — Geographic BTS map
+
+Verify:
+- Coordinate parsing.
+- Latitude/longitude validation.
+- No silent coordinate reversal.
+- Invalid location reporting.
+- Marker clustering.
+- Heatmap.
+- Registration and Network Cell layers.
+- Aggregated popups.
+- Map filters.
+- Map exports.
+- Tile loading without missing API-key errors.
+
+Do not expose raw IMSI, IMEI, or TMSI values in map popups.
+
+## Chart 4 — Military networks
+
+Verify:
+
+- 602/10 — المحمول العسكري المصري.
+- 602/11 — المحمول العسكري المصري.
+- 425/25 — المحمول العسكري الإسرائيلي.
+
+Use distinct `cell_id` counts and total record counts.
+
+Verify grouping, colors, ranking, and tooltips.
+
+## Chart 5 — Civilian networks
+
+Verify the complete operator mapping from the Second Development Prompt.
+
+Verify:
+- Correct operators.
+- Correct country labels.
+- Excluded networks.
+- Unique cell counts.
+- Total records.
+- Country ordering.
+- Ranking within country.
+- Country colors.
+- Tooltips.
+
+Do not add networks outside the specified mapping.
+
+All calculations must use actual database values.
+
+---
+
+# 7. ADVANCED FILTERS AND SAVED VIEWS
+
+Test the entire filter system.
+
+Verify:
+- Mission ID filtering.
+- Country and country code.
+- MCC and MNC.
+- RAT.
+- Date range.
+- BTS name and identifier.
+- Device model.
+- Location availability.
+- Distance ranges.
+- Registration-specific filters.
+- Network Cell-specific filters.
+- Chart-specific filters.
+- Multi-select.
+- Searchable dropdowns.
+- Active filter chips.
+- Clear individual filter.
+- Reset all.
+- AND/OR conditions where supported.
+- Save filters.
+- Load saved filters.
+- Delete saved filters.
+
+Do not apply filters across unrelated tables without a valid relationship.
+
+Saved filters must respect ownership and authorization.
+
+Verify that chart exports and map exports use the currently applied filters.
+
+---
+
+# 8. BACKEND, SECURITY AND API AUDIT
+
+Inspect all modified backend endpoints.
+
+Verify:
+- Zod validation.
+- Parameterized queries.
+- Authentication.
+- Role-based authorization.
+- Field-level permissions.
+- Geographic access permissions.
+- Correct error responses.
+- Server-side aggregation.
+- Pagination where required.
+- Database indexes.
+- Query performance.
+- Export authorization.
+- Audit logging.
+
+Sensitive identifiers must not appear in aggregated chart responses or unauthorized exports.
+
+Never rely only on hiding frontend controls to enforce security.
+
+Validate file uploads and prevent path traversal or arbitrary file execution.
+
+---
+
+# 9. FRONTEND AND LOCALIZATION AUDIT
+
+Test the entire application in Arabic and English.
+
+Verify:
+- English LTR.
+- Arabic RTL.
+- Correct chart titles.
+- Correct Arabic fonts.
+- Correct map-control positioning.
+- Correct filter alignment.
+- No overlapping elements.
+- No broken labels.
+- Responsive dashboard layout.
+
+Check:
+- Desktop.
+- Laptop.
+- Tablet.
+- Mobile.
+
+Preserve the existing sidebar navigation and page structure.
+
+All chart, map, filter, and export controls must perform their advertised actions.
+
+---
+
+# 10. EXISTING APPLICATION REGRESSION TESTING
+
+Ensure that the new work has not broken existing features.
+
+Test:
+- Authentication.
+- User management.
+- Roles and permissions.
+- Missions.
+- Registrations.
+- Targets.
+- Network cells.
+- GPS history.
+- SMS calls.
+- Map markers.
+- Map polygons.
+- Map circles.
+- Existing imports.
+- Existing exports.
+- Table search.
+- Sorting.
+- Pagination.
+- Mapping features.
+- Audit logs.
+- Docker deployment.
+
+Do not remove existing features unnecessarily.
+
+---
+
+# 11. AUTOMATED TESTS AND BUILD VALIDATION
+
+Use the existing test framework.
+
+Create or update tests for:
+
+### Database
+- SQLite-to-Prisma type mapping.
+- Identifier preservation.
+- Mission ID relationships.
+- Duplicate mission names.
+- Foreign-key integrity.
+- Type conversion.
+- NULL handling.
+
+### Import
+- SQLite table discovery.
+- Column mapping.
+- Batch import.
+- Duplicate handling.
+- Dependency order.
+- Import failure handling.
+- Large imports.
+
+### Analytics
+- All five chart calculations.
+- MCC/MNC normalization.
+- Unique cell counts.
+- Country rankings.
+- BTS coordinate parsing.
+
+### Exports
+- PNG chart export.
+- SVG chart export where supported.
+- PDF export.
+- CSV export.
+- Excel export.
+- Map PNG/PDF export.
+- GeoJSON export.
+- Filter-aware exports.
+- Permission-aware exports.
+
+### Map
+- Tile provider configuration.
+- Tile loading.
+- Marker layers.
+- Heatmap.
+- Clustering.
+- Map filters.
+- Map export.
+
+### General application
+- API validation.
+- Authorization.
+- Frontend rendering.
+- Arabic/English.
+- RTL/LTR.
+- Existing functionality.
+
+Run:
+
+- Prisma validation.
+- Prisma Client generation.
+- TypeScript checks.
+- Linting.
+- Backend tests.
+- Frontend tests.
+- Production builds.
+- Docker builds.
+- Docker Compose validation.
+
+Do not fabricate test results.
+
+Clearly distinguish passed, failed, skipped, and untested checks.
+
+---
+
+# 12. PERFORMANCE AND STABILITY
+
+Use the actual database size as a reference:
+
+| Table | Approximate records |
+|---|---:|
+| missions | 29 |
+| registrations | 54,833 |
+| targets | 31 |
+| network_cells | 4,777 |
+| gps_history | 44,510 |
+| sms_calls | 19 |
+| map_user_markers | 10 |
+| map_user_polygons | 1 |
+
+Verify:
+- Dashboard loading.
+- Analytics API response time.
+- Filter performance.
+- Map loading.
+- Chart rendering.
+- Import throughput.
+- Export generation.
+- Memory usage.
+- Database query plans.
+
+Use database aggregation instead of downloading entire tables for chart calculations.
+
+Use caching only where safe and ensure it respects user permissions and active filters.
+
+---
+
+# 13. FINAL ACCEPTANCE CRITERIA
+
+The third phase is complete only when the following requirements have been verified.
+
+## Prisma and SQLite types
+- [ ] Original SQLite schema inspected.
+- [ ] Actual SQLite stored values inspected.
+- [ ] All source tables reviewed.
+- [ ] Prisma types aligned with source data semantics.
+- [ ] PostgreSQL types verified.
+- [ ] Identifiers preserved.
+- [ ] Leading zeros preserved.
+- [ ] Mission IDs remain correct.
+- [ ] Existing data preserved.
+- [ ] No unexplained orphaned records.
+
+## Dashboard exports
+- [ ] All five visualizations can be exported.
+- [ ] PNG chart exports work.
+- [ ] SVG exports work where supported.
+- [ ] PDF exports work.
+- [ ] CSV exports work.
+- [ ] Excel exports work.
+- [ ] Map PNG export works.
+- [ ] Map PDF export works.
+- [ ] GeoJSON export works.
+- [ ] Exports respect active filters.
+- [ ] Exports respect permissions.
+
+## Map
+- [ ] API-key error resolved.
+- [ ] Geographic tiles load correctly.
+- [ ] No fake API keys.
+- [ ] Registration BTS layer works.
+- [ ] Network Cell layer works.
+- [ ] Clustering works.
+- [ ] Heatmap works.
+- [ ] Reset View works.
+- [ ] Map exports work.
+
+## Application
+- [ ] SQLite batch import works.
+- [ ] All five analytics are correct.
+- [ ] Advanced filters work.
+- [ ] Saved filters work.
+- [ ] Arabic works.
+- [ ] English works.
+- [ ] RTL works.
+- [ ] LTR works.
+- [ ] Existing features still work.
+- [ ] Authentication and authorization work.
+- [ ] No critical TypeScript errors.
+- [ ] No critical build errors.
+- [ ] Docker builds successfully.
+- [ ] Application starts successfully.
+
+---
+
+# 14. FINAL DELIVERY REPORT
+
+When implementation and testing are complete, provide:
+
+1. **Prisma/SQLite type alignment report**
+   - Source types.
+   - Final Prisma types.
+   - PostgreSQL types.
+   - Conversions performed.
+   - Values preserved.
+   - Remaining discrepancies.
+
+2. **Database integrity report**
+   - Table record counts.
+   - Mission relationship verification.
+   - Foreign-key verification.
+   - Orphaned record counts.
+   - Migration findings.
+
+3. **Map repair report**
+   - Original tile provider.
+   - Cause of API-key error.
+   - New tile provider.
+   - Whether an API key is required.
+   - Tile loading test results.
+
+4. **Export functionality report**
+   - Each supported chart export.
+   - Map exports.
+   - CSV/Excel exports.
+   - PDF exports.
+   - Filter and permission verification.
+
+5. **Analytics report**
+   - Results for all five charts.
+   - Calculation verification.
+   - Any discrepancies.
+
+6. **SQLite import report**
+   - Tables tested.
+   - Records imported.
+   - Conversion results.
+   - Errors and warnings.
+
+7. **Security and performance report**
+
+8. **Automated testing report**
+   - Passed.
+   - Failed.
+   - Skipped.
+   - Not tested.
+
+9. **Changed files**
+   - Important modified files.
+   - New files.
+   - Dependencies added or removed.
+
+10. **Deployment instructions**
+    - Exact commands.
+    - Environment variables.
+    - Any required configuration.
+
+11. **Remaining issues**
+
+12. **Final readiness classification**
+    - READY FOR PRODUCTION.
+    - READY WITH MINOR ISSUES.
+    - NOT READY FOR PRODUCTION.
+
+Do not declare production readiness when critical functionality remains untested or broken.
+
+---
+
+# FINAL INSTRUCTION
+
+This is the final quality and integration phase of the existing application.
+
+**Do not merely describe what should be done. Implement it.**
+
+The highest priorities are:
+
+1. Correct Prisma and PostgreSQL types based on the actual SQLite source data.
+2. Preserve all original identifiers and values.
+3. Make every dashboard chart and the geographic map exportable.
+4. Fix the map tile/API-key problem so the geographic background actually loads.
+5. Verify the SQLite batch import and all five analytics.
+6. Preserve existing application functionality.
+7. Test the complete application and provide truthful results.
+
+Do not reset the database.
+
+Do not repeat the completed mission migration.
+
+Do not invent missing fields.
+
+Do not hardcode data.
+
+Do not leave nonfunctional buttons.
+
+Deliver working code, safe migrations if necessary, export functionality, map configuration, automated tests, and deployment instructions.

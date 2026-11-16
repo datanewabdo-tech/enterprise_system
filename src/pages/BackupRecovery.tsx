@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 
 export const BackupRecovery: React.FC = () => {
-  const { t } = useApp();
+  const { t, apiFetch } = useApp();
   const [creating, setCreating] = useState(false);
   const [backups, setBackups] = useState<any[]>([
     {
@@ -29,8 +29,11 @@ export const BackupRecovery: React.FC = () => {
     setCreating(true);
     setNotice(null);
     try {
-      const res = await fetch('/api/v1/system/backups/create', { method: 'POST' });
+      const res = await apiFetch('/api/v1/system/backups/create', { method: 'POST' });
       const json = await res.json();
+      if (!res.ok) {
+        throw new Error(json.error || 'Backup creation failed');
+      }
       if (json.success) {
         setNotice(`Snapshot created: ${json.backupName}`);
         setBackups(prev => [

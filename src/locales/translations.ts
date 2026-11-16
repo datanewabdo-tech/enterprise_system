@@ -239,6 +239,19 @@ export const translations = {
     clearSelection: 'Clear Selection',
     validateEstimate: 'Validate & Estimate',
     startMultiImport: 'Start Multi-Table Import',
+    // Phase 3 Additions
+    exportPng: 'Export PNG Image',
+    exportSvg: 'Export SVG Vector',
+    exportPdf: 'Export PDF Report',
+    exportReady: 'Export Ready',
+    exportFailed: 'Export Failed',
+    exportDeniedTitle: 'Permission Denied',
+    exportDeniedMsg: 'Viewers cannot export data or visualizations. Switch role in navbar.',
+    fullscreen: 'Fullscreen',
+    exitFullscreen: 'Exit Fullscreen',
+    cancelImport: 'Cancel Import',
+    importCancelled: 'Import Cancelled',
+    exportingProgress: 'Generating export...',
   },
   ar: {
     // Top Bar & App
@@ -478,5 +491,18 @@ export const translations = {
     clearSelection: 'مسح التحديد',
     validateEstimate: 'فحص وتقدير النتائج',
     startMultiImport: 'بدء الاستيراد متعدد الجداول',
+    // Phase 3 Additions
+    exportPng: 'تصدير صورة PNG',
+    exportSvg: 'تصدير متجه SVG',
+    exportPdf: 'تصدير تقرير PDF',
+    exportReady: 'التصدير جاهز',
+    exportFailed: 'فشل التصدير',
+    exportDeniedTitle: 'صلاحية غير كافية',
+    exportDeniedMsg: 'صلاحية المستعرض لا تسمح بالتصدير. يرجى تبديل الدور من الشريط العلوي.',
+    fullscreen: 'ملء الشاشة',
+    exitFullscreen: 'إنهاء ملء الشاشة',
+    cancelImport: 'إلغاء الاستيراد',
+    importCancelled: 'تم إلغاء الاستيراد',
+    exportingProgress: 'جاري تجهيز التصدير...',
   },
 };

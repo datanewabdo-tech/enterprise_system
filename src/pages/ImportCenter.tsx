@@ -16,6 +16,7 @@ import {
   ChevronUp,
   Play,
   ShieldCheck,
+  XCircle,
 } from 'lucide-react';
 
 interface MultiSqliteConfigState {
@@ -88,6 +89,13 @@ export const ImportCenter: React.FC = () => {
   const [estimating, setEstimating] = useState(false);
   const [estimates, setEstimates] = useState<any[] | null>(null);
   const [multiExecuting, setMultiExecuting] = useState(false);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [jobProgress, setJobProgress] = useState<{
+    status: string;
+    totalTables: number;
+    completedTables: number;
+    currentTable: string | null;
+  } | null>(null);
   const [multiResult, setMultiResult] = useState<any | null>(null);
 
   // Import History
@@ -274,8 +282,34 @@ export const ImportCenter: React.FC = () => {
       return;
     }
 
+    const jobId = `job_${Date.now()}`;
+    setActiveJobId(jobId);
+    setJobProgress({
+      status: 'RUNNING',
+      totalTables: tables.length,
+      completedTables: 0,
+      currentTable: tables[0]?.sourceTable || null,
+    });
     setMultiExecuting(true);
     setErrorMsg(null);
+
+    const pollTimer = window.setInterval(async () => {
+      try {
+        const pRes = await apiFetch(`/api/v1/imports/sqlite/progress/${jobId}`);
+        if (pRes.ok) {
+          const prog = await pRes.json();
+          setJobProgress({
+            status: prog.status,
+            totalTables: prog.totalTables ?? tables.length,
+            completedTables: prog.completedTables ?? 0,
+            currentTable: prog.currentTable ?? null,
+          });
+        }
+      } catch {
+        // Ignore transient polling errors
+      }
+    }, 400);
+
     try {
       const res = await apiFetch('/api/v1/imports/sqlite/multi-execute', {
         method: 'POST',
@@ -284,6 +318,7 @@ export const ImportCenter: React.FC = () => {
           filePath: inspection.filePath,
           originalName: inspection.originalName,
           tables,
+          jobId,
         }),
       });
       const json = await res.json();
@@ -292,15 +327,33 @@ export const ImportCenter: React.FC = () => {
       setMultiResult(json);
       fetchHistory();
       refreshMissions();
+      const wasCancelled = json.status === 'CANCELLED' || json.tableResults?.some((r: any) => r.status === 'CANCELLED');
       addNotification({
-        title: 'Multi-Table SQLite Import Completed',
-        message: `Imported ${json.totals.inserted} inserted, ${json.totals.updated} updated across ${json.tableResults.length} tables.`,
-        type: json.totals.errors > 0 ? 'warning' : 'success',
+        title: wasCancelled ? t('importCancelled') : 'Multi-Table SQLite Import Completed',
+        message: `${wasCancelled ? 'Stopped early: ' : 'Imported '}${json.totals.inserted} inserted, ${json.totals.updated} updated across ${json.tableResults.length} tables.`,
+        type: wasCancelled || json.totals.errors > 0 ? 'warning' : 'success',
       });
     } catch (err: any) {
       setErrorMsg(err.message);
     } finally {
+      window.clearInterval(pollTimer);
       setMultiExecuting(false);
+      setActiveJobId(null);
+      setJobProgress(null);
+    }
+  };
+
+  const handleCancelMultiImport = async () => {
+    if (!activeJobId) return;
+    try {
+      const res = await apiFetch(`/api/v1/imports/sqlite/cancel/${activeJobId}`, {
+        method: 'POST',
+      });
+      if (res.ok) {
+        setJobProgress(prev => (prev ? { ...prev, status: 'CANCELLED' } : prev));
+      }
+    } catch {
+      // Ignore cancel errors if job already finished
     }
   };
 
@@ -574,8 +627,54 @@ export const ImportCenter: React.FC = () => {
                   {multiExecuting ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
                   <span>{multiExecuting ? 'Executing Transactions...' : `${t('startMultiImport')} (${selectedCount})`}</span>
                 </button>
+
+                {multiExecuting && activeJobId && (
+                  <button
+                    type="button"
+                    onClick={handleCancelMultiImport}
+                    className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold rounded-lg bg-rose-600 hover:bg-rose-500 text-white"
+                  >
+                    <XCircle className="w-3.5 h-3.5" />
+                    <span>{t('cancelImport')}</span>
+                  </button>
+                )}
               </div>
             </div>
+
+            {multiExecuting && jobProgress && (
+              <div className="p-3 rounded-xl bg-indigo-950/30 border border-indigo-700/40 space-y-2">
+                <div className="flex items-center justify-between text-xs text-indigo-200">
+                  <span className="flex items-center gap-2 font-semibold">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                    <span>
+                      {jobProgress.status === 'CANCELLED'
+                        ? t('importCancelled')
+                        : `Importing ${jobProgress.currentTable || '...'} (${jobProgress.completedTables}/${jobProgress.totalTables} tables)`}
+                    </span>
+                  </span>
+                  <span className="font-mono text-indigo-300">
+                    {jobProgress.totalTables > 0
+                      ? Math.round((jobProgress.completedTables / jobProgress.totalTables) * 100)
+                      : 0}
+                    %
+                  </span>
+                </div>
+                <div className="w-full h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-300 ${
+                      jobProgress.status === 'CANCELLED' ? 'bg-amber-500' : 'bg-indigo-500'
+                    }`}
+                    style={{
+                      width: `${
+                        jobProgress.totalTables > 0
+                          ? Math.round((jobProgress.completedTables / jobProgress.totalTables) * 100)
+                          : 0
+                      }%`,
+                    }}
+                  />
+                </div>
+              </div>
+            )}
 
             {/* Table Checklist & Per-Table Mapping Cards */}
             <div className="space-y-3">
@@ -767,54 +866,85 @@ export const ImportCenter: React.FC = () => {
             </div>
 
             {/* Multi-Table Execution Summary */}
-            {multiResult && (
-              <div className="p-4 rounded-xl bg-emerald-950/30 border border-emerald-800/70 space-y-3">
-                <div className="flex items-center justify-between flex-wrap gap-2">
-                  <div className="flex items-center gap-2 text-emerald-300 font-bold text-sm">
-                    <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-                    <span>Multi-Table SQLite Import Complete</span>
+            {multiResult && (() => {
+              const isCancelled =
+                multiResult.status === 'CANCELLED' ||
+                multiResult.tableResults?.some((r: any) => r.status === 'CANCELLED');
+              return (
+                <div
+                  className={`p-4 rounded-xl border space-y-3 ${
+                    isCancelled
+                      ? 'bg-amber-950/30 border-amber-700/60'
+                      : 'bg-emerald-950/30 border-emerald-800/70'
+                  }`}
+                >
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div
+                      className={`flex items-center gap-2 font-bold text-sm ${
+                        isCancelled ? 'text-amber-300' : 'text-emerald-300'
+                      }`}
+                    >
+                      {isCancelled ? (
+                        <AlertTriangle className="w-5 h-5 text-amber-400" />
+                      ) : (
+                        <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                      )}
+                      <span>{isCancelled ? t('importCancelled') : 'Multi-Table SQLite Import Complete'}</span>
+                    </div>
+                    <div className="text-xs font-mono text-slate-200">
+                      Inserted: <strong className="text-emerald-400">{multiResult.totals.inserted}</strong> | Updated:{' '}
+                      <strong className="text-sky-400">{multiResult.totals.updated}</strong> | Skipped:{' '}
+                      <strong>{multiResult.totals.skipped}</strong> | Errors:{' '}
+                      <strong className="text-rose-400">{multiResult.totals.errors}</strong>
+                      {multiResult.totals.ambiguousMissions > 0 && (
+                        <span className="ml-2 text-amber-300">| Ambiguous Missions: {multiResult.totals.ambiguousMissions}</span>
+                      )}
+                    </div>
                   </div>
-                  <div className="text-xs font-mono text-slate-200">
-                    Inserted: <strong className="text-emerald-400">{multiResult.totals.inserted}</strong> | Updated:{' '}
-                    <strong className="text-sky-400">{multiResult.totals.updated}</strong> | Skipped:{' '}
-                    <strong>{multiResult.totals.skipped}</strong> | Errors:{' '}
-                    <strong className="text-rose-400">{multiResult.totals.errors}</strong>
-                    {multiResult.totals.ambiguousMissions > 0 && (
-                      <span className="ml-2 text-amber-300">| Ambiguous Missions: {multiResult.totals.ambiguousMissions}</span>
-                    )}
-                  </div>
-                </div>
 
-                <div className="overflow-x-auto rounded-lg border border-slate-800">
-                  <table className="w-full text-[11px] text-left">
-                    <thead className="bg-slate-950 text-slate-400">
-                      <tr>
-                        <th className="px-3 py-2">Source Table</th>
-                        <th className="px-3 py-2">Destination</th>
-                        <th className="px-3 py-2">Status</th>
-                        <th className="px-3 py-2">Inserted</th>
-                        <th className="px-3 py-2">Updated</th>
-                        <th className="px-3 py-2">Skipped</th>
-                        <th className="px-3 py-2">Errors</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-800 text-slate-300">
-                      {multiResult.tableResults.map((tr: any) => (
-                        <tr key={tr.sourceTable}>
-                          <td className="px-3 py-1.5 font-mono">{tr.sourceTable}</td>
-                          <td className="px-3 py-1.5 font-mono text-indigo-300">{tr.destinationTable}</td>
-                          <td className="px-3 py-1.5">{tr.status}</td>
-                          <td className="px-3 py-1.5 text-emerald-400 font-mono">{tr.inserted}</td>
-                          <td className="px-3 py-1.5 text-sky-400 font-mono">{tr.updated}</td>
-                          <td className="px-3 py-1.5 font-mono">{tr.skipped}</td>
-                          <td className="px-3 py-1.5 text-rose-400 font-mono">{tr.errors}</td>
+                  <div className="overflow-x-auto rounded-lg border border-slate-800">
+                    <table className="w-full text-[11px] text-left rtl:text-right">
+                      <thead className="bg-slate-950 text-slate-400">
+                        <tr>
+                          <th className="px-3 py-2">Source Table</th>
+                          <th className="px-3 py-2">Destination</th>
+                          <th className="px-3 py-2">Status</th>
+                          <th className="px-3 py-2">Inserted</th>
+                          <th className="px-3 py-2">Updated</th>
+                          <th className="px-3 py-2">Skipped</th>
+                          <th className="px-3 py-2">Errors</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800 text-slate-300">
+                        {multiResult.tableResults.map((tr: any) => (
+                          <tr key={tr.sourceTable}>
+                            <td className="px-3 py-1.5 font-mono">{tr.sourceTable}</td>
+                            <td className="px-3 py-1.5 font-mono text-indigo-300">{tr.destinationTable}</td>
+                            <td className="px-3 py-1.5">
+                              <span
+                                className={
+                                  tr.status === 'CANCELLED'
+                                    ? 'text-amber-300 font-semibold'
+                                    : tr.status === 'COMPLETED'
+                                    ? 'text-emerald-400'
+                                    : 'text-slate-400'
+                                }
+                              >
+                                {tr.status}
+                              </span>
+                            </td>
+                            <td className="px-3 py-1.5 text-emerald-400 font-mono">{tr.inserted}</td>
+                            <td className="px-3 py-1.5 text-sky-400 font-mono">{tr.updated}</td>
+                            <td className="px-3 py-1.5 font-mono">{tr.skipped}</td>
+                            <td className="px-3 py-1.5 text-rose-400 font-mono">{tr.errors}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
           </div>
         )}
 

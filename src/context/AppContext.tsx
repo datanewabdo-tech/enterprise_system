@@ -140,19 +140,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   const refreshMissions = useCallback(() => {
-    fetch('/api/v1/tables/missions?pageSize=200')
-      .then(r => r.json())
+    const tok = authToken || localStorage.getItem('app_jwt_token');
+    if (!tok) return;
+    apiFetch('/api/v1/tables/missions?pageSize=200')
+      .then(r => (r.ok ? r.json() : null))
       .then(res => {
-        if (res.data && Array.isArray(res.data)) {
+        if (res?.data && Array.isArray(res.data)) {
           setMissions(res.data);
         }
       })
       .catch(() => {});
-  }, []);
+  }, [authToken, apiFetch]);
 
   useEffect(() => {
-    refreshMissions();
-  }, [refreshMissions]);
+    if (authToken) {
+      refreshMissions();
+    }
+  }, [authToken, refreshMissions]);
 
   const missionsList = missions.map(m => String(m.id));
 

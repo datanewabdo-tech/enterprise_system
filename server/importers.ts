@@ -285,21 +285,34 @@ function mapConflictMode(mode: 'skip' | 'update' | 'replace'): 'INSERT_ONLY' | '
   return 'INSERT_OR_UPDATE';
 }
 
-function coerceValueForColumn(val: any, colType: string): { value: any; error?: string } {
+function coerceValueForColumn(val: any, colType: string, colName?: string): { value: any; error?: string } {
   if (val === undefined || val === null || val === '') return { value: null };
   const t = colType.toUpperCase();
+  if (t.includes('DATETIME') || t.includes('TIMESTAMP')) {
+    if (typeof val === 'number' || (typeof val === 'string' && /^\d{10,13}$/.test(val.trim()))) {
+      const n = Number(val);
+      if (Number.isFinite(n)) {
+        const ms = n >= 1e12 ? n : n >= 1e9 ? n * 1000 : null;
+        if (ms !== null) {
+          const d = new Date(ms);
+          if (!Number.isNaN(d.getTime())) return { value: d.toISOString() };
+        }
+      }
+    }
+    return { value: String(val) };
+  }
   if (t.includes('INT')) {
     if (typeof val === 'boolean') return { value: val ? 1 : 0 };
     const n = Number(val);
     if (!Number.isFinite(n) || !Number.isInteger(n)) {
-      return { value: val, error: `Expected integer, got "${val}"` };
+      return { value: val, error: `Expected integer for ${colName || 'column'}, got "${val}"` };
     }
     return { value: n };
   }
   if (t.includes('REAL') || t.includes('FLOAT') || t.includes('NUMERIC') || t.includes('DOUBLE')) {
     const n = Number(val);
     if (!Number.isFinite(n)) {
-      return { value: val, error: `Expected number, got "${val}"` };
+      return { value: val, error: `Expected number for ${colName || 'column'}, got "${val}"` };
     }
     return { value: n };
   }
@@ -354,7 +367,7 @@ export function estimateMultiSqliteImport(
         for (const [srcCol, dstCol] of Object.entries(cfg.columnMapping)) {
           if (!dstCol || !destColMap.has(dstCol)) continue;
           const colMeta = destColMap.get(dstCol)!;
-          const coerced = coerceValueForColumn(srcRow[srcCol], colMeta.type);
+          const coerced = coerceValueForColumn(srcRow[srcCol], colMeta.type, dstCol);
           if (coerced.error) {
             rowHasError = true;
             if (sampleErrors.length < 10) sampleErrors.push(`Row ${i + 1} (${dstCol}): ${coerced.error}`);
@@ -410,14 +423,14 @@ export function estimateMultiSqliteImport(
 
 export interface MultiImportJobProgress {
   jobId: string;
-  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'CANCELLED' | 'FAILED';
   totalTables: number;
   completedTables: number;
   currentTable: string | null;
   tableResults: Array<{
     sourceTable: string;
     destinationTable: string;
-    status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'ERROR';
+    status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'CANCELLED' | 'ERROR';
     inserted: number;
     updated: number;
     skipped: number;
@@ -429,10 +442,29 @@ export interface MultiImportJobProgress {
 }
 
 const multiImportJobs = new Map<string, MultiImportJobProgress>();
+const cancelledImportJobs = new Set<string>();
 
 export function getMultiImportProgress(jobId: string): MultiImportJobProgress | null {
   return multiImportJobs.get(jobId) || null;
 }
+
+export function cancelMultiSqliteImport(jobId: string): boolean {
+  const prog = multiImportJobs.get(jobId);
+  if (!prog) return false;
+  cancelledImportJobs.add(jobId);
+  if (prog.status === 'PENDING' || prog.status === 'RUNNING') {
+    prog.status = 'CANCELLED';
+  }
+  return true;
+}
+
+const PARENT_FK_RULES: Record<string, { fkCol: string; parentTable: string; parentCol: string }> = {
+  location_extras: { fkCol: 'mission_id', parentTable: 'missions', parentCol: 'id' },
+  mission_files: { fkCol: 'mission_extra_id', parentTable: 'mission_extras', parentCol: 'id' },
+  location_files: { fkCol: 'location_extra_id', parentTable: 'location_extras', parentCol: 'id' },
+  target_files: { fkCol: 'target_id', parentTable: 'targets', parentCol: 'id' },
+  map_cells: { fkCol: 'db_id', parentTable: 'map_cell_databases', parentCol: 'id' },
+};
 
 /**
  * Dependency-ordered transactional SQLite multi-table import.
@@ -479,6 +511,16 @@ export async function executeMultiSqliteImport(
 
   try {
     for (let idx = 0; idx < ordered.length; idx++) {
+      if (cancelledImportJobs.has(jobId)) {
+        progress.status = 'CANCELLED';
+        progress.currentTable = null;
+        for (let k = idx; k < progress.tableResults.length; k++) {
+          progress.tableResults[k].status = 'CANCELLED';
+          summaryResults.push({ ...progress.tableResults[k] });
+        }
+        break;
+      }
+
       const cfg = ordered[idx];
       const progEntry = progress.tableResults[idx];
       progress.currentTable = cfg.sourceTable;
@@ -521,7 +563,7 @@ export async function executeMultiSqliteImport(
             const rec: Record<string, any> = {};
             for (const [srcCol, dstCol] of Object.entries(cfg.columnMapping)) {
               if (!dstCol || !destColNames.includes(dstCol)) continue;
-              const coerced = coerceValueForColumn(raw[srcCol], destColTypes.get(dstCol) || 'TEXT');
+              const coerced = coerceValueForColumn(raw[srcCol], destColTypes.get(dstCol) || 'TEXT', dstCol);
               if (coerced.error) {
                 progEntry.errors++;
                 preErrors.push(`Row ${rIdx + 1}: ${coerced.error}`);
@@ -573,17 +615,26 @@ export async function executeMultiSqliteImport(
           progEntry.errorLog.push(err.message);
         }
       } else {
+        const fkRule = PARENT_FK_RULES[cfg.destinationTable];
+        let tableCancelled = false;
         for (let rIdx = 0; rIdx < rawRows.length; rIdx++) {
+          if (rIdx % 500 === 0) {
+            await new Promise(resolve => setImmediate(resolve));
+            if (cancelledImportJobs.has(jobId)) {
+              tableCancelled = true;
+              break;
+            }
+          }
           const raw = rawRows[rIdx];
           const rec: Record<string, any> = {};
           let hasTypeErr = false;
 
           for (const [srcCol, dstCol] of Object.entries(cfg.columnMapping)) {
             if (!dstCol || !destColNames.includes(dstCol)) continue;
-            const coerced = coerceValueForColumn(raw[srcCol], destColTypes.get(dstCol) || 'TEXT');
+            const coerced = coerceValueForColumn(raw[srcCol], destColTypes.get(dstCol) || 'TEXT', dstCol);
             if (coerced.error) {
               hasTypeErr = true;
-              if (preErrors.length < 20) preErrors.push(`Row ${rIdx + 1} (${dstCol}): ${coerced.error}`);
+              if (preErrors.length < 25) preErrors.push(`Row ${rIdx + 1} (${dstCol}): ${coerced.error}`);
             } else if (coerced.value !== null) {
               rec[dstCol] = coerced.value;
             }
@@ -594,7 +645,7 @@ export async function executeMultiSqliteImport(
             continue;
           }
 
-          // Remap or resolve mission_id cleanly
+          // Remap or resolve mission_id cleanly (supports integer mission_id or integer source mission references)
           if (destColNames.includes('mission_id')) {
             const rawMissionId = rec.mission_id ?? raw.mission_id;
             if (rawMissionId !== undefined && rawMissionId !== null && rawMissionId !== '') {
@@ -604,7 +655,21 @@ export async function executeMultiSqliteImport(
               } else {
                 const exists = targetDb.prepare(`SELECT id FROM missions WHERE id = ?`).get(numId);
                 if (exists) rec.mission_id = numId;
+                else if (fkRule?.fkCol === 'mission_id') rec.mission_id = numId;
                 else delete rec.mission_id;
+              }
+            }
+
+            if (rec.mission_id === undefined) {
+              const mVal = rec.mission ?? raw.mission;
+              if (mVal !== undefined && mVal !== null && /^\d+$/.test(String(mVal).trim())) {
+                const mInt = Number(String(mVal).trim());
+                if (sourceMissionIdMap.has(mInt)) {
+                  rec.mission_id = sourceMissionIdMap.get(mInt);
+                } else {
+                  const exists = targetDb.prepare(`SELECT id FROM missions WHERE id = ?`).get(mInt);
+                  if (exists) rec.mission_id = mInt;
+                }
               }
             }
 
@@ -613,7 +678,7 @@ export async function executeMultiSqliteImport(
               if (mLabel) {
                 const matches = targetDb
                   .prepare(`SELECT id FROM missions WHERE mission = ? ORDER BY id ASC`)
-                  .all(mLabel) as Array<{ id: number }>;
+                  .all(String(mLabel)) as Array<{ id: number }>;
                 if (matches.length === 1) {
                   rec.mission_id = matches[0].id;
                 } else if (matches.length > 1) {
@@ -623,9 +688,44 @@ export async function executeMultiSqliteImport(
             }
           }
 
+          // Pre-validate strict parent foreign keys so missing parent records are explicitly reported
+          if (fkRule) {
+            const fkVal = rec[fkRule.fkCol];
+            if (fkVal === undefined || fkVal === null || fkVal === '') {
+              progEntry.errors++;
+              if (preErrors.length < 25) {
+                preErrors.push(`Row ${rIdx + 1}: Missing required foreign key ${fkRule.fkCol} -> ${fkRule.parentTable}`);
+              }
+              continue;
+            }
+            const parentExists = targetDb
+              .prepare(`SELECT 1 FROM "${fkRule.parentTable}" WHERE "${fkRule.parentCol}" = ?`)
+              .get(fkVal);
+            if (!parentExists) {
+              progEntry.errors++;
+              if (preErrors.length < 25) {
+                preErrors.push(`Row ${rIdx + 1}: Missing parent foreign key (${fkRule.fkCol}=${fkVal} not found in ${fkRule.parentTable})`);
+              }
+              continue;
+            }
+          }
+
           if (Object.keys(rec).length > 0) {
             preparedRecords.push(rec);
           }
+        }
+
+        if (tableCancelled) {
+          progEntry.status = 'CANCELLED';
+          progEntry.errors += 0;
+          progEntry.errorLog = [...preErrors, 'Import cancelled by user before table commit'].slice(0, 25);
+          progress.status = 'CANCELLED';
+          summaryResults.push({ ...progEntry });
+          for (let k = idx + 1; k < progress.tableResults.length; k++) {
+            progress.tableResults[k].status = 'CANCELLED';
+            summaryResults.push({ ...progress.tableResults[k] });
+          }
+          break;
         }
 
         // Preserve source IDs unless inserting fresh rows into autoincrement tables without replace
@@ -666,21 +766,25 @@ export async function executeMultiSqliteImport(
       summaryResults.push({ ...progEntry });
     }
 
-    progress.status = 'COMPLETED';
+    const finalStatus = cancelledImportJobs.has(jobId) ? 'CANCELLED' : 'COMPLETED';
+    cancelledImportJobs.delete(jobId);
+    progress.status = finalStatus;
     progress.currentTable = null;
 
     targetDb.prepare(`
       INSERT INTO audit_logs (username, action, module, record_id, ip_address, result, details)
-      VALUES (?, 'MULTI_SQLITE_IMPORT', 'import_center', ?, '127.0.0.1', 'SUCCESS', ?)
+      VALUES (?, ?, 'import_center', ?, '127.0.0.1', ?, ?)
     `).run(
       options.username || 'admin',
+      finalStatus === 'CANCELLED' ? 'MULTI_SQLITE_IMPORT_CANCELLED' : 'MULTI_SQLITE_IMPORT',
       options.originalName,
-      `Imported ${summaryResults.length} tables (${summaryResults.reduce((s, r) => s + r.inserted, 0)} inserted, ${summaryResults.reduce((s, r) => s + r.updated, 0)} updated, ${summaryResults.reduce((s, r) => s + r.errors, 0)} errors)`
+      finalStatus === 'CANCELLED' ? 'CANCELLED' : 'SUCCESS',
+      `${finalStatus}: ${summaryResults.length} tables (${summaryResults.reduce((s, r) => s + r.inserted, 0)} inserted, ${summaryResults.reduce((s, r) => s + r.updated, 0)} updated, ${summaryResults.reduce((s, r) => s + r.errors, 0)} errors)`
     );
 
     return {
       jobId,
-      status: 'COMPLETED',
+      status: finalStatus,
       tableResults: summaryResults,
       totals: {
         inserted: summaryResults.reduce((s, r) => s + r.inserted, 0),

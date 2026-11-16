@@ -1,5 +1,26 @@
 import ExcelJS from 'exceljs';
 import { db, queryTable, getTableColumns } from './db.js';
+import { maskSensitiveRecord } from './auth.js';
+
+const IDENTIFIER_TEXT_COLUMNS = new Set([
+  'reg_id',
+  'imsi',
+  'imei',
+  'tmsi',
+  'mcc',
+  'mnc',
+  'lac',
+  'cell_id',
+  'cid',
+  'bsic',
+  'psc',
+  'pci',
+  'tac',
+  'tac_id',
+  'bssid',
+  'mac',
+  'cid_lac_mnc',
+]);
 
 export async function exportDataset(options: {
   tableName: string;
@@ -8,6 +29,7 @@ export async function exportDataset(options: {
   search?: string;
   filters?: any[];
   username?: string;
+  canUnmask?: boolean;
 }) {
   // Query data (up to 10,000 records for export)
   const result = queryTable(options.tableName, {
@@ -18,7 +40,8 @@ export async function exportDataset(options: {
     filters: options.filters,
   });
 
-  const records = result.data as Record<string, any>[];
+  const allowUnmask = Boolean(options.canUnmask);
+  const records = (result.data as Record<string, any>[]).map(r => maskSensitiveRecord(r, allowUnmask));
 
   // Audit Log
   db.prepare(`
@@ -31,7 +54,7 @@ export async function exportDataset(options: {
     options.format.toUpperCase(),
     '127.0.0.1',
     'SUCCESS',
-    `Exported ${records.length} records in ${options.format.toUpperCase()} format`
+    `Exported ${records.length} records in ${options.format.toUpperCase()} format (unmasked=${allowUnmask})`
   );
 
   if (options.format === 'json') {
@@ -71,6 +94,7 @@ export async function exportDataset(options: {
     const geojson = {
       type: 'FeatureCollection',
       name: `${options.tableName}_layer`,
+      crs: { type: 'name', properties: { name: 'EPSG:4326' } },
       features,
     };
 
@@ -92,22 +116,23 @@ export async function exportDataset(options: {
         return `"${val}"`;
       }).join(',');
     });
-    const csvContent = [headerRow, ...rows].join('\n');
+    const csvContent = '\uFEFF' + [headerRow, ...rows].join('\n');
 
     return {
-      contentType: 'text/csv',
+      contentType: 'text/csv; charset=utf-8',
       filename: `${options.tableName}_export_${Date.now()}.csv`,
-      content: Buffer.from(csvContent),
+      content: Buffer.from(csvContent, 'utf8'),
     };
   }
 
   // Excel (.xlsx)
   const workbook = new ExcelJS.Workbook();
   const worksheet = workbook.addWorksheet(options.tableName);
-  const columns = getTableColumns(options.tableName).map(c => ({
+  const colMetas = getTableColumns(options.tableName);
+  const columns = colMetas.map(c => ({
     header: c.name,
     key: c.name,
-    width: Math.max(12, c.name.length + 3),
+    width: Math.max(14, c.name.length + 4),
   }));
   worksheet.columns = columns;
 
@@ -120,7 +145,21 @@ export async function exportDataset(options: {
   };
 
   for (const r of records) {
-    worksheet.addRow(r);
+    const rowObj: Record<string, any> = {};
+    for (const cm of colMetas) {
+      const val = r[cm.name];
+      if (val !== null && val !== undefined && IDENTIFIER_TEXT_COLUMNS.has(cm.name)) {
+        rowObj[cm.name] = String(val);
+      } else {
+        rowObj[cm.name] = val;
+      }
+    }
+    const row = worksheet.addRow(rowObj);
+    colMetas.forEach((cm, idx) => {
+      if (IDENTIFIER_TEXT_COLUMNS.has(cm.name)) {
+        row.getCell(idx + 1).numFmt = '@';
+      }
+    });
   }
 
   const buffer = await workbook.xlsx.writeBuffer();

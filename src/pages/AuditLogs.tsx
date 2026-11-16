@@ -13,17 +13,18 @@ import {
 } from 'lucide-react';
 
 export const AuditLogs: React.FC = () => {
-  const { t } = useApp();
+  const { apiFetch, authToken } = useApp();
 
   const [logs, setLogs] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [moduleFilter, setModuleFilter] = useState('ALL');
   const [page, setPage] = useState(1);
-  const [totalPages, setTotalPages] = useState(1);
-  const [total, setTotal] = useState(0);
+  const [, setTotalPages] = useState(1);
+  const [, setTotal] = useState(0);
 
   const fetchLogs = () => {
+    if (!authToken) return;
     setLoading(true);
     const params = new URLSearchParams({
       page: String(page),
@@ -32,8 +33,8 @@ export const AuditLogs: React.FC = () => {
     if (search.trim()) params.append('search', search.trim());
     if (moduleFilter !== 'ALL') params.append('module', moduleFilter);
 
-    fetch(`/api/v1/audit-logs?${params.toString()}`)
-      .then(res => res.json())
+    apiFetch(`/api/v1/audit-logs?${params.toString()}`)
+      .then(res => (res.ok ? res.json() : { logs: [], pagination: {} }))
       .then(json => {
         setLogs(json.logs || []);
         setTotal(json.pagination?.total || 0);
@@ -44,8 +45,10 @@ export const AuditLogs: React.FC = () => {
   };
 
   useEffect(() => {
-    fetchLogs();
-  }, [page, moduleFilter]);
+    if (authToken) {
+      fetchLogs();
+    }
+  }, [page, moduleFilter, authToken]);
 
   return (
     <div className="space-y-6">
