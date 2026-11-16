@@ -12,25 +12,28 @@ import {
 } from 'lucide-react';
 
 export const DataQuality: React.FC = () => {
-  const { t, activeMission } = useApp();
+  const { activeMission, apiFetch, authToken } = useApp();
 
   const [loading, setLoading] = useState(true);
   const [report, setReport] = useState<any>(null);
 
   const runQualityCheck = () => {
+    if (!authToken) return;
     setLoading(true);
-    fetch('/api/v1/analytics/dashboard')
-      .then(res => res.json())
+    apiFetch('/api/v1/analytics/dashboard')
+      .then(res => (res.ok ? res.json() : null))
       .then(data => {
-        setReport(data.qualityStats);
+        if (data?.qualityStats) setReport(data.qualityStats);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
   };
 
   useEffect(() => {
-    runQualityCheck();
-  }, [activeMission]);
+    if (authToken) {
+      runQualityCheck();
+    }
+  }, [activeMission, authToken]);
 
   return (
     <div className="space-y-6">

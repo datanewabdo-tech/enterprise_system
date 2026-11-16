@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import L from 'leaflet';
 // Ensure plugins attach to global L under Vite ESM
 if (typeof window !== 'undefined') {
@@ -6,10 +6,15 @@ if (typeof window !== 'undefined') {
 }
 import 'leaflet.markercluster';
 import 'leaflet.heat';
-import { RotateCcw, Layers, Flame, MapPin, Eye, EyeOff } from 'lucide-react';
+import { RotateCcw, Layers, Flame, MapPin, Eye, EyeOff, Maximize2, Minimize2 } from 'lucide-react';
+import { useApp } from '../../context/AppContext.js';
+import { DashboardFilterState } from '../../types/index.js';
+import { ChartExportMenu } from './ChartExportMenu.js';
+import { captureLeafletMapPng } from '../../utils/mapSnapshot.js';
 
 export interface BtsLocationItem {
-  key: string;
+  key?: string;
+  locationKey?: string;
   lat: number;
   lng: number;
   source: 'registration' | 'network_cell' | 'both';
@@ -20,9 +25,9 @@ export interface BtsLocationItem {
   btsCodes: string[];
   countries: string[];
   rats: string[];
-  mccs: number[];
-  mncs: number[];
-  cellIds: number[];
+  mccs: Array<string | number>;
+  mncs: Array<string | number>;
+  cellIds: Array<string | number>;
   missions: string[];
 }
 
@@ -35,14 +40,21 @@ interface BtsLocationsMapProps {
     networkCellLocationsCount: number;
     invalidSkippedCount: number;
   };
+  filters?: Partial<DashboardFilterState>;
+  onRegisterSnapshotCapture?: (fn: (() => Promise<string | null>) | null) => void;
   mapContainerId?: string;
 }
 
 export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
   locations,
   stats,
+  filters = {},
+  onRegisterSnapshotCapture,
   mapContainerId = 'bts-dashboard-map',
 }) => {
+  const { language, t } = useApp();
+  const isAr = language === 'ar';
+
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const clusterLayerRef = useRef<any>(null);
@@ -51,8 +63,18 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
   const [showRegistrations, setShowRegistrations] = useState(true);
   const [showNetworkCells, setShowNetworkCells] = useState(true);
   const [showHeatmap, setShowHeatmap] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
-  // Initialize Leaflet map once
+  const mapTitle = isAr
+    ? 'توزيع مواقع الأبراج وخلايا الشبكة (BTS)'
+    : 'BTS & Network Cell Locations Map';
+  const mapSubtitle = `${isAr ? 'مواقع فريدة' : 'Unique Locations'}: ${stats?.uniqueLocations ?? locations.length} • ${
+    isAr ? 'التسجيلات' : 'Reg Coords'
+  }: ${stats?.totalParsedRegistrationCoords ?? 0} • ${isAr ? 'الخلايا' : 'Network Cells'}: ${
+    stats?.networkCellLocationsCount ?? 0
+  }`;
+
+  // Initialize Leaflet map once using same-origin cached OpenStreetMap tile proxy
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
@@ -63,13 +85,21 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
       preferCanvas: true,
     });
 
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; OpenStreetMap &copy; CARTO',
+    const primaryTiles = L.tileLayer('/api/v1/map/tiles/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors',
       maxZoom: 19,
       crossOrigin: 'anonymous',
-    }).addTo(map);
+    });
 
-    L.control.zoom({ position: 'topright' }).addTo(map);
+    let switchedToFallback = false;
+    primaryTiles.on('tileerror', () => {
+      if (switchedToFallback) return;
+      switchedToFallback = true;
+      primaryTiles.setUrl('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png');
+    });
+
+    primaryTiles.addTo(map);
+    L.control.zoom({ position: isAr ? 'topleft' : 'topright' }).addTo(map);
 
     mapRef.current = map;
 
@@ -182,19 +212,51 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
     }
   }, [locations, showRegistrations, showNetworkCells, showHeatmap]);
 
+  const captureMapPng = useCallback(() => {
+    return captureLeafletMapPng(containerRef.current, mapRef.current, {
+      title: mapTitle,
+      subtitle: mapSubtitle,
+      locations,
+      showRegistrations,
+      showNetworkCells,
+      isRtl: isAr,
+    });
+  }, [mapTitle, mapSubtitle, locations, showRegistrations, showNetworkCells, isAr]);
+
+  useEffect(() => {
+    if (!onRegisterSnapshotCapture) return;
+    onRegisterSnapshotCapture(captureMapPng);
+    return () => onRegisterSnapshotCapture(null);
+  }, [onRegisterSnapshotCapture, captureMapPng]);
+
+  const toggleFullscreen = () => {
+    setIsFullscreen(v => !v);
+    setTimeout(() => {
+      mapRef.current?.invalidateSize();
+    }, 180);
+  };
+
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-3">
+    <div
+      className={`bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-3 ${
+        isFullscreen ? 'fixed inset-0 z-[900] rounded-none flex flex-col' : ''
+      }`}
+    >
       {/* Header & Controls */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
         <div>
           <h2 className="text-sm font-bold text-slate-100 flex items-center gap-2">
             <MapPin className="w-4 h-4 text-emerald-400" />
-            <span>BTS & Network Cell Locations Map</span>
+            <span>{mapTitle}</span>
           </h2>
           <p className="text-[11px] text-slate-400 mt-0.5">
-            Unique Locations: <strong className="text-slate-200">{stats?.uniqueLocations ?? locations.length}</strong> • Parsed Reg Coords:{' '}
-            <strong className="text-emerald-400">{stats?.totalParsedRegistrationCoords ?? 0}</strong> • Network Cells:{' '}
-            <strong className="text-blue-400">{stats?.networkCellLocationsCount ?? 0}</strong> • Invalid Skipped:{' '}
+            {isAr ? 'المواقع الفريدة:' : 'Unique Locations:'}{' '}
+            <strong className="text-slate-200">{stats?.uniqueLocations ?? locations.length}</strong> •{' '}
+            {isAr ? 'إحداثيات التسجيلات:' : 'Parsed Reg Coords:'}{' '}
+            <strong className="text-emerald-400">{stats?.totalParsedRegistrationCoords ?? 0}</strong> •{' '}
+            {isAr ? 'خلايا الشبكة:' : 'Network Cells:'}{' '}
+            <strong className="text-blue-400">{stats?.networkCellLocationsCount ?? 0}</strong> •{' '}
+            {isAr ? 'سجلات متجاوزة:' : 'Invalid Skipped:'}{' '}
             <strong className="text-amber-400">{stats?.invalidSkippedCount ?? 0}</strong>
           </p>
         </div>
@@ -203,70 +265,94 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
           <button
             type="button"
             onClick={() => setShowRegistrations(v => !v)}
-            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors ${
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors ${
               showRegistrations
                 ? 'bg-emerald-500/15 border-emerald-500/50 text-emerald-300'
                 : 'bg-slate-950 border-slate-800 text-slate-500'
             }`}
           >
             {showRegistrations ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-            <span>Registration BTS</span>
+            <span>{isAr ? 'أبراج التسجيلات' : 'Registration BTS'}</span>
           </button>
 
           <button
             type="button"
             onClick={() => setShowNetworkCells(v => !v)}
-            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors ${
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors ${
               showNetworkCells
                 ? 'bg-blue-500/15 border-blue-500/50 text-blue-300'
                 : 'bg-slate-950 border-slate-800 text-slate-500'
             }`}
           >
             {showNetworkCells ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-            <span>Network Cells</span>
+            <span>{isAr ? 'خلايا الشبكة' : 'Network Cells'}</span>
           </button>
 
           <button
             type="button"
             onClick={() => setShowHeatmap(v => !v)}
-            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors ${
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-semibold border transition-colors ${
               showHeatmap
                 ? 'bg-amber-500/20 border-amber-500/50 text-amber-300'
                 : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
             }`}
           >
             <Flame className="w-3.5 h-3.5" />
-            <span>Heatmap</span>
+            <span>{isAr ? 'خريطة حرارية' : 'Heatmap'}</span>
           </button>
 
           <button
             type="button"
             onClick={() => fitMapBounds(locations)}
-            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
           >
             <RotateCcw className="w-3.5 h-3.5" />
-            <span>Reset View</span>
+            <span>{isAr ? 'إعادة الضبط' : 'Reset View'}</span>
           </button>
+
+          <button
+            type="button"
+            onClick={toggleFullscreen}
+            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+          >
+            {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+            <span>{isFullscreen ? t('exitFullscreen') : t('fullscreen')}</span>
+          </button>
+
+          <ChartExportMenu
+            chartId="btsMap"
+            title={mapTitle}
+            subtitle={mapSubtitle}
+            filters={filters}
+            getPngSnapshot={captureMapPng}
+          />
         </div>
       </div>
 
       {/* Map Canvas */}
-      <div className="relative h-[420px] rounded-xl overflow-hidden border border-slate-800 bg-slate-950">
+      <div
+        className={`relative rounded-xl overflow-hidden border border-slate-800 bg-slate-950 ${
+          isFullscreen ? 'flex-1 min-h-[420px]' : 'h-[420px]'
+        }`}
+      >
         <div id={mapContainerId} ref={containerRef} className="w-full h-full" />
 
         {/* Legend Overlay */}
-        <div className="absolute bottom-3 left-3 z-[400] flex flex-wrap items-center gap-3 px-3 py-1.5 rounded-lg bg-slate-950/90 border border-slate-800 text-[11px] text-slate-300 shadow-lg">
+        <div className="absolute bottom-3 start-3 z-[400] flex flex-wrap items-center gap-3 px-3 py-1.5 rounded-lg bg-slate-950/90 border border-slate-800 text-[11px] text-slate-300 shadow-lg">
           <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 border border-white" /> Registration BTS
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 border border-white" />{' '}
+            {isAr ? 'أبراج التسجيلات' : 'Registration BTS'}
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-blue-500 border border-white" /> NetworkCell
+            <span className="w-2.5 h-2.5 rounded-full bg-blue-500 border border-white" />{' '}
+            {isAr ? 'خلايا الشبكة' : 'NetworkCell'}
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-amber-500 border border-white" /> Shared / Overlapping
+            <span className="w-2.5 h-2.5 rounded-full bg-amber-500 border border-white" />{' '}
+            {isAr ? 'مشترك / متطابق' : 'Shared / Overlapping'}
           </span>
           <span className="flex items-center gap-1 text-slate-400">
-            <Layers className="w-3 h-3" /> Clustered
+            <Layers className="w-3 h-3" /> {isAr ? 'تجميع عنقودي' : 'Clustered'}
           </span>
         </div>
       </div>

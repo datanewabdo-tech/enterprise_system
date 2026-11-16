@@ -101,10 +101,10 @@ describe('Phase 2: Analytical Queries, Country Exclusion, BTS Parsing & Filter I
       testDb.prepare(`INSERT INTO missions (id, mission, mission_name, location) VALUES (1, 'M_ALPHA', 'Alpha', 'Site A')`).run();
       testDb.prepare(`INSERT INTO missions (id, mission, mission_name, location) VALUES (2, 'M_BETA', 'Beta', 'Site B')`).run();
 
-      testDb.prepare(`INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES (425, 1, 'Israel', 'ISR', 'Partner')`).run();
-      testDb.prepare(`INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES (425, 5, 'Palestine', 'PSE', 'Jawwal')`).run();
-      testDb.prepare(`INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES (424, 2, 'United Arab Emirates', 'ARE', 'Etisalat UAE')`).run();
-      testDb.prepare(`INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES (602, 10, 'Egypt', 'EGY', 'Egyptian Military')`).run();
+      testDb.prepare(`INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES ('425', '1', 'Israel', 'ISR', 'Partner')`).run();
+      testDb.prepare(`INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES ('425', '5', 'Palestine', 'PSE', 'Jawwal')`).run();
+      testDb.prepare(`INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES ('424', '2', 'United Arab Emirates', 'ARE', 'Etisalat UAE')`).run();
+      testDb.prepare(`INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES ('602', '10', 'Egypt', 'EGY', 'Egyptian Military')`).run();
 
       // Registrations: duplicate IMSI for Palestine, excluded Egypt/EG/zero/null
       const insReg = testDb.prepare(`
@@ -122,14 +122,14 @@ describe('Phase 2: Analytical Queries, Country Exclusion, BTS Parsing & Filter I
         INSERT INTO network_cells (mission_id, mission, mcc, mnc, cell_id, rat, latitude, longitude)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `);
-      insNc.run(1, 'M_ALPHA', 602, 10, 1001, 'LTE', 31.2000, 34.2000);
-      insNc.run(1, 'M_ALPHA', 602, 10, 1001, 'LTE', 31.2000, 34.2000); // duplicate cell_id
-      insNc.run(1, 'M_ALPHA', 425, 25, 2001, 'LTE', 31.5017, 34.4668); // overlaps BTS_GAZA
-      insNc.run(1, 'M_ALPHA', 425, 1, 3001, 'LTE', 32.0853, 34.7818);
-      insNc.run(1, 'M_ALPHA', 425, 5, 4001, 'UMTS', 31.5200, 34.4700);
-      insNc.run(2, 'M_BETA', 424, 2, 5001, 'LTE', 25.2048, 55.2708);
-      insNc.run(2, 'M_BETA', 602, 1, 6001, 'GSM', null, null); // excluded from civilian
-      insNc.run(2, 'M_BETA', 425, 24, 7001, 'LTE', null, null); // excluded from civilian
+      insNc.run(1, 'M_ALPHA', '602', '10', '1001', 'LTE', 31.2000, 34.2000);
+      insNc.run(1, 'M_ALPHA', '602', '10', '1001', 'LTE', 31.2000, 34.2000); // duplicate cell_id
+      insNc.run(1, 'M_ALPHA', '425', '25', '2001', 'LTE', 31.5017, 34.4668); // overlaps BTS_GAZA
+      insNc.run(1, 'M_ALPHA', '425', '1', '3001', 'LTE', 32.0853, 34.7818);
+      insNc.run(1, 'M_ALPHA', '425', '5', '4001', 'UMTS', 31.5200, 34.4700);
+      insNc.run(2, 'M_BETA', '424', '2', '5001', 'LTE', 25.2048, 55.2708);
+      insNc.run(2, 'M_BETA', '602', '1', '6001', 'GSM', null, null); // excluded from civilian
+      insNc.run(2, 'M_BETA', '425', '24', '7001', 'LTE', null, null); // excluded from civilian
 
       // 2.1 Registrations by Country
       const regByCountry = getRegistrationsByCountry({}, testDb);
@@ -157,7 +157,11 @@ describe('Phase 2: Analytical Queries, Country Exclusion, BTS Parsing & Filter I
       const mil = getMilitaryNetworks({}, testDb);
       assert.equal(mil.totalDistinctCells, 2);
       assert.equal(mil.totalRecords, 3);
-      assert.ok(mil.items.every(i => (i.mcc === 602 && (i.mnc === 10 || i.mnc === 11)) || (i.mcc === 425 && i.mnc === 25)));
+      assert.ok(
+        mil.items.every(
+          i => (String(i.mcc) === '602' && (String(i.mnc) === '10' || String(i.mnc) === '11')) || (String(i.mcc) === '425' && String(i.mnc) === '25')
+        )
+      );
 
       // 2.5 Civilian Networks
       const civ = getCivilianNetworks({}, testDb);

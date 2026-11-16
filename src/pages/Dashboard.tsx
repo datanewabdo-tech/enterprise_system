@@ -4,6 +4,8 @@ import { DashboardFilterState, INITIAL_DASHBOARD_FILTERS } from '../types/index.
 import { GlobalFilterPanel } from '../components/dashboard/GlobalFilterPanel.js';
 import { BtsLocationsMap } from '../components/dashboard/BtsLocationsMap.js';
 import { ExportDashboardModal } from '../components/dashboard/ExportDashboardModal.js';
+import { ChartExportMenu } from '../components/dashboard/ChartExportMenu.js';
+import { renderChartPngDataUrl } from '../utils/chartExporter.js';
 import {
   BarChart,
   Bar,
@@ -42,57 +44,9 @@ import {
   X,
 } from 'lucide-react';
 
-async function svgContainerToPngDataUrl(container: HTMLElement | null): Promise<string | null> {
-  if (!container) return null;
-  const svg = container.querySelector('svg');
-  if (!svg) return null;
-
-  try {
-    const rect = svg.getBoundingClientRect();
-    const width = Math.max(480, Math.round(rect.width || 600));
-    const height = Math.max(240, Math.round(rect.height || 260));
-    const clone = svg.cloneNode(true) as SVGSVGElement;
-    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-    clone.setAttribute('width', String(width));
-    clone.setAttribute('height', String(height));
-
-    const xml = new XMLSerializer().serializeToString(clone);
-    const svgBlob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(svgBlob);
-
-    const dataUrl = await new Promise<string | null>(resolve => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        canvas.width = width * 2;
-        canvas.height = height * 2;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          URL.revokeObjectURL(url);
-          resolve(null);
-          return;
-        }
-        ctx.fillStyle = '#0f172a';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.scale(2, 2);
-        ctx.drawImage(img, 0, 0, width, height);
-        URL.revokeObjectURL(url);
-        resolve(canvas.toDataURL('image/png'));
-      };
-      img.onerror = () => {
-        URL.revokeObjectURL(url);
-        resolve(null);
-      };
-      img.src = url;
-    });
-    return dataUrl;
-  } catch {
-    return null;
-  }
-}
-
 export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ onNavigate }) => {
-  const { t, activeMission, apiFetch, missions, currentUser, addNotification, refreshMissions } = useApp();
+  const { t, language, activeMission, apiFetch, authToken, missions, currentUser, addNotification, refreshMissions } = useApp();
+  const isAr = language === 'ar';
 
   const [filters, setFilters] = useState<DashboardFilterState>(INITIAL_DASHBOARD_FILTERS);
   const [filterOptions, setFilterOptions] = useState<any | null>(null);
@@ -105,11 +59,12 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
   const [ambiguities, setAmbiguities] = useState<any[]>([]);
   const [resolvingId, setResolvingId] = useState<number | null>(null);
 
-  // Chart Refs for PDF/Word PNG embedding
+  // Chart Refs & Map Snapshot callback for PNG/SVG/PDF embedding
   const regCountryChartRef = useRef<HTMLDivElement>(null);
   const mccChartRef = useRef<HTMLDivElement>(null);
   const militaryChartRef = useRef<HTMLDivElement>(null);
   const civilianChartRef = useRef<HTMLDivElement>(null);
+  const mapSnapshotCaptureRef = useRef<(() => Promise<string | null>) | null>(null);
 
   // Sync top Navbar activeMission dropdown into filter missionIds
   useEffect(() => {
@@ -123,15 +78,16 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
     }
   }, [activeMission]);
 
-  // Fetch filter dropdown options once
+  // Fetch filter dropdown options once authenticated
   useEffect(() => {
+    if (!authToken) return;
     apiFetch('/api/v1/analytics/filter-options')
       .then(r => (r.ok ? r.json() : null))
       .then(opts => {
         if (opts) setFilterOptions(opts);
       })
       .catch(() => {});
-  }, [apiFetch]);
+  }, [authToken, apiFetch]);
 
   const buildFilterPayload = useCallback((f: DashboardFilterState) => {
     return {
@@ -165,6 +121,7 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
       channel: f.channel || undefined,
       bsic: f.bsic || undefined,
       pci: f.pci || undefined,
+      psc: f.psc || undefined,
       rxLevMin: f.rxLevMin || undefined,
       rxLevMax: f.rxLevMax || undefined,
       rxLevDbmMin: f.rxLevDbmMin || undefined,
@@ -183,6 +140,7 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
   }, []);
 
   const fetchDashboardData = useCallback(() => {
+    if (!authToken) return () => {};
     setLoading(true);
     const timer = setTimeout(() => {
       apiFetch('/api/v1/analytics/dashboard', {
@@ -198,7 +156,7 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
         .finally(() => setLoading(false));
     }, 120);
     return () => clearTimeout(timer);
-  }, [filters, apiFetch, buildFilterPayload]);
+  }, [filters, authToken, apiFetch, buildFilterPayload]);
 
   useEffect(() => {
     const cleanup = fetchDashboardData();
@@ -232,29 +190,33 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
     }
   };
 
+  const regTitle = isAr
+    ? data?.registrationsByCountry?.titleAr || 'أعداد شرائح الاتصال المرصودة لكل دولة'
+    : data?.registrationsByCountry?.titleEn || 'Detected SIM Registrations by Country';
+  const mccTitle = isAr
+    ? data?.networkCellsByMcc?.titleAr || 'إجمالي الخلايا المرصودة لكل دولة'
+    : data?.networkCellsByMcc?.titleEn || 'Total Detected Network Cells by Country (MCC)';
+  const milTitle = isAr
+    ? data?.militaryNetworks?.titleAr || 'شبكات الاتصال بالهواتف المحمولة العسكرية (الإسرائيلية والمصرية)'
+    : data?.militaryNetworks?.titleEn || 'Military Mobile Networks (Egypt & Israel)';
+  const civTitle = isAr
+    ? data?.civilianNetworks?.titleAr || 'شبكات اتصالات الهواتف المحمولة المدنية (الإسرائيلية والفلسطينية والإماراتية)'
+    : data?.civilianNetworks?.titleEn || 'Civilian Mobile Networks (Israel, Palestine & UAE)';
+
   const captureChartImages = async (): Promise<Record<string, string>> => {
     const images: Record<string, string> = {};
-    const [imgReg, imgMcc, imgMil, imgCiv] = await Promise.all([
-      svgContainerToPngDataUrl(regCountryChartRef.current),
-      svgContainerToPngDataUrl(mccChartRef.current),
-      svgContainerToPngDataUrl(militaryChartRef.current),
-      svgContainerToPngDataUrl(civilianChartRef.current),
+    const [imgReg, imgMcc, imgMil, imgCiv, imgMap] = await Promise.all([
+      renderChartPngDataUrl(regCountryChartRef.current, { title: regTitle, isRtl: isAr }),
+      renderChartPngDataUrl(mccChartRef.current, { title: mccTitle, isRtl: isAr }),
+      renderChartPngDataUrl(militaryChartRef.current, { title: milTitle, isRtl: isAr }),
+      renderChartPngDataUrl(civilianChartRef.current, { title: civTitle, isRtl: isAr }),
+      mapSnapshotCaptureRef.current ? mapSnapshotCaptureRef.current() : Promise.resolve(null),
     ]);
     if (imgReg) images.registrationsByCountry = imgReg;
     if (imgMcc) images.networkCellsByMcc = imgMcc;
     if (imgMil) images.militaryNetworks = imgMil;
     if (imgCiv) images.civilianNetworks = imgCiv;
-
-    // Attempt Leaflet map canvas snapshot if available & untainted
-    try {
-      const mapEl = document.getElementById('bts-dashboard-map');
-      const canvas = mapEl?.querySelector('canvas');
-      if (canvas) {
-        images.btsMap = canvas.toDataURL('image/png');
-      }
-    } catch {
-      // external tile CORS taint ignored gracefully; server renders BTS coordinates table
-    }
+    if (imgMap) images.btsMap = imgMap;
     return images;
   };
 
@@ -382,16 +344,27 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
           <div className="flex items-start justify-between gap-2">
             <div>
-              <h2 className="text-sm font-bold text-slate-100" dir="rtl">
-                أعداد شرائح الاتصال المرصودة لكل دولة
+              <h2 className="text-sm font-bold text-slate-100">
+                {regTitle}
               </h2>
               <p className="text-[11px] text-slate-400">
-                Distinct IMSIs per country (excluding null/empty country, zero IMSI, and Egypt)
+                {isAr
+                  ? 'شرائح IMSI الفريدة لكل دولة (مع استبعاد الدول الفارغة ومصر افتراضياً)'
+                  : 'Distinct IMSIs per country (excluding null/empty country, zero IMSI, and Egypt)'}
               </p>
             </div>
-            <span className="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[11px] font-mono font-bold shrink-0">
-              Total: {data?.registrationsByCountry?.totalDistinctImsis ?? 0}
-            </span>
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[11px] font-mono font-bold">
+                Total: {data?.registrationsByCountry?.totalDistinctImsis ?? 0}
+              </span>
+              <ChartExportMenu
+                chartId="registrationsByCountry"
+                title={regTitle}
+                subtitle={`Total Distinct IMSIs: ${data?.registrationsByCountry?.totalDistinctImsis ?? 0}`}
+                filters={filters}
+                svgContainerRef={regCountryChartRef}
+              />
+            </div>
           </div>
 
           <div ref={regCountryChartRef} className="h-64">
@@ -456,16 +429,27 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
           <div className="flex items-start justify-between gap-2">
             <div>
-              <h2 className="text-sm font-bold text-slate-100" dir="rtl">
-                إجمالي الخلايا المرصودة لكل دولة
+              <h2 className="text-sm font-bold text-slate-100">
+                {mccTitle}
               </h2>
               <p className="text-[11px] text-slate-400">
-                Distinct Cell IDs per MCC resolved via PlmnStorage
+                {isAr
+                  ? 'معرفات الخلايا الفريدة لكل رمز دولة MCC عبر جدول المشغلين'
+                  : 'Distinct Cell IDs per MCC resolved via PlmnStorage'}
               </p>
             </div>
-            <span className="px-2 py-0.5 rounded bg-blue-500/15 border border-blue-500/30 text-blue-300 text-[11px] font-mono font-bold shrink-0">
-              Total Cells: {data?.networkCellsByMcc?.totalDistinctCells ?? 0}
-            </span>
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="px-2 py-0.5 rounded bg-blue-500/15 border border-blue-500/30 text-blue-300 text-[11px] font-mono font-bold">
+                Total Cells: {data?.networkCellsByMcc?.totalDistinctCells ?? 0}
+              </span>
+              <ChartExportMenu
+                chartId="networkCellsByMcc"
+                title={mccTitle}
+                subtitle={`Total Distinct Cells: ${data?.networkCellsByMcc?.totalDistinctCells ?? 0}`}
+                filters={filters}
+                svgContainerRef={mccChartRef}
+              />
+            </div>
           </div>
 
           <div ref={mccChartRef} className="h-64">
@@ -526,19 +510,35 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
       </div>
 
       {/* SECTION 2.2: BTS Locations Interactive Map */}
-      <BtsLocationsMap locations={data?.btsMap?.locations || []} stats={data?.btsMap?.stats} />
+      <BtsLocationsMap
+        locations={data?.btsMap?.locations || []}
+        stats={data?.btsMap?.stats}
+        filters={filters}
+        onRegisterSnapshotCapture={fn => {
+          mapSnapshotCaptureRef.current = fn;
+        }}
+      />
 
       {/* SECTION 2.4 & 2.5: Military & Civilian Mobile Networks */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* 2.4 Military Mobile Networks */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
-          <div>
-            <h2 className="text-sm font-bold text-slate-100" dir="rtl">
-              شبكات الاتصال بالهواتف المحمولة العسكرية (الإسرائيلية والمصرية)
-            </h2>
-            <p className="text-[11px] text-slate-400">
-              Restricted exclusively to MCC/MNC (602/10, 602/11) Egypt (#3498DB) & (425/25) Israel (#27AE60)
-            </p>
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-bold text-slate-100">
+                {milTitle}
+              </h2>
+              <p className="text-[11px] text-slate-400">
+                Restricted exclusively to MCC/MNC (602/10, 602/11) Egypt (#3498DB) &amp; (425/25) Israel (#27AE60)
+              </p>
+            </div>
+            <ChartExportMenu
+              chartId="militaryNetworks"
+              title={milTitle}
+              subtitle={`Distinct Cells: ${data?.militaryNetworks?.totalDistinctCells ?? 0}`}
+              filters={filters}
+              svgContainerRef={militaryChartRef}
+            />
           </div>
 
           <div ref={militaryChartRef} className="h-56">
@@ -594,13 +594,22 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
 
         {/* 2.5 Civilian Mobile Networks */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
-          <div>
-            <h2 className="text-sm font-bold text-slate-100" dir="rtl">
-              شبكات اتصالات الهواتف المحمولة المدنية (الإسرائيلية والفلسطينية والإماراتية)
-            </h2>
-            <p className="text-[11px] text-slate-400">
-              Israel (#2980B9), Palestine (#27AE60), UAE (#E67E22) — Excluding 602/1,2,3,4,10,11 &amp; 425/24
-            </p>
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-bold text-slate-100">
+                {civTitle}
+              </h2>
+              <p className="text-[11px] text-slate-400">
+                Israel (#2980B9), Palestine (#27AE60), UAE (#E67E22) — Excluding 602/1,2,3,4,10,11 &amp; 425/24
+              </p>
+            </div>
+            <ChartExportMenu
+              chartId="civilianNetworks"
+              title={civTitle}
+              subtitle={`Distinct Cells: ${data?.civilianNetworks?.totalDistinctCells ?? 0}`}
+              filters={filters}
+              svgContainerRef={civilianChartRef}
+            />
           </div>
 
           <div ref={civilianChartRef} className="h-56">
@@ -870,11 +879,17 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
               <div className="space-y-3">
                 {ambiguities.map(amb => {
                   const candidateIds: number[] = (() => {
+                    const raw = amb.candidate_mission_ids || '';
                     try {
-                      return JSON.parse(amb.candidate_mission_ids || '[]');
+                      const parsed = JSON.parse(raw);
+                      if (Array.isArray(parsed)) return parsed.map(Number).filter(Number.isInteger);
                     } catch {
-                      return [];
+                      // fall back to comma-separated list
                     }
+                    return String(raw)
+                      .split(',')
+                      .map(s => Number(s.trim()))
+                      .filter(n => Number.isInteger(n) && n > 0);
                   })();
                   const candidateMissions = missions.filter(m => candidateIds.includes(m.id));
                   return (
@@ -883,7 +898,7 @@ export const Dashboard: React.FC<{ onNavigate: (page: string) => void }> = ({ on
                         <span className="font-mono text-indigo-300">
                           {amb.table_name} #{amb.record_id}
                         </span>
-                        <span className="text-amber-300">Label: &quot;{amb.raw_mission_value}&quot;</span>
+                        <span className="text-amber-300">Label: &quot;{amb.mission_label || amb.raw_mission_value}&quot;</span>
                       </div>
                       <div className="flex flex-wrap gap-2">
                         {candidateMissions.map(cm => (

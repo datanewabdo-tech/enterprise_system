@@ -3,18 +3,19 @@ import { useApp } from '../context/AppContext.js';
 import { BookOpen, Search, Database, Key, Check, Layers } from 'lucide-react';
 
 export const DataDictionary: React.FC = () => {
-  const { t } = useApp();
+  const { t, apiFetch, authToken } = useApp();
   const [dictionary, setDictionary] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [, setLoading] = useState(true);
   const [search, setSearch] = useState('');
 
   useEffect(() => {
-    fetch('/api/v1/system/data-dictionary')
-      .then(r => r.json())
-      .then(data => setDictionary(data || []))
+    if (!authToken) return;
+    apiFetch('/api/v1/system/data-dictionary')
+      .then(r => (r.ok ? r.json() : []))
+      .then(data => setDictionary(Array.isArray(data) ? data : []))
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, []);
+  }, [authToken]);
 
   const filtered = dictionary.filter(
     item =>

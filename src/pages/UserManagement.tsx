@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 
 export const UserManagement: React.FC = () => {
-  const { t, currentUser } = useApp();
+  const { apiFetch, authToken } = useApp();
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
@@ -26,25 +26,39 @@ export const UserManagement: React.FC = () => {
   const [password, setPassword] = useState('');
   const [role, setRole] = useState<Role>('DATA_ANALYST');
   const [error, setError] = useState<string | null>(null);
+  const [accessError, setAccessError] = useState<string | null>(null);
 
   const fetchUsers = () => {
+    if (!authToken) return;
     setLoading(true);
-    fetch('/api/v1/users')
-      .then(res => res.json())
-      .then(data => setUsers(data || []))
-      .catch(() => {})
+    setAccessError(null);
+    apiFetch('/api/v1/users')
+      .then(async res => {
+        const json = await res.json();
+        if (!res.ok) {
+          throw new Error(json.error || 'Failed to load users');
+        }
+        return json;
+      })
+      .then(data => setUsers(Array.isArray(data) ? data : []))
+      .catch(err => {
+        setUsers([]);
+        setAccessError(err.message);
+      })
       .finally(() => setLoading(false));
   };
 
   useEffect(() => {
-    fetchUsers();
-  }, []);
+    if (authToken) {
+      fetchUsers();
+    }
+  }, [authToken]);
 
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     try {
-      const res = await fetch('/api/v1/users', {
+      const res = await apiFetch('/api/v1/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -94,6 +108,13 @@ export const UserManagement: React.FC = () => {
           <span>Provision New User</span>
         </button>
       </div>
+
+      {accessError && (
+        <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0" />
+          <span>{accessError}</span>
+        </div>
+      )}
 
       {/* Users Table */}
       <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-sm">

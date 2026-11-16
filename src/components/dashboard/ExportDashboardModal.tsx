@@ -31,6 +31,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
   const [format, setFormat] = useState<'pdf' | 'xlsx' | 'docx'>('pdf');
   const [reportLang, setReportLang] = useState<'en' | 'ar'>(language);
   const [exporting, setExporting] = useState(false);
+  const [progressStage, setProgressStage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastExport, setLastExport] = useState<{ exportId: number; fileName: string; downloadUrl: string } | null>(null);
   const [history, setHistory] = useState<any[]>([]);
@@ -93,11 +94,13 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
 
   const handleGenerateExport = async () => {
     setExporting(true);
+    setProgressStage('Capturing charts & geographic map snapshots...');
     setError(null);
     setLastExport(null);
 
     try {
       const chartImages = format !== 'xlsx' ? await captureChartImages() : {};
+      setProgressStage(`Generating ${format.toUpperCase()} report on server...`);
 
       const res = await apiFetch('/api/v1/exports/dashboard', {
         method: 'POST',
@@ -136,6 +139,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
             channel: filters.channel || undefined,
             bsic: filters.bsic || undefined,
             pci: filters.pci || undefined,
+            psc: filters.psc || undefined,
             rxLevMin: filters.rxLevMin || undefined,
             rxLevMax: filters.rxLevMax || undefined,
             rxLevDbmMin: filters.rxLevDbmMin || undefined,
@@ -161,6 +165,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
         throw new Error(json.error || 'Export generation failed');
       }
 
+      setProgressStage('Starting file download...');
       setLastExport(json);
       fetchHistory();
       triggerDownload(json.downloadUrl, json.fileName);
@@ -174,6 +179,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
       setError(err.message);
     } finally {
       setExporting(false);
+      setProgressStage(null);
     }
   };
 
@@ -352,6 +358,14 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
           </div>
         )}
 
+        {/* Staged Progress Banner */}
+        {exporting && progressStage && (
+          <div className="p-3 rounded-xl bg-indigo-950/40 border border-indigo-700/50 flex items-center gap-2.5 text-xs text-indigo-200">
+            <RefreshCw className="w-4 h-4 animate-spin text-indigo-400 shrink-0" />
+            <span>{progressStage}</span>
+          </div>
+        )}
+
         {/* Footer Actions */}
         <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
           <button
@@ -368,7 +382,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
             className="flex items-center gap-2 px-5 py-2 text-xs font-bold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50"
           >
             {exporting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
-            <span>{exporting ? 'Generating Report...' : `Generate ${format.toUpperCase()} Report`}</span>
+            <span>{exporting ? (progressStage || 'Generating Report...') : `Generate ${format.toUpperCase()} Report`}</span>
           </button>
         </div>
 

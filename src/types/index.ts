@@ -88,13 +88,14 @@ export interface DashboardFilterState {
   update: string[];
   // NetworkCell Filters
   rat: string[];
-  mcc: number[];
-  mnc: number[];
+  mcc: string[];
+  mnc: string[];
   lac: string;
   cellId: string;
   channel: string;
   bsic: string;
   pci: string;
+  psc?: string;
   rxLevMin: string;
   rxLevMax: string;
   rxLevDbmMin: string;

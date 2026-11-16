@@ -88,38 +88,44 @@ export function isValidCoord(lat: number, lng: number): boolean {
   return true;
 }
 
-const FALLBACK_MCC_COUNTRIES: Record<number, string> = {
-  602: 'Egypt',
-  425: 'Israel / Palestine',
-  424: 'United Arab Emirates',
-  420: 'Saudi Arabia',
-  416: 'Jordan',
-  208: 'France',
-  234: 'United Kingdom',
-  310: 'United States',
+function stripLeadingZeros(val: unknown): string {
+  const s = String(val ?? '').trim();
+  if (!s) return '';
+  return s.replace(/^0+(?=\d)/, '');
+}
+
+const FALLBACK_MCC_COUNTRIES: Record<string, string> = {
+  '602': 'Egypt',
+  '425': 'Israel / Palestine',
+  '424': 'United Arab Emirates',
+  '420': 'Saudi Arabia',
+  '416': 'Jordan',
+  '208': 'France',
+  '234': 'United Kingdom',
+  '310': 'United States',
 };
 
-const MILITARY_NETWORK_MAP: Array<{ mcc: number; mnc: number; operator: string; country: string; color: string }> = [
-  { mcc: 602, mnc: 10, operator: 'المحمول العسكري المصري', country: 'Egypt', color: '#3498DB' },
-  { mcc: 602, mnc: 11, operator: 'المحمول العسكري المصري', country: 'Egypt', color: '#3498DB' },
-  { mcc: 425, mnc: 25, operator: 'المحمول العسكري الإسرائيلي', country: 'Israel', color: '#27AE60' },
+const MILITARY_NETWORK_MAP: Array<{ mcc: string; mnc: string; operator: string; country: string; color: string }> = [
+  { mcc: '602', mnc: '10', operator: 'المحمول العسكري المصري', country: 'Egypt', color: '#3498DB' },
+  { mcc: '602', mnc: '11', operator: 'المحمول العسكري المصري', country: 'Egypt', color: '#3498DB' },
+  { mcc: '425', mnc: '25', operator: 'المحمول العسكري الإسرائيلي', country: 'Israel', color: '#27AE60' },
 ];
 
-const CIVILIAN_NETWORK_MAP: Array<{ mcc: number; mnc: number; country: string; operator: string; color: string }> = [
+const CIVILIAN_NETWORK_MAP: Array<{ mcc: string; mnc: string; country: string; operator: string; color: string }> = [
   // Israel (#2980B9)
-  { mcc: 425, mnc: 1, country: 'Israel', operator: 'Partner', color: '#2980B9' },
-  { mcc: 425, mnc: 2, country: 'Israel', operator: 'Cellcom', color: '#2980B9' },
-  { mcc: 425, mnc: 3, country: 'Israel', operator: 'Pelephone', color: '#2980B9' },
-  { mcc: 425, mnc: 7, country: 'Israel', operator: 'Hot Mobile', color: '#2980B9' },
-  { mcc: 425, mnc: 9, country: 'Israel', operator: 'We4G', color: '#2980B9' },
-  { mcc: 425, mnc: 25, country: 'Israel', operator: 'IMOD', color: '#2980B9' },
-  { mcc: 425, mnc: 28, country: 'Israel', operator: 'PHI Networks', color: '#2980B9' },
-  { mcc: 425, mnc: 29, country: 'Israel', operator: 'CG Networks', color: '#2980B9' },
+  { mcc: '425', mnc: '1', country: 'Israel', operator: 'Partner', color: '#2980B9' },
+  { mcc: '425', mnc: '2', country: 'Israel', operator: 'Cellcom', color: '#2980B9' },
+  { mcc: '425', mnc: '3', country: 'Israel', operator: 'Pelephone', color: '#2980B9' },
+  { mcc: '425', mnc: '7', country: 'Israel', operator: 'Hot Mobile', color: '#2980B9' },
+  { mcc: '425', mnc: '9', country: 'Israel', operator: 'We4G', color: '#2980B9' },
+  { mcc: '425', mnc: '25', country: 'Israel', operator: 'IMOD', color: '#2980B9' },
+  { mcc: '425', mnc: '28', country: 'Israel', operator: 'PHI Networks', color: '#2980B9' },
+  { mcc: '425', mnc: '29', country: 'Israel', operator: 'CG Networks', color: '#2980B9' },
   // Palestine (#27AE60)
-  { mcc: 425, mnc: 5, country: 'Palestine', operator: 'Jawwal', color: '#27AE60' },
-  { mcc: 425, mnc: 6, country: 'Palestine', operator: 'Wataniya', color: '#27AE60' },
+  { mcc: '425', mnc: '5', country: 'Palestine', operator: 'Jawwal', color: '#27AE60' },
+  { mcc: '425', mnc: '6', country: 'Palestine', operator: 'Wataniya', color: '#27AE60' },
   // UAE (#E67E22)
-  { mcc: 424, mnc: 2, country: 'United Arab Emirates', operator: 'Etisalat UAE (e&)', color: '#E67E22' },
+  { mcc: '424', mnc: '2', country: 'United Arab Emirates', operator: 'Etisalat UAE (e&)', color: '#E67E22' },
 ];
 
 const CIVILIAN_EXCLUDED_PAIRS = new Set([
@@ -287,33 +293,37 @@ export function buildNetworkCellWhere(
   }
   if (filters.mcc && filters.mcc.length > 0) {
     const ph = filters.mcc.map(() => '?').join(', ');
-    clauses.push(`mcc IN (${ph})`);
-    params.push(...filters.mcc);
+    clauses.push(`TRIM(mcc) IN (${ph})`);
+    params.push(...filters.mcc.map(v => String(v).trim()));
   }
   if (filters.mnc && filters.mnc.length > 0) {
     const ph = filters.mnc.map(() => '?').join(', ');
-    clauses.push(`mnc IN (${ph})`);
-    params.push(...filters.mnc);
+    clauses.push(`TRIM(mnc) IN (${ph})`);
+    params.push(...filters.mnc.map(v => String(v).trim()));
   }
-  if (filters.lac !== undefined) {
-    clauses.push(`lac = ?`);
-    params.push(filters.lac);
+  if (filters.lac !== undefined && filters.lac !== '') {
+    clauses.push(`TRIM(lac) = ?`);
+    params.push(String(filters.lac).trim());
   }
-  if (filters.cellId !== undefined) {
-    clauses.push(`cell_id = ?`);
-    params.push(filters.cellId);
+  if (filters.cellId !== undefined && filters.cellId !== '') {
+    clauses.push(`TRIM(cell_id) = ?`);
+    params.push(String(filters.cellId).trim());
   }
   if (filters.channel !== undefined) {
     clauses.push(`channel = ?`);
     params.push(filters.channel);
   }
-  if (filters.bsic !== undefined) {
-    clauses.push(`bsic = ?`);
-    params.push(filters.bsic);
+  if (filters.bsic !== undefined && filters.bsic !== '') {
+    clauses.push(`TRIM(bsic) = ?`);
+    params.push(String(filters.bsic).trim());
   }
-  if (filters.pci !== undefined) {
-    clauses.push(`pci = ?`);
-    params.push(filters.pci);
+  if (filters.psc !== undefined && filters.psc !== '') {
+    clauses.push(`TRIM(psc) = ?`);
+    params.push(String(filters.psc).trim());
+  }
+  if (filters.pci !== undefined && filters.pci !== '') {
+    clauses.push(`TRIM(pci) = ?`);
+    params.push(String(filters.pci).trim());
   }
   if (filters.rxLevMin !== undefined) {
     clauses.push(`rx_lev >= ?`);
@@ -386,14 +396,18 @@ export function buildNetworkCellWhere(
     const term = `%${filters.plmnQuery}%`;
     const matchedPlmns = targetDb.prepare(`
       SELECT mcc, mnc FROM plmn_storage
-      WHERE name LIKE ? OR country LIKE ? OR code LIKE ? OR CAST(mcc AS TEXT) LIKE ?
-    `).all(term, term, term, term) as Array<{ mcc: number; mnc: number }>;
+      WHERE name LIKE ? OR country LIKE ? OR code LIKE ? OR CAST(mcc AS TEXT) LIKE ? OR CAST(mnc AS TEXT) LIKE ?
+    `).all(term, term, term, term, term) as Array<{ mcc: string | number; mnc: string | number }>;
 
     if (matchedPlmns.length > 0) {
-      const pairClauses = matchedPlmns.map(() => `(mcc = ? AND mnc = ?)`).join(' OR ');
+      const pairClauses = matchedPlmns
+        .map(() => `((TRIM(mcc) = ? AND TRIM(mnc) = ?) OR (LTRIM(TRIM(mcc), '0') = ? AND LTRIM(TRIM(mnc), '0') = ?))`)
+        .join(' OR ');
       clauses.push(`(${pairClauses})`);
       for (const p of matchedPlmns) {
-        params.push(p.mcc, p.mnc);
+        const mccStr = String(p.mcc).trim();
+        const mncStr = String(p.mnc).trim();
+        params.push(mccStr, mncStr, stripLeadingZeros(mccStr), stripLeadingZeros(mncStr));
       }
     } else {
       clauses.push(`1 = 0`);
@@ -477,9 +491,9 @@ export function getBtsMapData(filters: Partial<DashboardFilters> = {}, targetDb:
     btsCodes: Set<string>;
     countries: Set<string>;
     rats: Set<string>;
-    mccs: Set<number>;
-    mncs: Set<number>;
-    cellIds: Set<number>;
+    mccs: Set<string>;
+    mncs: Set<string>;
+    cellIds: Set<string>;
     missions: Set<string>;
   }
 
@@ -538,9 +552,9 @@ export function getBtsMapData(filters: Partial<DashboardFilters> = {}, targetDb:
     b.sources.add('network_cell');
     b.networkCellCount++;
     if (nc.rat) b.rats.add(String(nc.rat));
-    if (nc.mcc !== null && nc.mcc !== undefined) b.mccs.add(Number(nc.mcc));
-    if (nc.mnc !== null && nc.mnc !== undefined) b.mncs.add(Number(nc.mnc));
-    if (nc.cell_id !== null && nc.cell_id !== undefined) b.cellIds.add(Number(nc.cell_id));
+    if (nc.mcc !== null && nc.mcc !== undefined && String(nc.mcc).trim() !== '') b.mccs.add(String(nc.mcc).trim());
+    if (nc.mnc !== null && nc.mnc !== undefined && String(nc.mnc).trim() !== '') b.mncs.add(String(nc.mnc).trim());
+    if (nc.cell_id !== null && nc.cell_id !== undefined && String(nc.cell_id).trim() !== '') b.cellIds.add(String(nc.cell_id).trim());
     if (nc.mission) b.missions.add(String(nc.mission));
   }
 
@@ -584,35 +598,38 @@ export function getBtsMapData(filters: Partial<DashboardFilters> = {}, targetDb:
 }
 
 /**
- * 2.3 Network Cells by MCC (distinct non-null cellId per non-null mcc, resolved via PlmnStorage)
+ * 2.3 Network Cells by MCC (distinct non-null cellId per non-null mcc, preserving leading zeros)
  */
 export function getNetworkCellsByMcc(filters: Partial<DashboardFilters> = {}, targetDb: DatabaseSync = db) {
   const { whereSql, params } = buildNetworkCellWhere(filters, targetDb);
   const baseClauses = whereSql ? [whereSql.replace(/^WHERE\s+/i, '')] : [];
-  baseClauses.push(`mcc IS NOT NULL`);
-  baseClauses.push(`cell_id IS NOT NULL`);
+  baseClauses.push(`mcc IS NOT NULL AND TRIM(mcc) != ''`);
+  baseClauses.push(`cell_id IS NOT NULL AND TRIM(cell_id) != ''`);
 
   const rows = targetDb.prepare(`
-    SELECT mcc,
-           COUNT(DISTINCT cell_id) as distinctCellCount,
+    SELECT TRIM(mcc) as mcc,
+           COUNT(DISTINCT TRIM(cell_id)) as distinctCellCount,
            COUNT(*) as totalRecords
     FROM network_cells
     WHERE ${baseClauses.join(' AND ')}
-    GROUP BY mcc
+    GROUP BY TRIM(mcc)
     ORDER BY distinctCellCount DESC, totalRecords DESC, mcc ASC
-  `).all(...params) as Array<{ mcc: number; distinctCellCount: number; totalRecords: number }>;
+  `).all(...params) as Array<{ mcc: string; distinctCellCount: number; totalRecords: number }>;
 
-  // Resolve MCC -> country via PlmnStorage
+  // Resolve MCC -> country via PlmnStorage (supporting exact string & leading-zero-normalized lookup)
   const plmnCountries = targetDb.prepare(`
-    SELECT mcc, GROUP_CONCAT(DISTINCT country) as countries
+    SELECT TRIM(mcc) as mcc, GROUP_CONCAT(DISTINCT country) as countries
     FROM plmn_storage
-    GROUP BY mcc
-  `).all() as Array<{ mcc: number; countries: string }>;
-  const countryLookup = new Map<number, string>();
+    GROUP BY TRIM(mcc)
+  `).all() as Array<{ mcc: string; countries: string }>;
+  const countryLookup = new Map<string, string>();
+  const normalizedCountryLookup = new Map<string, string>();
   for (const p of plmnCountries) {
     if (p.countries) {
       const list = p.countries.split(',').map(s => s.trim()).filter(Boolean);
-      countryLookup.set(Number(p.mcc), list.join(' / '));
+      const label = list.join(' / ');
+      countryLookup.set(String(p.mcc).trim(), label);
+      normalizedCountryLookup.set(stripLeadingZeros(p.mcc), label);
     }
   }
 
@@ -624,13 +641,19 @@ export function getNetworkCellsByMcc(filters: Partial<DashboardFilters> = {}, ta
     titleEn: 'Total Observed Network Cells by Country (MCC)',
     totalDistinctCells: totalDistinct,
     items: rows.map((r, idx) => {
-      const mccNum = Number(r.mcc);
-      const country = countryLookup.get(mccNum) || FALLBACK_MCC_COUNTRIES[mccNum] || `MCC ${mccNum}`;
+      const mccStr = String(r.mcc).trim();
+      const mccNorm = stripLeadingZeros(mccStr);
+      const country =
+        countryLookup.get(mccStr) ||
+        normalizedCountryLookup.get(mccNorm) ||
+        FALLBACK_MCC_COUNTRIES[mccStr] ||
+        FALLBACK_MCC_COUNTRIES[mccNorm] ||
+        `MCC ${mccStr}`;
       return {
         rank: idx + 1,
-        mcc: mccNum,
+        mcc: mccStr,
         country,
-        label: `${country} (${mccNum})`,
+        label: `${country} (${mccStr})`,
         distinctCellCount: Number(r.distinctCellCount),
         totalRecords: Number(r.totalRecords),
         percentageShare: totalDistinct > 0 ? Number(((Number(r.distinctCellCount) / totalDistinct) * 100).toFixed(2)) : 0,
@@ -646,28 +669,32 @@ export function getNetworkCellsByMcc(filters: Partial<DashboardFilters> = {}, ta
 export function getMilitaryNetworks(filters: Partial<DashboardFilters> = {}, targetDb: DatabaseSync = db) {
   const { whereSql, params } = buildNetworkCellWhere(filters, targetDb);
   const baseClauses = whereSql ? [whereSql.replace(/^WHERE\s+/i, '')] : [];
-  baseClauses.push(`((mcc = 602 AND mnc IN (10, 11)) OR (mcc = 425 AND mnc = 25))`);
+  baseClauses.push(`((LTRIM(TRIM(mcc), '0') = '602' AND LTRIM(TRIM(mnc), '0') IN ('10', '11')) OR (LTRIM(TRIM(mcc), '0') = '425' AND LTRIM(TRIM(mnc), '0') = '25'))`);
 
   const rows = targetDb.prepare(`
-    SELECT mcc, mnc,
-           COUNT(DISTINCT CASE WHEN cell_id IS NOT NULL THEN cell_id END) as distinctCellCount,
+    SELECT TRIM(mcc) as mcc, TRIM(mnc) as mnc,
+           COUNT(DISTINCT CASE WHEN cell_id IS NOT NULL AND TRIM(cell_id) != '' THEN TRIM(cell_id) END) as distinctCellCount,
            COUNT(*) as totalRecords
     FROM network_cells
     WHERE ${baseClauses.join(' AND ')}
-    GROUP BY mcc, mnc
+    GROUP BY TRIM(mcc), TRIM(mnc)
     ORDER BY distinctCellCount DESC, totalRecords DESC, mcc ASC, mnc ASC
-  `).all(...params) as Array<{ mcc: number; mnc: number; distinctCellCount: number; totalRecords: number }>;
+  `).all(...params) as Array<{ mcc: string; mnc: string; distinctCellCount: number; totalRecords: number }>;
 
   const items = rows.map((r, idx) => {
-    const spec = MILITARY_NETWORK_MAP.find(m => m.mcc === Number(r.mcc) && m.mnc === Number(r.mnc))!;
+    const mccStr = String(r.mcc).trim();
+    const mncStr = String(r.mnc).trim();
+    const spec = MILITARY_NETWORK_MAP.find(
+      m => m.mcc === stripLeadingZeros(mccStr) && m.mnc === stripLeadingZeros(mncStr)
+    )!;
     return {
       rank: idx + 1,
-      mcc: Number(r.mcc),
-      mnc: Number(r.mnc),
-      plmn: `${r.mcc}-${r.mnc}`,
+      mcc: mccStr,
+      mnc: mncStr,
+      plmn: `${mccStr}-${mncStr}`,
       operator: spec.operator,
       country: spec.country,
-      label: `${spec.operator} (${r.mcc}/${r.mnc})`,
+      label: `${spec.operator} (${mccStr}/${mncStr})`,
       distinctCellCount: Number(r.distinctCellCount),
       totalRecords: Number(r.totalRecords),
       color: spec.color,
@@ -689,26 +716,32 @@ export function getMilitaryNetworks(filters: Partial<DashboardFilters> = {}, tar
 export function getCivilianNetworks(filters: Partial<DashboardFilters> = {}, targetDb: DatabaseSync = db) {
   const { whereSql, params } = buildNetworkCellWhere(filters, targetDb);
   const baseClauses = whereSql ? [whereSql.replace(/^WHERE\s+/i, '')] : [];
-  const validPairClauses = CIVILIAN_NETWORK_MAP.map(m => `(mcc = ${m.mcc} AND mnc = ${m.mnc})`).join(' OR ');
+  const validPairClauses = CIVILIAN_NETWORK_MAP.map(
+    m => `(LTRIM(TRIM(mcc), '0') = '${m.mcc}' AND LTRIM(TRIM(mnc), '0') = '${m.mnc}')`
+  ).join(' OR ');
   baseClauses.push(`(${validPairClauses})`);
 
   const rows = targetDb.prepare(`
-    SELECT mcc, mnc,
-           COUNT(DISTINCT CASE WHEN cell_id IS NOT NULL THEN cell_id END) as distinctCellCount,
+    SELECT TRIM(mcc) as mcc, TRIM(mnc) as mnc,
+           COUNT(DISTINCT CASE WHEN cell_id IS NOT NULL AND TRIM(cell_id) != '' THEN TRIM(cell_id) END) as distinctCellCount,
            COUNT(*) as totalRecords
     FROM network_cells
     WHERE ${baseClauses.join(' AND ')}
-    GROUP BY mcc, mnc
-  `).all(...params) as Array<{ mcc: number; mnc: number; distinctCellCount: number; totalRecords: number }>;
+    GROUP BY TRIM(mcc), TRIM(mnc)
+  `).all(...params) as Array<{ mcc: string; mnc: string; distinctCellCount: number; totalRecords: number }>;
 
   const mapped = rows
-    .filter(r => !CIVILIAN_EXCLUDED_PAIRS.has(`${r.mcc}:${r.mnc}`))
+    .filter(r => !CIVILIAN_EXCLUDED_PAIRS.has(`${stripLeadingZeros(r.mcc)}:${stripLeadingZeros(r.mnc)}`))
     .map(r => {
-      const spec = CIVILIAN_NETWORK_MAP.find(m => m.mcc === Number(r.mcc) && m.mnc === Number(r.mnc))!;
+      const mccStr = String(r.mcc).trim();
+      const mncStr = String(r.mnc).trim();
+      const spec = CIVILIAN_NETWORK_MAP.find(
+        m => m.mcc === stripLeadingZeros(mccStr) && m.mnc === stripLeadingZeros(mncStr)
+      )!;
       return {
-        mcc: Number(r.mcc),
-        mnc: Number(r.mnc),
-        plmn: `${r.mcc}/${r.mnc}`,
+        mcc: mccStr,
+        mnc: mncStr,
+        plmn: `${mccStr}/${mncStr}`,
         country: spec.country,
         operator: spec.operator,
         distinctCellCount: Number(r.distinctCellCount),
@@ -785,7 +818,7 @@ export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {
   // Core NetworkCell KPIs (strictly filtered by NetworkCell + Mission + PLMN filters)
   const totalNetworkCells = safeScalar(`SELECT COUNT(*) as val FROM network_cells ${ncWhere.whereSql}`, ncWhere.params);
   const distinctNetworkCells = safeScalar(
-    `SELECT COUNT(DISTINCT cell_id) as val FROM network_cells ${ncWhere.whereSql ? `${ncWhere.whereSql} AND` : 'WHERE'} cell_id IS NOT NULL`,
+    `SELECT COUNT(DISTINCT TRIM(cell_id)) as val FROM network_cells ${ncWhere.whereSql ? `${ncWhere.whereSql} AND` : 'WHERE'} cell_id IS NOT NULL AND TRIM(cell_id) != ''`,
     ncWhere.params
   );
   const networkCellsWithValidCoords = safeScalar(
@@ -961,8 +994,8 @@ export function getDashboardFilterOptions(targetDb: DatabaseSync = db) {
     },
     networkCells: {
       rats: distinctStrings(`SELECT DISTINCT rat as val FROM network_cells WHERE rat IS NOT NULL AND TRIM(rat) != '' ORDER BY val`),
-      mccs: distinctNums(`SELECT DISTINCT mcc as val FROM network_cells WHERE mcc IS NOT NULL ORDER BY val`),
-      mncs: distinctNums(`SELECT DISTINCT mnc as val FROM network_cells WHERE mnc IS NOT NULL ORDER BY val`),
+      mccs: distinctStrings(`SELECT DISTINCT TRIM(mcc) as val FROM network_cells WHERE mcc IS NOT NULL AND TRIM(mcc) != '' ORDER BY val`),
+      mncs: distinctStrings(`SELECT DISTINCT TRIM(mnc) as val FROM network_cells WHERE mnc IS NOT NULL AND TRIM(mnc) != '' ORDER BY val`),
     },
     plmnEntries: targetDb.prepare(`SELECT mcc, mnc, country, code, name FROM plmn_storage ORDER BY mcc, mnc`).all(),
   };

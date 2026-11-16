@@ -29,10 +29,10 @@ interface FilterOptionsResponse {
   };
   networkCells: {
     rats: string[];
-    mccs: number[];
-    mncs: number[];
+    mccs: string[];
+    mncs: string[];
   };
-  plmnEntries: Array<{ mcc: number; mnc: number; country: string; code: string; name: string }>;
+  plmnEntries: Array<{ mcc: string; mnc: string; country: string; code: string; name: string }>;
 }
 
 interface GlobalFilterPanelProps {
@@ -46,13 +46,13 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
   onChange,
   options,
 }) => {
-  const { t, apiFetch, currentUser, addNotification } = useApp();
+  const { t, apiFetch, authToken, currentUser, addNotification } = useApp();
   const [expanded, setExpanded] = useState(true);
   const [activeTab, setActiveTab] = useState<'missions' | 'registrations' | 'network_cells' | 'plmn'>('missions');
   const [missionSearch, setMissionSearch] = useState('');
 
   // PLMN Search
-  const [plmnResults, setPlmnResults] = useState<Array<{ mcc: number; mnc: number; country: string; code: string; name: string }>>([]);
+  const [plmnResults, setPlmnResults] = useState<Array<{ mcc: string; mnc: string; country: string; code: string; name: string }>>([]);
   const [plmnLoading, setPlmnLoading] = useState(false);
 
   // Saved Views
@@ -63,6 +63,7 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
   const canUseTmsiFilter = currentUser?.role === 'SUPER_ADMIN' || currentUser?.role === 'ADMIN';
 
   const loadSavedViews = () => {
+    if (!authToken) return;
     apiFetch('/api/v1/saved-views?tableName=dashboard')
       .then(r => (r.ok ? r.json() : []))
       .then(rows => setSavedViews(Array.isArray(rows) ? rows : []))
@@ -71,7 +72,7 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
 
   useEffect(() => {
     loadSavedViews();
-  }, []);
+  }, [authToken]);
 
   useEffect(() => {
     const q = filters.plmnQuery.trim();
@@ -110,15 +111,10 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
     });
   };
 
-  const toggleArrayString = (key: 'country' | 'countryCode' | 'ueModel' | 'action' | 'update' | 'rat', val: string) => {
-    const arr = filters[key];
-    onChange({
-      ...filters,
-      [key]: arr.includes(val) ? arr.filter(x => x !== val) : [...arr, val],
-    });
-  };
-
-  const toggleArrayNum = (key: 'mcc' | 'mnc', val: number) => {
+  const toggleArrayString = (
+    key: 'country' | 'countryCode' | 'ueModel' | 'action' | 'update' | 'rat' | 'mcc' | 'mnc',
+    val: string
+  ) => {
     const arr = filters[key];
     onChange({
       ...filters,
@@ -231,6 +227,7 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
       ['channel', 'Channel'],
       ['bsic', 'BSIC'],
       ['pci', 'PCI'],
+      ['psc', 'PSC'],
       ['rxLevMin', 'RxLev ≥'],
       ['rxLevMax', 'RxLev ≤'],
       ['rxLevDbmMin', 'dBm ≥'],
@@ -265,14 +262,14 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
       chips.push({
         id: `mcc_${m}`,
         label: `MCC: ${m}`,
-        remove: () => toggleArrayNum('mcc', m),
+        remove: () => toggleArrayString('mcc', String(m)),
       })
     );
     filters.mnc.forEach(m =>
       chips.push({
         id: `mnc_${m}`,
         label: `MNC: ${m}`,
-        remove: () => toggleArrayNum('mnc', m),
+        remove: () => toggleArrayString('mnc', String(m)),
       })
     );
 
@@ -826,21 +823,21 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
                 <div>
                   <label className="text-[10px] font-semibold text-slate-400 uppercase block mb-1">LAC</label>
                   <input
-                    type="number"
+                    type="text"
                     value={filters.lac}
                     onChange={e => onChange({ ...filters, lac: e.target.value })}
                     placeholder="Exact LAC..."
-                    className="w-full h-8 px-2.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200"
+                    className="w-full h-8 px-2.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 font-mono"
                   />
                 </div>
                 <div>
                   <label className="text-[10px] font-semibold text-slate-400 uppercase block mb-1">Cell ID</label>
                   <input
-                    type="number"
+                    type="text"
                     value={filters.cellId}
                     onChange={e => onChange({ ...filters, cellId: e.target.value })}
                     placeholder="Exact Cell ID..."
-                    className="w-full h-8 px-2.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200"
+                    className="w-full h-8 px-2.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 font-mono"
                   />
                 </div>
                 <div>
@@ -854,21 +851,28 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
                   />
                 </div>
                 <div>
-                  <label className="text-[10px] font-semibold text-slate-400 uppercase block mb-1">BSIC / PCI</label>
+                  <label className="text-[10px] font-semibold text-slate-400 uppercase block mb-1">BSIC / PCI / PSC</label>
                   <div className="flex gap-1.5">
                     <input
-                      type="number"
+                      type="text"
                       placeholder="BSIC"
                       value={filters.bsic}
                       onChange={e => onChange({ ...filters, bsic: e.target.value })}
-                      className="w-1/2 h-8 px-2 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200"
+                      className="w-1/3 h-8 px-2 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 font-mono"
                     />
                     <input
-                      type="number"
+                      type="text"
                       placeholder="PCI"
                       value={filters.pci}
                       onChange={e => onChange({ ...filters, pci: e.target.value })}
-                      className="w-1/2 h-8 px-2 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200"
+                      className="w-1/3 h-8 px-2 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 font-mono"
+                    />
+                    <input
+                      type="text"
+                      placeholder="PSC"
+                      value={filters.psc || ''}
+                      onChange={e => onChange({ ...filters, psc: e.target.value })}
+                      className="w-1/3 h-8 px-2 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 font-mono"
                     />
                   </div>
                 </div>
@@ -1017,40 +1021,46 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
                 <div>
                   <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">MCC</div>
                   <div className="flex flex-wrap gap-1.5">
-                    {(options?.networkCells.mccs || []).map(m => (
-                      <button
-                        key={m}
-                        type="button"
-                        onClick={() => toggleArrayNum('mcc', m)}
-                        className={`px-2 py-1 rounded-md text-[11px] font-mono border ${
-                          filters.mcc.includes(m)
-                            ? 'bg-blue-600 border-blue-500 text-white'
-                            : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
-                        }`}
-                      >
-                        {m}
-                      </button>
-                    ))}
+                    {(options?.networkCells.mccs || []).map(m => {
+                      const val = String(m);
+                      return (
+                        <button
+                          key={val}
+                          type="button"
+                          onClick={() => toggleArrayString('mcc', val)}
+                          className={`px-2 py-1 rounded-md text-[11px] font-mono border ${
+                            filters.mcc.includes(val)
+                              ? 'bg-blue-600 border-blue-500 text-white'
+                              : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
+                          }`}
+                        >
+                          {val}
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
 
                 <div>
                   <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">MNC</div>
                   <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-                    {(options?.networkCells.mncs || []).map(m => (
-                      <button
-                        key={m}
-                        type="button"
-                        onClick={() => toggleArrayNum('mnc', m)}
-                        className={`px-2 py-1 rounded-md text-[11px] font-mono border ${
-                          filters.mnc.includes(m)
-                            ? 'bg-blue-600 border-blue-500 text-white'
-                            : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
-                        }`}
-                      >
-                        {m}
-                      </button>
-                    ))}
+                    {(options?.networkCells.mncs || []).map(m => {
+                      const val = String(m);
+                      return (
+                        <button
+                          key={val}
+                          type="button"
+                          onClick={() => toggleArrayString('mnc', val)}
+                          className={`px-2 py-1 rounded-md text-[11px] font-mono border ${
+                            filters.mnc.includes(val)
+                              ? 'bg-blue-600 border-blue-500 text-white'
+                              : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
+                          }`}
+                        >
+                          {val}
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
               </div>
@@ -1090,13 +1100,15 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
                     <button
                       key={`${p.mcc}-${p.mnc}-${idx}`}
                       type="button"
-                      onClick={() =>
+                      onClick={() => {
+                        const sMcc = String(p.mcc);
+                        const sMnc = String(p.mnc);
                         onChange({
                           ...filters,
-                          mcc: filters.mcc.includes(p.mcc) ? filters.mcc : [...filters.mcc, p.mcc],
-                          mnc: filters.mnc.includes(p.mnc) ? filters.mnc : [...filters.mnc, p.mnc],
-                        })
-                      }
+                          mcc: filters.mcc.includes(sMcc) ? filters.mcc : [...filters.mcc, sMcc],
+                          mnc: filters.mnc.includes(sMnc) ? filters.mnc : [...filters.mnc, sMnc],
+                        });
+                      }}
                       className="flex items-center justify-between p-2.5 rounded-lg bg-slate-950/70 border border-slate-800 hover:border-amber-500/60 text-start transition-colors"
                     >
                       <div className="min-w-0">

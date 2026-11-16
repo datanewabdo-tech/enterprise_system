@@ -28,11 +28,11 @@ import {
 } from 'lucide-react';
 
 export const Analytics: React.FC = () => {
-  const { t, activeMission, missionsList } = useApp();
+  const { activeMission, apiFetch, authToken } = useApp();
 
   const [table, setTable] = useState('registrations');
   const [dimensionCol, setDimensionCol] = useState('country');
-  const [metricCol, setMetricCol] = useState('');
+  const [metricCol] = useState('');
   const [aggregation, setAggregation] = useState<'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX'>('COUNT');
   const [chartType, setChartType] = useState<'bar' | 'line' | 'pie' | 'area'>('bar');
   const [limit, setLimit] = useState(15);
@@ -44,10 +44,11 @@ export const Analytics: React.FC = () => {
 
   // Fetch columns for selected table
   useEffect(() => {
-    fetch(`/api/v1/tables/${table}?pageSize=1`)
-      .then(r => r.json())
+    if (!authToken) return;
+    apiFetch(`/api/v1/tables/${table}?pageSize=1`)
+      .then(r => (r.ok ? r.json() : null))
       .then(res => {
-        if (res.columns && Array.isArray(res.columns)) {
+        if (res?.columns && Array.isArray(res.columns)) {
           const names = res.columns.map((c: any) => c.name);
           setAvailableColumns(names);
           if (!names.includes(dimensionCol)) {
@@ -56,14 +57,15 @@ export const Analytics: React.FC = () => {
         }
       })
       .catch(() => {});
-  }, [table]);
+  }, [table, authToken]);
 
   // Execute Dynamic Analytics Query
   const executeQuery = () => {
+    if (!authToken) return;
     setLoading(true);
     setError(null);
 
-    fetch('/api/v1/analytics/query', {
+    apiFetch('/api/v1/analytics/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -93,8 +95,9 @@ export const Analytics: React.FC = () => {
   };
 
   useEffect(() => {
+    if (!authToken) return;
     executeQuery();
-  }, [table, dimensionCol, aggregation, activeMission]);
+  }, [table, dimensionCol, aggregation, activeMission, limit, authToken]);
 
   const COLORS = ['#6366f1', '#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#06b6d4', '#14b8a6', '#f43f5e'];
 
