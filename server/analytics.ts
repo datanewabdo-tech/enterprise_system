@@ -780,16 +780,13 @@ export function getCivilianNetworks(filters: Partial<DashboardFilters> = {}, tar
   };
 }
 
-/**
- * Computes all 11 enhanced Phase 2 KPIs + legacy compatibility KPIs + 5 analytics sections + BTS map summary.
- */
-export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {}, targetDb: DatabaseSync = db) {
-  const normalizedFilters: Partial<DashboardFilters> =
-    typeof filters === 'string' ? { mission: filters } : (filters || {});
-
-  const regWhere = buildRegistrationWhere(normalizedFilters, targetDb);
-  const ncWhere = buildNetworkCellWhere(normalizedFilters, targetDb);
-  const missionWhere = resolveMissionWhere(normalizedFilters, targetDb);
+export function getDashboardQualityStats(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: DatabaseSync = db
+) {
+  const regWhere = buildRegistrationWhere(filters, targetDb);
+  const missionWhere = resolveMissionWhere(filters, targetDb);
+  const mFilterSql = missionWhere.clause ? `WHERE ${missionWhere.clause}` : '';
 
   const safeScalar = (sql: string, params: any[] = []): number => {
     try {
@@ -800,7 +797,60 @@ export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {
     }
   };
 
-  // Core Registration KPIs (strictly filtered by Registration + Mission filters)
+  const totalRegistrations = safeScalar(
+    `SELECT COUNT(*) as val FROM registrations ${regWhere.whereSql}`,
+    regWhere.params
+  );
+  const totalGpsHistory = safeScalar(
+    `SELECT COUNT(*) as val FROM gps_history ${mFilterSql}`,
+    missionWhere.params
+  );
+  const missingRegIds = safeScalar(
+    `SELECT COUNT(*) as val FROM registrations ${regWhere.whereSql ? `${regWhere.whereSql} AND` : 'WHERE'} (reg_id IS NULL OR reg_id = '')`,
+    regWhere.params
+  );
+  const missingImsi = safeScalar(
+    `SELECT COUNT(*) as val FROM registrations ${regWhere.whereSql ? `${regWhere.whereSql} AND` : 'WHERE'} (imsi IS NULL OR imsi = '')`,
+    regWhere.params
+  );
+  const invalidGps = safeScalar(
+    `SELECT COUNT(*) as val FROM gps_history ${mFilterSql ? `${mFilterSql} AND` : 'WHERE'} (latitude < -90 OR latitude > 90 OR longitude < -180 OR longitude > 180)`,
+    missionWhere.params
+  );
+  const pendingAmbiguities = safeScalar(
+    `SELECT COUNT(*) as val FROM migration_ambiguities WHERE status = 'PENDING'`
+  );
+
+  return {
+    totalChecked: totalRegistrations + totalGpsHistory,
+    validRecords: Math.max(0, (totalRegistrations + totalGpsHistory) - (missingRegIds + missingImsi + invalidGps)),
+    issuesFound: missingRegIds + missingImsi + invalidGps + pendingAmbiguities,
+    pendingAmbiguities,
+    breakdown: [
+      { issue: 'Missing Device Identifier (IMSI/RegID)', count: missingRegIds + missingImsi },
+      { issue: 'Out-of-bound GPS Coordinates', count: invalidGps },
+      { issue: 'Ambiguous Mission Links Pending Review', count: pendingAmbiguities },
+    ],
+  };
+}
+
+export function getDashboardKpiSummary(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: DatabaseSync = db
+) {
+  const regWhere = buildRegistrationWhere(filters, targetDb);
+  const ncWhere = buildNetworkCellWhere(filters, targetDb);
+  const missionWhere = resolveMissionWhere(filters, targetDb);
+
+  const safeScalar = (sql: string, params: any[] = []): number => {
+    try {
+      const row = targetDb.prepare(sql).get(...params) as { val?: number } | undefined;
+      return row && row.val !== undefined && row.val !== null ? Number(row.val) : 0;
+    } catch {
+      return 0;
+    }
+  };
+
   const totalRegistrations = safeScalar(`SELECT COUNT(*) as val FROM registrations ${regWhere.whereSql}`, regWhere.params);
   const distinctImsis = safeScalar(
     `SELECT COUNT(DISTINCT imsi) as val FROM registrations ${regWhere.whereSql ? `${regWhere.whereSql} AND` : 'WHERE'} imsi IS NOT NULL AND TRIM(imsi) != '' AND TRIM(imsi) != '0'`,
@@ -815,7 +865,6 @@ export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {
     regWhere.params
   );
 
-  // Core NetworkCell KPIs (strictly filtered by NetworkCell + Mission + PLMN filters)
   const totalNetworkCells = safeScalar(`SELECT COUNT(*) as val FROM network_cells ${ncWhere.whereSql}`, ncWhere.params);
   const distinctNetworkCells = safeScalar(
     `SELECT COUNT(DISTINCT TRIM(cell_id)) as val FROM network_cells ${ncWhere.whereSql ? `${ncWhere.whereSql} AND` : 'WHERE'} cell_id IS NOT NULL AND TRIM(cell_id) != ''`,
@@ -826,26 +875,17 @@ export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {
     ncWhere.params
   );
 
-  // Mission count (respects selected missionIds if provided)
-  const totalMissions = normalizedFilters.missionIds && normalizedFilters.missionIds.length > 0
+  const totalMissions = filters.missionIds && filters.missionIds.length > 0
     ? safeScalar(
-        `SELECT COUNT(*) as val FROM missions WHERE id IN (${normalizedFilters.missionIds.map(() => '?').join(', ')})`,
-        normalizedFilters.missionIds
+        `SELECT COUNT(*) as val FROM missions WHERE id IN (${filters.missionIds.map(() => '?').join(', ')})`,
+        filters.missionIds
       )
     : safeScalar(`SELECT COUNT(*) as val FROM missions`);
 
-  // Phase 2 Analytics Sections
-  const registrationsByCountry = getRegistrationsByCountry(normalizedFilters, targetDb);
-  const btsMap = getBtsMapData(normalizedFilters, targetDb);
-  const networkCellsByMcc = getNetworkCellsByMcc(normalizedFilters, targetDb);
-  const militaryNetworks = getMilitaryNetworks(normalizedFilters, targetDb);
-  const civilianNetworks = getCivilianNetworks(normalizedFilters, targetDb);
+  const btsMap = getBtsMapData(filters, targetDb);
+  const militaryNetworks = getMilitaryNetworks(filters, targetDb);
+  const civilianNetworks = getCivilianNetworks(filters, targetDb);
 
-  const totalBtsLocations = btsMap.stats.registrationLocationsCount;
-  const militaryNetworkCells = militaryNetworks.totalDistinctCells;
-  const civilianNetworkCells = civilianNetworks.totalDistinctCells;
-
-  // Legacy / auxiliary KPIs
   const mFilterSql = missionWhere.clause ? `WHERE ${missionWhere.clause}` : '';
   const totalTargets = safeScalar(`SELECT COUNT(*) as val FROM targets ${mFilterSql}`, missionWhere.params);
   const totalGpsHistory = safeScalar(`SELECT COUNT(*) as val FROM gps_history ${mFilterSql}`, missionWhere.params);
@@ -855,13 +895,41 @@ export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {
   const totalImports = safeScalar(`SELECT COUNT(*) as val FROM import_history`);
   const totalOperationalRecords = totalRegistrations + totalTargets + totalNetworkCells + totalGpsHistory + totalWifiPoints + totalMapCells;
 
-  // Records by Mission (using mission_id join)
+  return {
+    totalRegistrations,
+    distinctImsis,
+    distinctImeis,
+    totalNetworkCells,
+    distinctNetworkCells,
+    totalMissions,
+    countriesRepresented,
+    totalBtsLocations: btsMap.stats.registrationLocationsCount,
+    networkCellsWithValidCoords,
+    militaryNetworkCells: militaryNetworks.totalDistinctCells,
+    civilianNetworkCells: civilianNetworks.totalDistinctCells,
+    totalTargets,
+    totalGpsHistory,
+    totalWifiPoints,
+    totalMapCells,
+    totalFiles,
+    totalImports,
+    totalOperationalRecords,
+  };
+}
+
+export function getDashboardOperationalPanels(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: DatabaseSync = db
+) {
+  const regWhere = buildRegistrationWhere(filters, targetDb);
+  const ncWhere = buildNetworkCellWhere(filters, targetDb);
+
   let recordsByMission: any[] = [];
   try {
-    const mClause = normalizedFilters.missionIds && normalizedFilters.missionIds.length > 0
-      ? `WHERE m.id IN (${normalizedFilters.missionIds.map(() => '?').join(', ')})`
+    const mClause = filters.missionIds && filters.missionIds.length > 0
+      ? `WHERE m.id IN (${filters.missionIds.map(() => '?').join(', ')})`
       : '';
-    const mParams = normalizedFilters.missionIds && normalizedFilters.missionIds.length > 0 ? normalizedFilters.missionIds : [];
+    const mParams = filters.missionIds && filters.missionIds.length > 0 ? filters.missionIds : [];
     recordsByMission = targetDb.prepare(`
       SELECT m.id as missionId,
              m.mission,
@@ -878,7 +946,6 @@ export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {
     recordsByMission = [];
   }
 
-  // Network Cells by RAT (filtered)
   let cellsByRat: any[] = [];
   try {
     cellsByRat = targetDb.prepare(`
@@ -892,7 +959,6 @@ export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {
     cellsByRat = [];
   }
 
-  // Activity Timeline (filtered by Registration filters)
   let activityTimeline: any[] = [];
   try {
     activityTimeline = targetDb.prepare(`
@@ -907,55 +973,80 @@ export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {
     activityTimeline = [];
   }
 
-  // Quality stats
-  const missingRegIds = safeScalar(`SELECT COUNT(*) as val FROM registrations WHERE reg_id IS NULL OR reg_id = ''`);
-  const missingImsi = safeScalar(`SELECT COUNT(*) as val FROM registrations WHERE imsi IS NULL OR imsi = ''`);
-  const invalidGps = safeScalar(`SELECT COUNT(*) as val FROM gps_history WHERE latitude < -90 OR latitude > 90 OR longitude < -180 OR longitude > 180`);
-  const pendingAmbiguities = safeScalar(`SELECT COUNT(*) as val FROM migration_ambiguities WHERE status = 'PENDING'`);
-  const qualityStats = {
-    totalChecked: totalRegistrations + totalGpsHistory,
-    validRecords: Math.max(0, (totalRegistrations + totalGpsHistory) - (missingRegIds + missingImsi + invalidGps)),
-    issuesFound: missingRegIds + missingImsi + invalidGps + pendingAmbiguities,
-    pendingAmbiguities,
-    breakdown: [
-      { issue: 'Missing Device Identifier (IMSI/RegID)', count: missingRegIds + missingImsi },
-      { issue: 'Out-of-bound GPS Coordinates', count: invalidGps },
-      { issue: 'Ambiguous Mission Links Pending Review', count: pendingAmbiguities },
-    ],
-  };
+  const qualityStats = getDashboardQualityStats(filters, targetDb);
 
   return {
-    kpis: {
-      totalRegistrations,
-      distinctImsis,
-      distinctImeis,
-      totalNetworkCells,
-      distinctNetworkCells,
-      totalMissions,
-      countriesRepresented,
-      totalBtsLocations,
-      networkCellsWithValidCoords,
-      militaryNetworkCells,
-      civilianNetworkCells,
-      // Legacy compatibility keys
-      totalTargets,
-      totalGpsHistory,
-      totalWifiPoints,
-      totalMapCells,
-      totalFiles,
-      totalImports,
-      totalOperationalRecords,
-    },
+    recordsByMission,
+    cellsByRat,
+    activityTimeline,
+    qualityStats,
+  };
+}
+
+export type DashboardWidgetId =
+  | 'kpis'
+  | 'registrationsByCountry'
+  | 'btsMap'
+  | 'networkCellsByMcc'
+  | 'militaryNetworks'
+  | 'civilianNetworks'
+  | 'operationalSummary'
+  | 'qualityStats';
+
+export function getDashboardWidget(
+  widgetId: DashboardWidgetId,
+  filters: Partial<DashboardFilters> = {},
+  targetDb: DatabaseSync = db
+) {
+  switch (widgetId) {
+    case 'kpis':
+      return getDashboardKpiSummary(filters, targetDb);
+    case 'registrationsByCountry':
+      return getRegistrationsByCountry(filters, targetDb);
+    case 'btsMap':
+      return getBtsMapData(filters, targetDb);
+    case 'networkCellsByMcc':
+      return getNetworkCellsByMcc(filters, targetDb);
+    case 'militaryNetworks':
+      return getMilitaryNetworks(filters, targetDb);
+    case 'civilianNetworks':
+      return getCivilianNetworks(filters, targetDb);
+    case 'operationalSummary':
+      return getDashboardOperationalPanels(filters, targetDb);
+    case 'qualityStats':
+      return getDashboardQualityStats(filters, targetDb);
+    default:
+      throw new Error(`Unknown dashboard widget: ${widgetId}`);
+  }
+}
+
+/**
+ * Computes all 11 enhanced Phase 2 KPIs + legacy compatibility KPIs + 5 analytics sections + BTS map summary.
+ */
+export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {}, targetDb: DatabaseSync = db) {
+  const normalizedFilters: Partial<DashboardFilters> =
+    typeof filters === 'string' ? { mission: filters } : (filters || {});
+
+  const kpis = getDashboardKpiSummary(normalizedFilters, targetDb);
+  const registrationsByCountry = getRegistrationsByCountry(normalizedFilters, targetDb);
+  const btsMap = getBtsMapData(normalizedFilters, targetDb);
+  const networkCellsByMcc = getNetworkCellsByMcc(normalizedFilters, targetDb);
+  const militaryNetworks = getMilitaryNetworks(normalizedFilters, targetDb);
+  const civilianNetworks = getCivilianNetworks(normalizedFilters, targetDb);
+  const operational = getDashboardOperationalPanels(normalizedFilters, targetDb);
+
+  return {
+    kpis,
     registrationsByCountry,
     btsMap,
     networkCellsByMcc,
     militaryNetworks,
     civilianNetworks,
-    recordsByMission,
+    recordsByMission: operational.recordsByMission,
     recordsByCountry: registrationsByCountry.items.map(i => ({ country: i.country, count: i.distinctImsiCount })),
-    cellsByRat,
-    activityTimeline,
-    qualityStats,
+    cellsByRat: operational.cellsByRat,
+    activityTimeline: operational.activityTimeline,
+    qualityStats: operational.qualityStats,
   };
 }
 

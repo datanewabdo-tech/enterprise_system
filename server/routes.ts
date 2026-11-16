@@ -24,6 +24,8 @@ import {
 } from './auth.js';
 import {
   getDashboardKPIs,
+  getDashboardWidget,
+  DashboardWidgetId,
   executeDynamicAnalytics,
   getDashboardFilterOptions,
   getBtsMapData,
@@ -984,6 +986,34 @@ apiRouter.get('/analytics/bts-map', (req: Request, res: Response) => {
   return res.json(getBtsMapData(parsed.data));
 });
 
+const ALLOWED_WIDGET_IDS = new Set<DashboardWidgetId>([
+  'kpis',
+  'registrationsByCountry',
+  'btsMap',
+  'networkCellsByMcc',
+  'militaryNetworks',
+  'civilianNetworks',
+  'operationalSummary',
+  'qualityStats',
+]);
+
+apiRouter.post('/analytics/widget/:widgetId', (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  const widgetId = req.params.widgetId as DashboardWidgetId;
+  if (!ALLOWED_WIDGET_IDS.has(widgetId)) {
+    return res.status(404).json({ error: `Unknown dashboard widget: ${widgetId}` });
+  }
+  const parsed = DashboardFilterSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid filter payload', details: parsed.error.flatten() });
+  }
+  if (parsed.data.tmsi && !auth.perms.canViewUnmaskedData) {
+    return res.status(403).json({ error: 'Insufficient permissions to filter by TMSI' });
+  }
+  return res.json(getDashboardWidget(widgetId, parsed.data));
+});
+
 apiRouter.get('/plmn/search', (req: Request, res: Response) => {
   const auth = requireAuth(req, res);
   if (!auth) return;
@@ -1183,6 +1213,32 @@ apiRouter.get('/system/data-dictionary', (req: Request, res: Response) => {
     };
   });
   return res.json(dict);
+});
+
+apiRouter.get('/system/backups', (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  try {
+    const entries = fs.existsSync(BACKUPS_DIR) ? fs.readdirSync(BACKUPS_DIR) : [];
+    const files = entries
+      .filter(name => /\.(sqlite|db|sql)$/i.test(name))
+      .map(name => {
+        const fullPath = path.join(BACKUPS_DIR, name);
+        const stat = fs.statSync(fullPath);
+        return {
+          name,
+          created: stat.mtime.toISOString(),
+          sizeBytes: stat.size,
+          type: name.endsWith('.sql') ? 'PG_DUMP' : 'FULL_SNAPSHOT',
+          status: 'VERIFIED',
+        };
+      })
+      .sort((a, b) => new Date(b.created).getTime() - new Date(a.created).getTime());
+
+    return res.json(files);
+  } catch (e: any) {
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 apiRouter.post('/system/backups/create', (req: Request, res: Response) => {

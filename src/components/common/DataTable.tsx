@@ -1,6 +1,14 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../../context/AppContext.js';
 import { TableResponse, ColumnMeta, FilterCondition, FilterOperator } from '../../types/index.js';
+import { useAsyncResource } from '../../hooks/useAsyncResource.js';
+import {
+  TopProgressBar,
+  RefreshingBadge,
+  TableSkeletonRows,
+  EmptyStateCard,
+  ErrorRetryCard,
+} from './LoadingStates.js';
 import {
   Search,
   Filter,
@@ -47,14 +55,10 @@ export const DataTable: React.FC<DataTableProps> = ({
 }) => {
   const { t, activeMission, globalSearch, apiFetch, authToken } = useApp();
 
-  const [loading, setLoading] = useState(true);
-  const [data, setData] = useState<any[]>([]);
   const [columns, setColumns] = useState<ColumnMeta[]>([]);
   const [visibleColumns, setVisibleColumns] = useState<string[]>([]);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
-  const [totalPages, setTotalPages] = useState(1);
-  const [totalRecords, setTotalRecords] = useState(0);
 
   const [search, setSearch] = useState('');
   const [sortBy, setSortBy] = useState<string>('id');
@@ -64,18 +68,38 @@ export const DataTable: React.FC<DataTableProps> = ({
   // Filter Builder State
   const [filterBuilderOpen, setFilterBuilderOpen] = useState(false);
   const [filters, setFilters] = useState<FilterCondition[]>([]);
+  const [appliedFilters, setAppliedFilters] = useState<FilterCondition[]>([]);
   const [columnMenuOpen, setColumnMenuOpen] = useState(false);
+
+  // Export state
+  const [exportingFormat, setExportingFormat] = useState<'xlsx' | 'csv' | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   // Sync with globalSearch if set
   useEffect(() => {
     if (globalSearch) {
       setSearch(globalSearch);
+      setPage(1);
     }
   }, [globalSearch]);
 
-  const fetchData = useCallback(async () => {
-    setLoading(true);
-    try {
+  // Reset pagination/schema when switching tables
+  useEffect(() => {
+    setColumns([]);
+    setVisibleColumns([]);
+    setPage(1);
+    setFilters([]);
+    setAppliedFilters([]);
+    setExportError(null);
+  }, [tableName]);
+
+  const filtersJson = useMemo(
+    () => (appliedFilters.length > 0 ? JSON.stringify(appliedFilters) : ''),
+    [appliedFilters]
+  );
+
+  const tableRes = useAsyncResource<TableResponse>(
+    async signal => {
       const params = new URLSearchParams({
         page: String(page),
         pageSize: String(pageSize),
@@ -87,39 +111,44 @@ export const DataTable: React.FC<DataTableProps> = ({
       if (activeMission && activeMission !== 'ALL') {
         params.append('mission', activeMission);
       }
-
       if (search.trim()) {
         params.append('search', search.trim());
       }
-
-      if (filters.length > 0) {
-        params.append('filters', JSON.stringify(filters));
+      if (filtersJson) {
+        params.append('filters', filtersJson);
       }
 
-      const res = await apiFetch(`/api/v1/tables/${tableName}?${params.toString()}`);
-      if (!res.ok) throw new Error('Failed to fetch data');
-      const json: TableResponse = await res.json();
-
-      setData(json.data || []);
-      setTotalPages(json.pagination?.totalPages || 1);
-      setTotalRecords(json.pagination?.total || 0);
-
-      if (columns.length === 0 && json.columns) {
-        setColumns(json.columns);
-        // Default visible columns: first 8 columns
-        setVisibleColumns(json.columns.slice(0, 8).map(c => c.name));
+      const res = await apiFetch(`/api/v1/tables/${tableName}?${params.toString()}`, { signal });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(json?.error || `Failed to fetch ${tableName} data`);
       }
-    } catch (err) {
-      console.error(err);
-      setData([]);
-    } finally {
-      setLoading(false);
+      return json as TableResponse;
+    },
+    [tableName, page, pageSize, sortBy, sortOrder, search, activeMission, filtersJson, unmask, refreshTrigger, authToken],
+    {
+      enabled: Boolean(authToken),
+      keepPreviousData: true,
+      isEmpty: json => !json.data || json.data.length === 0,
     }
-  }, [tableName, page, pageSize, sortBy, sortOrder, search, activeMission, filters, unmask, columns.length]);
+  );
 
   useEffect(() => {
-    fetchData();
-  }, [fetchData, refreshTrigger]);
+    const cols = tableRes.data?.columns;
+    if (cols && cols.length > 0 && columns.length === 0) {
+      setColumns(cols);
+      setVisibleColumns(cols.slice(0, 8).map(c => c.name));
+    }
+  }, [tableRes.data?.columns, columns.length]);
+
+  const data = tableRes.data?.data || [];
+  const totalPages = tableRes.data?.pagination?.totalPages || 1;
+  const totalRecords = tableRes.data?.pagination?.total;
+  const hasLoadedOnce = tableRes.data !== null;
+  const isInitialLoading = tableRes.isLoading && !hasLoadedOnce;
+  const isUpdating = tableRes.isRefreshing || (tableRes.isLoading && hasLoadedOnce);
+  const showActionsCol = Boolean(onEditRecord || onDeleteRecord || onRowClick);
+  const skeletonColumnCount = visibleColumns.length > 0 ? visibleColumns.length + (showActionsCol ? 1 : 0) : 6;
 
   const handleSort = (colName: string) => {
     if (sortBy === colName) {
@@ -128,6 +157,7 @@ export const DataTable: React.FC<DataTableProps> = ({
       setSortBy(colName);
       setSortOrder('ASC');
     }
+    setPage(1);
   };
 
   const toggleColumnVisibility = (colName: string) => {
@@ -149,25 +179,44 @@ export const DataTable: React.FC<DataTableProps> = ({
   };
 
   const removeFilter = (index: number) => {
-    setFilters(prev => prev.filter((_, i) => i !== index));
+    const next = filters.filter((_, i) => i !== index);
+    setFilters(next);
+    setAppliedFilters(next);
+    setPage(1);
   };
 
-  const handleExport = (format: 'xlsx' | 'csv') => {
-    const params = new URLSearchParams({
-      table: tableName,
-      format,
-    });
-    if (activeMission && activeMission !== 'ALL') params.append('mission', activeMission);
-    if (search.trim()) params.append('search', search.trim());
-    if (filters.length > 0) params.append('filters', JSON.stringify(filters));
-    if (authToken) params.append('token', authToken);
+  const handleExport = async (format: 'xlsx' | 'csv') => {
+    setExportingFormat(format);
+    setExportError(null);
+    try {
+      const params = new URLSearchParams({
+        table: tableName,
+        format,
+      });
+      if (activeMission && activeMission !== 'ALL') params.append('mission', activeMission);
+      if (search.trim()) params.append('search', search.trim());
+      if (appliedFilters.length > 0) params.append('filters', JSON.stringify(appliedFilters));
 
-    const a = document.createElement('a');
-    a.href = `/api/v1/exports/download?${params.toString()}`;
-    a.download = `${tableName}.${format}`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+      const res = await apiFetch(`/api/v1/exports/download?${params.toString()}`);
+      if (!res.ok) {
+        const json = await res.json().catch(() => null);
+        throw new Error(json?.error || `Export failed (${res.status})`);
+      }
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${tableName}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      setExportError(err?.message || 'Export failed');
+    } finally {
+      setExportingFormat(null);
+    }
   };
 
   return (
@@ -175,11 +224,16 @@ export const DataTable: React.FC<DataTableProps> = ({
       {/* Header bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+          <h1 className="text-xl font-bold text-slate-100 flex items-center gap-2 flex-wrap">
             <span>{title}</span>
-            <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-indigo-400 font-medium">
-              {totalRecords.toLocaleString()} {t('recordsCount')}
-            </span>
+            {hasLoadedOnce && totalRecords !== undefined ? (
+              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-indigo-400 font-medium tabular-nums">
+                {totalRecords.toLocaleString()} {t('recordsCount')}
+              </span>
+            ) : isInitialLoading ? (
+              <span className="inline-block h-5 w-24 rounded-full bg-slate-800 animate-pulse motion-reduce:animate-none" />
+            ) : null}
+            {isUpdating && <RefreshingBadge label={t('updatingTable')} />}
           </h1>
           {description && (
             <p className="text-xs text-slate-400 mt-0.5">{description}</p>
@@ -190,6 +244,7 @@ export const DataTable: React.FC<DataTableProps> = ({
         <div className="flex items-center gap-2 flex-wrap">
           {/* Privacy masking toggle */}
           <button
+            type="button"
             onClick={() => setUnmask(!unmask)}
             className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
               unmask
@@ -205,19 +260,31 @@ export const DataTable: React.FC<DataTableProps> = ({
           {/* Export dropdown */}
           <div className="relative inline-flex rounded-lg border border-slate-700 bg-slate-800/80 p-0.5">
             <button
+              type="button"
+              disabled={exportingFormat !== null}
               onClick={() => handleExport('xlsx')}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs text-slate-300 hover:text-white hover:bg-slate-700 rounded-md transition-colors"
+              className="flex items-center gap-1 px-2.5 py-1 text-xs text-slate-300 hover:text-white hover:bg-slate-700 rounded-md transition-colors disabled:opacity-50"
               title={t('exportExcel')}
             >
-              <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+              {exportingFormat === 'xlsx' ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+              ) : (
+                <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+              )}
               <span>Excel</span>
             </button>
             <button
+              type="button"
+              disabled={exportingFormat !== null}
               onClick={() => handleExport('csv')}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs text-slate-300 hover:text-white hover:bg-slate-700 rounded-md transition-colors"
+              className="flex items-center gap-1 px-2.5 py-1 text-xs text-slate-300 hover:text-white hover:bg-slate-700 rounded-md transition-colors disabled:opacity-50"
               title={t('exportCsv')}
             >
-              <Download className="w-3.5 h-3.5 text-sky-400" />
+              {exportingFormat === 'csv' ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />
+              ) : (
+                <Download className="w-3.5 h-3.5 text-sky-400" />
+              )}
               <span>CSV</span>
             </button>
           </div>
@@ -225,6 +292,7 @@ export const DataTable: React.FC<DataTableProps> = ({
           {/* Create record button if handler provided */}
           {onCreateRecord && (
             <button
+              type="button"
               onClick={onCreateRecord}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white shadow-sm shadow-indigo-600/30 transition-colors"
             >
@@ -235,11 +303,13 @@ export const DataTable: React.FC<DataTableProps> = ({
 
           {/* Refresh button */}
           <button
-            onClick={() => fetchData()}
-            className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors border border-slate-700/60"
+            type="button"
+            onClick={() => tableRes.reload({ force: true })}
+            disabled={isInitialLoading || isUpdating}
+            className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors border border-slate-700/60 disabled:opacity-60"
             title={t('refresh')}
           >
-            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin text-indigo-400' : ''}`} />
+            <RefreshCw className={`w-4 h-4 ${isInitialLoading || isUpdating ? 'animate-spin motion-reduce:animate-none text-indigo-400' : ''}`} />
           </button>
         </div>
       </div>
@@ -250,6 +320,10 @@ export const DataTable: React.FC<DataTableProps> = ({
           <AlertCircle className="w-3.5 h-3.5 shrink-0 text-indigo-400" />
           <span>{t('maskedNotice')}</span>
         </div>
+      )}
+
+      {exportError && (
+        <ErrorRetryCard compact message={exportError} onRetry={() => setExportError(null)} />
       )}
 
       {/* Search, Filter Builder Toggle, Columns Toggle bar */}
@@ -265,10 +339,11 @@ export const DataTable: React.FC<DataTableProps> = ({
               setPage(1);
             }}
             placeholder={`${t('search')} ${title}...`}
-            className="w-full h-9 pl-9 pr-3 rtl:pr-9 rtl:pl-3 text-xs bg-slate-950/70 border border-slate-800 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+            className="w-full h-9 pl-9 pr-8 rtl:pr-9 rtl:pl-8 text-xs bg-slate-950/70 border border-slate-800 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
           />
           {search && (
             <button
+              type="button"
               onClick={() => {
                 setSearch('');
                 setPage(1);
@@ -284,18 +359,19 @@ export const DataTable: React.FC<DataTableProps> = ({
         <div className="flex items-center gap-2">
           {/* Filter button */}
           <button
+            type="button"
             onClick={() => setFilterBuilderOpen(!filterBuilderOpen)}
             className={`flex items-center gap-1.5 h-9 px-3 text-xs font-medium rounded-lg border transition-colors ${
-              filters.length > 0 || filterBuilderOpen
+              appliedFilters.length > 0 || filterBuilderOpen
                 ? 'bg-indigo-600/20 border-indigo-500 text-indigo-300'
                 : 'bg-slate-950/70 border-slate-800 text-slate-300 hover:bg-slate-800'
             }`}
           >
             <Filter className="w-3.5 h-3.5" />
             <span>{t('filter')}</span>
-            {filters.length > 0 && (
+            {appliedFilters.length > 0 && (
               <span className="w-4 h-4 rounded-full bg-indigo-600 text-white text-[10px] flex items-center justify-center">
-                {filters.length}
+                {appliedFilters.length}
               </span>
             )}
           </button>
@@ -303,8 +379,10 @@ export const DataTable: React.FC<DataTableProps> = ({
           {/* Columns menu button */}
           <div className="relative">
             <button
+              type="button"
+              disabled={columns.length === 0}
               onClick={() => setColumnMenuOpen(!columnMenuOpen)}
-              className="flex items-center gap-1.5 h-9 px-3 text-xs font-medium rounded-lg bg-slate-950/70 border border-slate-800 text-slate-300 hover:bg-slate-800 transition-colors"
+              className="flex items-center gap-1.5 h-9 px-3 text-xs font-medium rounded-lg bg-slate-950/70 border border-slate-800 text-slate-300 hover:bg-slate-800 transition-colors disabled:opacity-50"
             >
               <SlidersHorizontal className="w-3.5 h-3.5" />
               <span>{t('columns')}</span>
@@ -315,20 +393,24 @@ export const DataTable: React.FC<DataTableProps> = ({
                 <div className="text-[11px] font-semibold text-slate-400 px-2 pb-1 border-b border-slate-800 mb-1">
                   {t('columns')}
                 </div>
-                {columns.map(col => (
-                  <label
-                    key={col.name}
-                    className="flex items-center gap-2 px-2 py-1.5 text-xs text-slate-300 hover:bg-slate-800/60 rounded cursor-pointer"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={visibleColumns.includes(col.name)}
-                      onChange={() => toggleColumnVisibility(col.name)}
-                      className="rounded bg-slate-950 border-slate-700 text-indigo-600 focus:ring-0"
-                    />
-                    <span className="truncate">{col.name}</span>
-                  </label>
-                ))}
+                {columns.length === 0 ? (
+                  <div className="text-xs text-slate-500 px-2 py-2">{t('loadingOptions')}</div>
+                ) : (
+                  columns.map(col => (
+                    <label
+                      key={col.name}
+                      className="flex items-center gap-2 px-2 py-1.5 text-xs text-slate-300 hover:bg-slate-800/60 rounded cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={visibleColumns.includes(col.name)}
+                        onChange={() => toggleColumnVisibility(col.name)}
+                        className="rounded bg-slate-950 border-slate-700 text-indigo-600 focus:ring-0"
+                      />
+                      <span className="truncate">{col.name}</span>
+                    </label>
+                  ))
+                )}
               </div>
             )}
           </div>
@@ -345,16 +427,20 @@ export const DataTable: React.FC<DataTableProps> = ({
             </span>
             <div className="flex items-center gap-2">
               <button
+                type="button"
+                disabled={columns.length === 0}
                 onClick={addFilterRow}
-                className="flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 font-medium"
+                className="flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 font-medium disabled:opacity-50"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>{t('addFilter')}</span>
               </button>
-              {filters.length > 0 && (
+              {(filters.length > 0 || appliedFilters.length > 0) && (
                 <button
+                  type="button"
                   onClick={() => {
                     setFilters([]);
+                    setAppliedFilters([]);
                     setPage(1);
                   }}
                   className="text-xs text-rose-400 hover:text-rose-300 ml-2"
@@ -430,6 +516,7 @@ export const DataTable: React.FC<DataTableProps> = ({
 
                   {/* Remove button */}
                   <button
+                    type="button"
                     onClick={() => removeFilter(idx)}
                     className="p-1 text-slate-400 hover:text-rose-400"
                   >
@@ -440,9 +527,10 @@ export const DataTable: React.FC<DataTableProps> = ({
 
               <div className="flex justify-end pt-1">
                 <button
+                  type="button"
                   onClick={() => {
+                    setAppliedFilters([...filters]);
                     setPage(1);
-                    fetchData();
                   }}
                   className="px-3 py-1.5 text-xs font-semibold rounded bg-indigo-600 hover:bg-indigo-500 text-white transition-colors"
                 >
@@ -454,67 +542,91 @@ export const DataTable: React.FC<DataTableProps> = ({
         </div>
       )}
 
+      {/* Non-blocking error banner when previous rows remain visible */}
+      {tableRes.isError && data.length > 0 && (
+        <ErrorRetryCard compact message={tableRes.error} onRetry={() => tableRes.reload({ force: true })} />
+      )}
+
       {/* Main Table Container */}
       <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-900/50 shadow-sm">
+        <TopProgressBar active={isInitialLoading || isUpdating} label={t('updatingTable')} />
         <table className="w-full text-left rtl:text-right border-collapse">
           <thead>
-            <tr className="border-b border-slate-800 bg-slate-950/60 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-              {visibleColumns.map(col => (
-                <th
-                  key={col}
-                  onClick={() => handleSort(col)}
-                  className="px-4 py-3 cursor-pointer hover:bg-slate-800/40 select-none transition-colors"
-                >
-                  <div className="flex items-center gap-1.5">
-                    <span>{col}</span>
-                    {sortBy === col ? (
-                      sortOrder === 'ASC' ? (
-                        <ArrowUp className="w-3.5 h-3.5 text-indigo-400" />
+            {isInitialLoading && visibleColumns.length === 0 ? (
+              <tr className="border-b border-slate-800 bg-slate-950/60">
+                {Array.from({ length: 6 }).map((_, idx) => (
+                  <th key={idx} className="px-4 py-3">
+                    <div className="h-3 w-20 bg-slate-800 rounded animate-pulse motion-reduce:animate-none" />
+                  </th>
+                ))}
+              </tr>
+            ) : (
+              <tr className="border-b border-slate-800 bg-slate-950/60 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                {visibleColumns.map(col => (
+                  <th
+                    key={col}
+                    onClick={() => handleSort(col)}
+                    className="px-4 py-3 cursor-pointer hover:bg-slate-800/40 select-none transition-colors"
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <span>{col}</span>
+                      {sortBy === col ? (
+                        sortOrder === 'ASC' ? (
+                          <ArrowUp className="w-3.5 h-3.5 text-indigo-400" />
+                        ) : (
+                          <ArrowDown className="w-3.5 h-3.5 text-indigo-400" />
+                        )
                       ) : (
-                        <ArrowDown className="w-3.5 h-3.5 text-indigo-400" />
-                      )
-                    ) : (
-                      <ArrowUpDown className="w-3 h-3 text-slate-600" />
-                    )}
-                  </div>
-                </th>
-              ))}
-              {(onEditRecord || onDeleteRecord || onRowClick) && (
-                <th className="px-4 py-3 text-center w-24">Actions</th>
-              )}
-            </tr>
+                        <ArrowUpDown className="w-3 h-3 text-slate-600" />
+                      )}
+                    </div>
+                  </th>
+                ))}
+                {showActionsCol && visibleColumns.length > 0 && (
+                  <th className="px-4 py-3 text-center w-24">Actions</th>
+                )}
+              </tr>
+            )}
           </thead>
-          <tbody className="divide-y divide-slate-800/60 text-xs text-slate-300">
-            {loading ? (
-              // Loading Skeleton Rows
-              Array.from({ length: 6 }).map((_, i) => (
-                <tr key={i} className="animate-pulse">
-                  {visibleColumns.map(c => (
-                    <td key={c} className="px-4 py-3">
-                      <div className="h-4 bg-slate-800 rounded w-3/4" />
-                    </td>
-                  ))}
-                  <td className="px-4 py-3">
-                    <div className="h-4 bg-slate-800 rounded w-12 mx-auto" />
-                  </td>
-                </tr>
-              ))
-            ) : data.length === 0 ? (
-              // Empty State
+          <tbody
+            className={`divide-y divide-slate-800/60 text-xs text-slate-300 transition-opacity ${
+              isUpdating && data.length > 0 ? 'opacity-60' : 'opacity-100'
+            }`}
+          >
+            {isInitialLoading ? (
+              <TableSkeletonRows columns={skeletonColumnCount} rows={8} />
+            ) : tableRes.isError && data.length === 0 ? (
               <tr>
-                <td
-                  colSpan={visibleColumns.length + 1}
-                  className="px-4 py-12 text-center text-slate-500"
-                >
-                  <div className="flex flex-col items-center justify-center gap-2">
-                    <AlertCircle className="w-8 h-8 text-slate-600" />
-                    <span className="text-sm font-medium">{t('noDataFound')}</span>
-                    <span className="text-xs text-slate-600">Try clearing your filters or changing search keywords.</span>
-                  </div>
+                <td colSpan={skeletonColumnCount} className="p-6">
+                  <ErrorRetryCard message={tableRes.error} onRetry={() => tableRes.reload({ force: true })} />
+                </td>
+              </tr>
+            ) : data.length === 0 ? (
+              <tr>
+                <td colSpan={skeletonColumnCount} className="p-6">
+                  <EmptyStateCard
+                    title={t('noDataFound')}
+                    description={t('noRecordsHint')}
+                    action={
+                      (search || appliedFilters.length > 0) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSearch('');
+                            setFilters([]);
+                            setAppliedFilters([]);
+                            setPage(1);
+                          }}
+                          className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                        >
+                          {t('clearFilters')}
+                        </button>
+                      )
+                    }
+                  />
                 </td>
               </tr>
             ) : (
-              // Data Rows
               data.map((row, rIdx) => (
                 <tr
                   key={row.id || rIdx}
@@ -538,7 +650,7 @@ export const DataTable: React.FC<DataTableProps> = ({
                       </td>
                     );
                   })}
-                  {(onEditRecord || onDeleteRecord || onRowClick) && (
+                  {showActionsCol && (
                     <td
                       className="px-4 py-2 text-center"
                       onClick={e => e.stopPropagation()}
@@ -546,6 +658,7 @@ export const DataTable: React.FC<DataTableProps> = ({
                       <div className="flex items-center justify-center gap-1.5 opacity-80 group-hover:opacity-100">
                         {onRowClick && (
                           <button
+                            type="button"
                             onClick={() => onRowClick(row)}
                             className="p-1 text-slate-400 hover:text-indigo-400 rounded hover:bg-slate-800"
                             title={t('viewDetails')}
@@ -555,6 +668,7 @@ export const DataTable: React.FC<DataTableProps> = ({
                         )}
                         {onEditRecord && (
                           <button
+                            type="button"
                             onClick={() => onEditRecord(row)}
                             className="p-1 text-slate-400 hover:text-emerald-400 rounded hover:bg-slate-800"
                             title={t('editRecord')}
@@ -564,6 +678,7 @@ export const DataTable: React.FC<DataTableProps> = ({
                         )}
                         {onDeleteRecord && (
                           <button
+                            type="button"
                             onClick={() => onDeleteRecord(row)}
                             className="p-1 text-slate-400 hover:text-rose-400 rounded hover:bg-slate-800"
                             title={t('deleteRecord')}
@@ -584,9 +699,15 @@ export const DataTable: React.FC<DataTableProps> = ({
       {/* Pagination Bar */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-400 px-1">
         {/* Record counts */}
-        <div>
-          {t('showing')} <strong className="text-slate-200">{data.length}</strong> {t('of')}{' '}
-          <strong className="text-slate-200">{totalRecords.toLocaleString()}</strong> {t('recordsCount')}
+        <div className="tabular-nums">
+          {isInitialLoading ? (
+            <div className="h-4 w-44 bg-slate-800 rounded animate-pulse motion-reduce:animate-none" />
+          ) : (
+            <>
+              {t('showing')} <strong className="text-slate-200">{data.length}</strong> {t('of')}{' '}
+              <strong className="text-slate-200">{(totalRecords ?? 0).toLocaleString()}</strong> {t('recordsCount')}
+            </>
+          )}
         </div>
 
         {/* Page navigation controls */}
@@ -610,34 +731,38 @@ export const DataTable: React.FC<DataTableProps> = ({
           </div>
 
           <button
+            type="button"
             onClick={() => setPage(1)}
-            disabled={page <= 1}
+            disabled={page <= 1 || isInitialLoading}
             className="p-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed text-slate-300"
           >
             <ChevronsLeft className="w-4 h-4 rtl:rotate-180" />
           </button>
           <button
+            type="button"
             onClick={() => setPage(p => Math.max(1, p - 1))}
-            disabled={page <= 1}
+            disabled={page <= 1 || isInitialLoading}
             className="p-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed text-slate-300"
           >
             <ChevronLeft className="w-4 h-4 rtl:rotate-180" />
           </button>
 
-          <span className="px-2 text-xs">
+          <span className="px-2 text-xs tabular-nums">
             {t('page')} <strong className="text-slate-200">{page}</strong> / {totalPages}
           </span>
 
           <button
+            type="button"
             onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-            disabled={page >= totalPages}
+            disabled={page >= totalPages || isInitialLoading}
             className="p-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed text-slate-300"
           >
             <ChevronRight className="w-4 h-4 rtl:rotate-180" />
           </button>
           <button
+            type="button"
             onClick={() => setPage(totalPages)}
-            disabled={page >= totalPages}
+            disabled={page >= totalPages || isInitialLoading}
             className="p-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed text-slate-300"
           >
             <ChevronsRight className="w-4 h-4 rtl:rotate-180" />

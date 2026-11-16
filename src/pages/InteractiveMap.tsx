@@ -1,5 +1,7 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useApp } from '../context/AppContext.js';
+import { useAsyncResource } from '../hooks/useAsyncResource.js';
+import { MapStatusOverlay, RefreshingBadge, ErrorRetryCard } from '../components/common/LoadingStates.js';
 import L from 'leaflet';
 import {
   Layers,
@@ -14,17 +16,38 @@ import {
   CheckCircle2,
   Shapes,
   Circle as CircleIcon,
-  Search,
+  RefreshCw,
 } from 'lucide-react';
 
+interface SpatialLayersPayload {
+  mapCells: any[];
+  netCells: any[];
+  gpsPoints: any[];
+  markers: any[];
+  polygons: any[];
+  circles: any[];
+}
+
 export const InteractiveMap: React.FC = () => {
-  const { t, activeMission, apiFetch, authToken } = useApp();
+  const { t, language, activeMission, apiFetch, authToken } = useApp();
+  const isAr = language === 'ar';
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const layersGroupRef = useRef<L.LayerGroup | null>(null);
+  const tileLayerRef = useRef<L.TileLayer | null>(null);
+  const fallbackSwitchedRef = useRef(false);
+  const fallbackErrCountRef = useRef(0);
 
   const [mouseCoords, setMouseCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Tile loading / failure state
+  const [tilesLoading, setTilesLoading] = useState(true);
+  const [tileError, setTileError] = useState(false);
+
+  // GeoJSON export loading/error
+  const [exportingGeo, setExportingGeo] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   // Layer Visibility State
   const [showMapCells, setShowMapCells] = useState(true);
@@ -33,23 +56,6 @@ export const InteractiveMap: React.FC = () => {
   const [showMarkers, setShowMarkers] = useState(true);
   const [showPolygons, setShowPolygons] = useState(true);
   const [showCircles, setShowCircles] = useState(true);
-
-  // Map Data State
-  const [spatialData, setSpatialData] = useState<{
-    mapCells: any[];
-    netCells: any[];
-    gpsPoints: any[];
-    markers: any[];
-    polygons: any[];
-    circles: any[];
-  }>({
-    mapCells: [],
-    netCells: [],
-    gpsPoints: [],
-    markers: [],
-    polygons: [],
-    circles: [],
-  });
 
   // Coordinate Parser Tool State
   const [coordInput, setCoordInput] = useState('');
@@ -61,31 +67,50 @@ export const InteractiveMap: React.FC = () => {
     error?: string;
   } | null>(null);
 
-  // Fetch all spatial layers from backend
-  useEffect(() => {
-    if (!authToken) return;
-    const params = activeMission && activeMission !== 'ALL' ? `?mission=${activeMission}` : '';
-    apiFetch(`/api/v1/map/all-layers${params}`)
-      .then(res => (res.ok ? res.json() : null))
-      .then(data => {
-        if (!data) return;
-        setSpatialData({
-          mapCells: data.mapCells || [],
-          netCells: data.netCells || [],
-          gpsPoints: data.gpsPoints || [],
-          markers: data.markers || [],
-          polygons: data.polygons || [],
-          circles: data.circles || [],
-        });
-      })
-      .catch(err => console.error('Failed to load spatial layers:', err));
-  }, [activeMission, authToken, apiFetch]);
+  const spatialRes = useAsyncResource<SpatialLayersPayload>(
+    async signal => {
+      const params = activeMission && activeMission !== 'ALL' ? `?mission=${encodeURIComponent(activeMission)}` : '';
+      const res = await apiFetch(`/api/v1/map/all-layers${params}`, { signal });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(data?.error || 'Failed to load spatial layers');
+      }
+      return {
+        mapCells: data?.mapCells || [],
+        netCells: data?.netCells || [],
+        gpsPoints: data?.gpsPoints || [],
+        markers: data?.markers || [],
+        polygons: data?.polygons || [],
+        circles: data?.circles || [],
+      };
+    },
+    [activeMission, authToken],
+    {
+      enabled: Boolean(authToken),
+      keepPreviousData: true,
+      isEmpty: d =>
+        d.mapCells.length === 0 &&
+        d.netCells.length === 0 &&
+        d.gpsPoints.length === 0 &&
+        d.markers.length === 0 &&
+        d.polygons.length === 0 &&
+        d.circles.length === 0,
+    }
+  );
+
+  const spatialData: SpatialLayersPayload = spatialRes.data || {
+    mapCells: [],
+    netCells: [],
+    gpsPoints: [],
+    markers: [],
+    polygons: [],
+    circles: [],
+  };
 
   // Initialize Leaflet Map
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
 
-    // Center on Cairo / Alexandria region
     const map = L.map(mapContainerRef.current, {
       center: [30.0444, 31.2357],
       zoom: 12,
@@ -93,26 +118,43 @@ export const InteractiveMap: React.FC = () => {
       preferCanvas: true,
     });
 
-    // Same-origin cached OpenStreetMap tile proxy (no API key required)
     const primaryTiles = L.tileLayer('/api/v1/map/tiles/{z}/{x}/{y}.png', {
       attribution: '© OpenStreetMap contributors',
       maxZoom: 19,
       crossOrigin: 'anonymous',
     });
 
-    let switchedToFallback = false;
+    fallbackSwitchedRef.current = false;
+    fallbackErrCountRef.current = 0;
+
+    primaryTiles.on('loading', () => {
+      setTilesLoading(true);
+    });
+    primaryTiles.on('load', () => {
+      setTilesLoading(false);
+    });
+    primaryTiles.on('tileload', () => {
+      setTileError(false);
+      fallbackErrCountRef.current = 0;
+    });
     primaryTiles.on('tileerror', () => {
-      if (switchedToFallback) return;
-      switchedToFallback = true;
-      primaryTiles.setUrl('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png');
+      if (!fallbackSwitchedRef.current) {
+        fallbackSwitchedRef.current = true;
+        primaryTiles.setUrl('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png');
+        return;
+      }
+      fallbackErrCountRef.current += 1;
+      if (fallbackErrCountRef.current >= 3) {
+        setTilesLoading(false);
+        setTileError(true);
+      }
     });
 
     primaryTiles.addTo(map);
+    tileLayerRef.current = primaryTiles;
 
-    // Zoom controls at top right
     L.control.zoom({ position: 'topright' }).addTo(map);
 
-    // Track mouse coordinate movement
     map.on('mousemove', (e: L.LeafletMouseEvent) => {
       setMouseCoords({ lat: Number(e.latlng.lat.toFixed(5)), lng: Number(e.latlng.lng.toFixed(5)) });
     });
@@ -124,7 +166,20 @@ export const InteractiveMap: React.FC = () => {
     return () => {
       map.remove();
       mapInstanceRef.current = null;
+      tileLayerRef.current = null;
+      layersGroupRef.current = null;
     };
+  }, []);
+
+  const handleRetryTiles = useCallback(() => {
+    const tiles = tileLayerRef.current;
+    if (!tiles) return;
+    fallbackSwitchedRef.current = false;
+    fallbackErrCountRef.current = 0;
+    setTileError(false);
+    setTilesLoading(true);
+    tiles.setUrl('/api/v1/map/tiles/{z}/{x}/{y}.png');
+    tiles.redraw();
   }, []);
 
   // Render layers onto the map whenever data or toggles change
@@ -140,7 +195,6 @@ export const InteractiveMap: React.FC = () => {
       spatialData.mapCells.forEach(cell => {
         if (!cell.lat || !cell.lng) return;
 
-        // Custom circle marker
         const marker = L.circleMarker([cell.lat, cell.lng], {
           radius: 7,
           fillColor: '#3b82f6',
@@ -163,13 +217,12 @@ export const InteractiveMap: React.FC = () => {
         `);
         group.addLayer(marker);
 
-        // Directional Sector Wedge if radius & direction provided
         if (cell.radius && cell.direction !== null && cell.direction !== undefined) {
           const dir = cell.direction;
           const open = cell.openingAngle || 65;
           const startAngle = (dir - open / 2) * (Math.PI / 180);
           const endAngle = (dir + open / 2) * (Math.PI / 180);
-          const r = (cell.radius / 111300); // approximate meters to lat/lng degrees
+          const r = cell.radius / 111300;
 
           const p1: [number, number] = [cell.lat, cell.lng];
           const p2: [number, number] = [cell.lat + r * Math.cos(startAngle), cell.lng + r * Math.sin(startAngle)];
@@ -228,7 +281,6 @@ export const InteractiveMap: React.FC = () => {
       });
       group.addLayer(polyline);
 
-      // Add start and end points
       if (latlngs.length > 0) {
         const start = latlngs[0];
         const end = latlngs[latlngs.length - 1];
@@ -297,7 +349,7 @@ export const InteractiveMap: React.FC = () => {
             `);
             group.addLayer(polygon);
           }
-        } catch (e) {
+        } catch {
           console.error('Invalid polygon points JSON:', poly.points);
         }
       });
@@ -346,7 +398,6 @@ export const InteractiveMap: React.FC = () => {
     let lat: number | null = null;
     let lng: number | null = null;
 
-    // Check WKT
     const wktMatch = str.match(/POINT\s*\(\s*([-\d.]+)\s+([-\d.]+)\s*\)/i);
     if (wktMatch) {
       lng = parseFloat(wktMatch[1]);
@@ -388,7 +439,6 @@ export const InteractiveMap: React.FC = () => {
 
     setParsedCoord({ lat, lng, isValid: true });
 
-    // Fly to parsed coordinates on map
     if (mapInstanceRef.current) {
       mapInstanceRef.current.flyTo([lat, lng], 15);
       L.marker([lat, lng])
@@ -399,10 +449,38 @@ export const InteractiveMap: React.FC = () => {
   };
 
   const toggleFullscreen = () => {
-    setIsFullscreen(!isFullscreen);
-    setTimeout(() => {
-      mapInstanceRef.current?.invalidateSize();
-    }, 200);
+    setIsFullscreen(prev => !prev);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        mapInstanceRef.current?.invalidateSize();
+      });
+    });
+  };
+
+  const handleExportGeoJson = async () => {
+    setExportingGeo(true);
+    setExportError(null);
+    try {
+      const qs = activeMission !== 'ALL' ? `&mission=${encodeURIComponent(activeMission)}` : '';
+      const res = await apiFetch(`/api/v1/exports/download?table=network_cells&format=geojson${qs}`);
+      if (!res.ok) {
+        const json = await res.json().catch(() => null);
+        throw new Error(json?.error || `Export failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'network_cells.geojson';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      setExportError(err?.message || 'Failed to export GeoJSON');
+    } finally {
+      setExportingGeo(false);
+    }
   };
 
   return (
@@ -410,33 +488,54 @@ export const InteractiveMap: React.FC = () => {
       {/* Top Header Bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900/90 p-3 rounded-xl border border-slate-800">
         <div>
-          <h1 className="text-lg font-bold text-slate-100 flex items-center gap-2">
+          <h1 className="text-lg font-bold text-slate-100 flex items-center gap-2 flex-wrap">
             <MapPin className="w-5 h-5 text-indigo-400" />
             <span>{t('mapTitle')}</span>
+            {spatialRes.isRefreshing && <RefreshingBadge label={t('loadingMapData')} />}
           </h1>
           <p className="text-xs text-slate-400 mt-0.5">{t('mapSubtitle')}</p>
         </div>
 
-        {/* Right buttons: Fullscreen, GeoJSON Export */}
-        <div className="flex items-center gap-2">
-          <a
-            href={`/api/v1/exports/download?table=network_cells&format=geojson${activeMission !== 'ALL' ? `&mission=${encodeURIComponent(activeMission)}` : ''}${authToken ? `&token=${encodeURIComponent(authToken)}` : ''}`}
-            download="network_cells.geojson"
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors"
+        {/* Right buttons: Refresh, GeoJSON Export, Fullscreen */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            disabled={spatialRes.isLoading || spatialRes.isRefreshing}
+            onClick={() => spatialRes.reload({ force: true })}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors disabled:opacity-50"
           >
-            <Download className="w-3.5 h-3.5 text-indigo-400" />
-            <span>Export GeoJSON</span>
-          </a>
+            <RefreshCw className={`w-3.5 h-3.5 ${spatialRes.isLoading || spatialRes.isRefreshing ? 'animate-spin' : ''}`} />
+            <span>{t('refresh')}</span>
+          </button>
 
           <button
+            type="button"
+            disabled={exportingGeo}
+            onClick={handleExportGeoJson}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors disabled:opacity-50"
+          >
+            {exportingGeo ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+            ) : (
+              <Download className="w-3.5 h-3.5 text-indigo-400" />
+            )}
+            <span>{exportingGeo ? t('loading') : 'Export GeoJSON'}</span>
+          </button>
+
+          <button
+            type="button"
             onClick={toggleFullscreen}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white shadow-sm shadow-indigo-600/30 transition-colors"
           >
             {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
-            <span>{isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}</span>
+            <span>{isFullscreen ? (isAr ? 'إنهاء ملء الشاشة' : 'Exit Fullscreen') : (isAr ? 'ملء الشاشة' : 'Fullscreen')}</span>
           </button>
         </div>
       </div>
+
+      {exportError && (
+        <ErrorRetryCard compact message={exportError} onRetry={handleExportGeoJson} />
+      )}
 
       {/* Main Map + Side Panel Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
@@ -444,14 +543,25 @@ export const InteractiveMap: React.FC = () => {
         <div className="lg:col-span-3 relative h-[580px] rounded-2xl overflow-hidden border border-slate-800 shadow-xl bg-slate-950">
           <div ref={mapContainerRef} className="w-full h-full" />
 
+          <MapStatusOverlay
+            dataLoading={spatialRes.isLoading}
+            dataRefreshing={spatialRes.isRefreshing}
+            dataError={spatialRes.isError && !spatialRes.data ? spatialRes.error : null}
+            onRetryData={() => spatialRes.reload({ force: true })}
+            isEmpty={spatialRes.isEmpty}
+            tilesLoading={tilesLoading}
+            tileError={tileError}
+            onRetryTiles={handleRetryTiles}
+          />
+
           {/* Floating Coordinate Bar (Bottom Left) */}
-          <div className="absolute bottom-3 left-3 rtl:right-3 rtl:left-auto z-20 px-3 py-1.5 rounded-lg bg-slate-950/85 backdrop-blur border border-slate-800 text-[11px] font-mono text-slate-300 flex items-center gap-3 shadow-lg">
+          <div className="absolute bottom-3 left-3 rtl:right-3 rtl:left-auto z-[420] px-3 py-1.5 rounded-lg bg-slate-950/85 backdrop-blur border border-slate-800 text-[11px] font-mono text-slate-300 flex items-center gap-3 shadow-lg">
             <div className="flex items-center gap-1 text-indigo-400">
               <Compass className="w-3.5 h-3.5" />
               <span>CURSOR:</span>
             </div>
             {mouseCoords ? (
-              <span>
+              <span className="tabular-nums">
                 Lat: <strong>{mouseCoords.lat}</strong>, Lng: <strong>{mouseCoords.lng}</strong>
               </span>
             ) : (
@@ -460,7 +570,7 @@ export const InteractiveMap: React.FC = () => {
           </div>
 
           {/* Floating Legend (Bottom Right) */}
-          <div className="absolute bottom-3 right-3 rtl:left-3 rtl:right-auto z-20 hidden sm:flex items-center gap-3 px-3 py-1.5 rounded-lg bg-slate-950/85 backdrop-blur border border-slate-800 text-[10px] text-slate-400 shadow-lg">
+          <div className="absolute bottom-3 right-3 rtl:left-3 rtl:right-auto z-[420] hidden sm:flex items-center gap-3 px-3 py-1.5 rounded-lg bg-slate-950/85 backdrop-blur border border-slate-800 text-[10px] text-slate-400 shadow-lg">
             <span className="flex items-center gap-1">
               <span className="w-2.5 h-2.5 rounded-full bg-blue-500" /> Map Cells
             </span>
@@ -602,10 +712,11 @@ export const InteractiveMap: React.FC = () => {
               </div>
 
               <button
+                type="button"
                 onClick={handleTestParse}
                 className="w-full py-2 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition-colors"
               >
-                Validate & Locate on Map
+                Validate &amp; Locate on Map
               </button>
 
               {parsedCoord && (

@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useApp } from '../context/AppContext.js';
 import { DataTable } from '../components/common/DataTable.js';
 import { RecordDetailModal } from '../components/common/RecordDetailModal.js';
 import { RecordFormModal } from '../components/common/RecordFormModal.js';
 import { ColumnMeta } from '../types/index.js';
+import { requestCache } from '../utils/requestCache.js';
 
 interface TableViewProps {
   tableId: string;
@@ -12,7 +13,7 @@ interface TableViewProps {
 }
 
 export const TableView: React.FC<TableViewProps> = ({ tableId, title, description }) => {
-  const { t, apiFetch } = useApp();
+  const { t, apiFetch, refreshMissions } = useApp();
 
   const [selectedRecord, setSelectedRecord] = useState<any | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -20,7 +21,47 @@ export const TableView: React.FC<TableViewProps> = ({ tableId, title, descriptio
   const [formOpen, setFormOpen] = useState(false);
   const [editingRecord, setEditingRecord] = useState<any | null>(null);
   const [columns, setColumns] = useState<ColumnMeta[]>([]);
+  const [columnsLoading, setColumnsLoading] = useState(false);
+  const [columnsError, setColumnsError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+
+  const schemaAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    setColumns([]);
+    setColumnsError(null);
+    return () => {
+      if (schemaAbortRef.current) schemaAbortRef.current.abort();
+    };
+  }, [tableId]);
+
+  const loadSchema = async () => {
+    if (schemaAbortRef.current) schemaAbortRef.current.abort();
+    const controller = new AbortController();
+    schemaAbortRef.current = controller;
+
+    setColumnsLoading(true);
+    setColumnsError(null);
+    try {
+      const res = await apiFetch(`/api/v1/tables/${tableId}?pageSize=1`, {
+        signal: controller.signal,
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(json?.error || `Failed to load ${tableId} schema`);
+      }
+      if (!controller.signal.aborted && Array.isArray(json?.columns)) {
+        setColumns(json.columns);
+      }
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || controller.signal.aborted) return;
+      setColumnsError(err?.message || 'Failed to load table schema');
+    } finally {
+      if (!controller.signal.aborted) {
+        setColumnsLoading(false);
+      }
+    }
+  };
 
   const handleRowClick = (record: any) => {
     setSelectedRecord(record);
@@ -29,23 +70,18 @@ export const TableView: React.FC<TableViewProps> = ({ tableId, title, descriptio
 
   const handleEdit = (record: any) => {
     setEditingRecord(record);
-    // Fetch columns for form if needed
-    apiFetch(`/api/v1/tables/${tableId}?pageSize=1`)
-      .then(r => r.json())
-      .then(res => {
-        if (res.columns) setColumns(res.columns);
-        setFormOpen(true);
-      });
+    setFormOpen(true);
+    if (columns.length === 0) {
+      void loadSchema();
+    }
   };
 
   const handleCreate = () => {
     setEditingRecord(null);
-    apiFetch(`/api/v1/tables/${tableId}?pageSize=1`)
-      .then(r => r.json())
-      .then(res => {
-        if (res.columns) setColumns(res.columns);
-        setFormOpen(true);
-      });
+    setFormOpen(true);
+    if (columns.length === 0) {
+      void loadSchema();
+    }
   };
 
   const handleDelete = async (record: any) => {
@@ -56,6 +92,8 @@ export const TableView: React.FC<TableViewProps> = ({ tableId, title, descriptio
           method: 'DELETE',
         });
         if (res.ok) {
+          requestCache.clear();
+          if (tableId === 'missions') refreshMissions();
           setRefreshKey(k => k + 1);
         }
       } catch (err) {
@@ -93,7 +131,12 @@ export const TableView: React.FC<TableViewProps> = ({ tableId, title, descriptio
         tableName={tableId}
         record={editingRecord}
         columns={columns}
+        columnsLoading={columnsLoading}
+        columnsError={columnsError}
+        onRetryColumns={loadSchema}
         onSuccess={() => {
+          requestCache.clear();
+          if (tableId === 'missions') refreshMissions();
           setRefreshKey(k => k + 1);
         }}
       />

@@ -15,7 +15,9 @@ import {
   Smartphone,
   Target,
   Globe,
+  RefreshCw,
 } from 'lucide-react';
+import { FilterOptionsSkeleton, ErrorRetryCard, EmptyStateCard } from '../common/LoadingStates.js';
 
 interface FilterOptionsResponse {
   missions: MissionItem[];
@@ -39,12 +41,18 @@ interface GlobalFilterPanelProps {
   filters: DashboardFilterState;
   onChange: (next: DashboardFilterState) => void;
   options: FilterOptionsResponse | null;
+  optionsLoading?: boolean;
+  optionsError?: string | null;
+  onRetryOptions?: () => void;
 }
 
 export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
   filters,
   onChange,
   options,
+  optionsLoading = false,
+  optionsError = null,
+  onRetryOptions,
 }) => {
   const { t, apiFetch, authToken, currentUser, addNotification } = useApp();
   const [expanded, setExpanded] = useState(true);
@@ -54,41 +62,75 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
   // PLMN Search
   const [plmnResults, setPlmnResults] = useState<Array<{ mcc: string; mnc: string; country: string; code: string; name: string }>>([]);
   const [plmnLoading, setPlmnLoading] = useState(false);
+  const [plmnError, setPlmnError] = useState<string | null>(null);
+  const plmnSeqRef = React.useRef(0);
 
   // Saved Views
   const [savedViews, setSavedViews] = useState<Array<{ id: number; view_name: string; filters_json: string }>>([]);
+  const [savedViewsLoading, setSavedViewsLoading] = useState(true);
   const [newViewName, setNewViewName] = useState('');
   const [savingView, setSavingView] = useState(false);
 
   const canUseTmsiFilter = currentUser?.role === 'SUPER_ADMIN' || currentUser?.role === 'ADMIN';
 
-  const loadSavedViews = () => {
+  const loadSavedViews = React.useCallback((signal?: AbortSignal) => {
     if (!authToken) return;
-    apiFetch('/api/v1/saved-views?tableName=dashboard')
+    setSavedViewsLoading(true);
+    apiFetch('/api/v1/saved-views?tableName=dashboard', { signal })
       .then(r => (r.ok ? r.json() : []))
-      .then(rows => setSavedViews(Array.isArray(rows) ? rows : []))
-      .catch(() => {});
-  };
+      .then(rows => {
+        if (!signal?.aborted) setSavedViews(Array.isArray(rows) ? rows : []);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!signal?.aborted) setSavedViewsLoading(false);
+      });
+  }, [authToken, apiFetch]);
 
   useEffect(() => {
-    loadSavedViews();
-  }, [authToken]);
+    const controller = new AbortController();
+    loadSavedViews(controller.signal);
+    return () => controller.abort();
+  }, [loadSavedViews]);
 
   useEffect(() => {
     const q = filters.plmnQuery.trim();
     if (!q) {
       setPlmnResults((options?.plmnEntries || []).slice(0, 12));
+      setPlmnError(null);
+      setPlmnLoading(false);
       return;
     }
+    const controller = new AbortController();
+    const seq = ++plmnSeqRef.current;
     const timer = setTimeout(() => {
       setPlmnLoading(true);
-      apiFetch(`/api/v1/plmn/search?q=${encodeURIComponent(q)}`)
-        .then(r => (r.ok ? r.json() : []))
-        .then(rows => setPlmnResults(Array.isArray(rows) ? rows : []))
-        .catch(() => setPlmnResults([]))
-        .finally(() => setPlmnLoading(false));
-    }, 220);
-    return () => clearTimeout(timer);
+      setPlmnError(null);
+      apiFetch(`/api/v1/plmn/search?q=${encodeURIComponent(q)}`, { signal: controller.signal })
+        .then(async r => {
+          const json = await r.json().catch(() => null);
+          if (!r.ok) throw new Error(json?.error || 'PLMN search failed');
+          return json;
+        })
+        .then(rows => {
+          if (controller.signal.aborted || seq !== plmnSeqRef.current) return;
+          setPlmnResults(Array.isArray(rows) ? rows : []);
+        })
+        .catch(err => {
+          if (controller.signal.aborted || err?.name === 'AbortError' || seq !== plmnSeqRef.current) return;
+          setPlmnError(err?.message || 'Search failed');
+          setPlmnResults([]);
+        })
+        .finally(() => {
+          if (!controller.signal.aborted && seq === plmnSeqRef.current) {
+            setPlmnLoading(false);
+          }
+        });
+    }, 180);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [filters.plmnQuery, options?.plmnEntries, apiFetch]);
 
   const missionsList = useMemo(() => {
@@ -313,7 +355,12 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
 
         <div className="flex items-center gap-2 flex-wrap">
           {/* Saved Views Dropdown */}
-          {savedViews.length > 0 && (
+          {savedViewsLoading ? (
+            <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-400 px-2">
+              <RefreshCw className="w-3 h-3 animate-spin text-amber-400" />
+              <span>{t('loadingOptions')}</span>
+            </span>
+          ) : savedViews.length > 0 && (
             <div className="flex items-center gap-1">
               <Bookmark className="w-3.5 h-3.5 text-amber-400" />
               <select
@@ -492,34 +539,42 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-48 overflow-y-auto pr-1">
-                {missionsList.map(m => {
-                  const selected = filters.missionIds.includes(m.id);
-                  return (
-                    <label
-                      key={m.id}
-                      className={`flex items-center gap-2 p-2 rounded-lg border text-xs cursor-pointer transition-colors ${
-                        selected
-                          ? 'bg-indigo-600/20 border-indigo-500 text-white'
-                          : 'bg-slate-950/70 border-slate-800 text-slate-300 hover:bg-slate-800/50'
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selected}
-                        onChange={() => toggleMissionId(m.id)}
-                        className="rounded bg-slate-900 border-slate-700 text-indigo-600"
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="font-semibold truncate">{m.mission}</div>
-                        <div className="text-[10px] text-slate-400 truncate">
-                          {m.location} • #{m.id}
+              {optionsError ? (
+                <ErrorRetryCard compact message={optionsError} onRetry={onRetryOptions} />
+              ) : optionsLoading && !options ? (
+                <FilterOptionsSkeleton items={6} />
+              ) : missionsList.length === 0 ? (
+                <EmptyStateCard title={t('noRecordsTitle')} description="" />
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-48 overflow-y-auto pr-1">
+                  {missionsList.map(m => {
+                    const selected = filters.missionIds.includes(m.id);
+                    return (
+                      <label
+                        key={m.id}
+                        className={`flex items-center gap-2 p-2 rounded-lg border text-xs cursor-pointer transition-colors ${
+                          selected
+                            ? 'bg-indigo-600/20 border-indigo-500 text-white'
+                            : 'bg-slate-950/70 border-slate-800 text-slate-300 hover:bg-slate-800/50'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selected}
+                          onChange={() => toggleMissionId(m.id)}
+                          className="rounded bg-slate-900 border-slate-700 text-indigo-600"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="font-semibold truncate">{m.mission}</div>
+                          <div className="text-[10px] text-slate-400 truncate">
+                            {m.location} • #{m.id}
+                          </div>
                         </div>
-                      </div>
-                    </label>
-                  );
-                })}
-              </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
 
               {/* Saved Views quick manager */}
               {savedViews.length > 0 && (
@@ -729,86 +784,92 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
               </div>
 
               {/* Multi-select checkbox groups for Registration */}
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-3 pt-2 border-t border-slate-800">
-                <div>
-                  <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">Country</div>
-                  <div className="max-h-28 overflow-y-auto space-y-1 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
-                    {(options?.registrations.countries || []).map(c => (
-                      <label key={c} className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={filters.country.includes(c)}
-                          onChange={() => toggleArrayString('country', c)}
-                          className="rounded bg-slate-900 border-slate-700 text-emerald-500"
-                        />
-                        <span className="truncate">{c}</span>
-                      </label>
-                    ))}
-                  </div>
+              {optionsLoading && !options ? (
+                <div className="pt-2 border-t border-slate-800">
+                  <FilterOptionsSkeleton items={4} columnsClass="grid grid-cols-1 md:grid-cols-4 gap-3" />
                 </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3 pt-2 border-t border-slate-800">
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">Country</div>
+                    <div className="max-h-28 overflow-y-auto space-y-1 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
+                      {(options?.registrations.countries || []).map(c => (
+                        <label key={c} className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={filters.country.includes(c)}
+                            onChange={() => toggleArrayString('country', c)}
+                            className="rounded bg-slate-900 border-slate-700 text-emerald-500"
+                          />
+                          <span className="truncate">{c}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
 
-                <div>
-                  <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">Country Code</div>
-                  <div className="max-h-28 overflow-y-auto space-y-1 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
-                    {(options?.registrations.countryCodes || []).map(cc => (
-                      <label key={cc} className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={filters.countryCode.includes(cc)}
-                          onChange={() => toggleArrayString('countryCode', cc)}
-                          className="rounded bg-slate-900 border-slate-700 text-emerald-500"
-                        />
-                        <span>{cc}</span>
-                      </label>
-                    ))}
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">Country Code</div>
+                    <div className="max-h-28 overflow-y-auto space-y-1 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
+                      {(options?.registrations.countryCodes || []).map(cc => (
+                        <label key={cc} className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={filters.countryCode.includes(cc)}
+                            onChange={() => toggleArrayString('countryCode', cc)}
+                            className="rounded bg-slate-900 border-slate-700 text-emerald-500"
+                          />
+                          <span>{cc}</span>
+                        </label>
+                      ))}
+                    </div>
                   </div>
-                </div>
 
-                <div>
-                  <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">UE Model</div>
-                  <div className="max-h-28 overflow-y-auto space-y-1 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
-                    {(options?.registrations.ueModels || []).map(u => (
-                      <label key={u} className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={filters.ueModel.includes(u)}
-                          onChange={() => toggleArrayString('ueModel', u)}
-                          className="rounded bg-slate-900 border-slate-700 text-emerald-500"
-                        />
-                        <span className="truncate">{u}</span>
-                      </label>
-                    ))}
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">UE Model</div>
+                    <div className="max-h-28 overflow-y-auto space-y-1 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
+                      {(options?.registrations.ueModels || []).map(u => (
+                        <label key={u} className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={filters.ueModel.includes(u)}
+                            onChange={() => toggleArrayString('ueModel', u)}
+                            className="rounded bg-slate-900 border-slate-700 text-emerald-500"
+                          />
+                          <span className="truncate">{u}</span>
+                        </label>
+                      ))}
+                    </div>
                   </div>
-                </div>
 
-                <div>
-                  <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">Action / Update</div>
-                  <div className="max-h-28 overflow-y-auto space-y-1 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
-                    {(options?.registrations.actions || []).map(a => (
-                      <label key={`a_${a}`} className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={filters.action.includes(a)}
-                          onChange={() => toggleArrayString('action', a)}
-                          className="rounded bg-slate-900 border-slate-700 text-emerald-500"
-                        />
-                        <span>Action: {a}</span>
-                      </label>
-                    ))}
-                    {(options?.registrations.updates || []).map(u => (
-                      <label key={`u_${u}`} className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={filters.update.includes(u)}
-                          onChange={() => toggleArrayString('update', u)}
-                          className="rounded bg-slate-900 border-slate-700 text-emerald-500"
-                        />
-                        <span>Update: {u}</span>
-                      </label>
-                    ))}
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">Action / Update</div>
+                    <div className="max-h-28 overflow-y-auto space-y-1 bg-slate-950/60 p-2 rounded-lg border border-slate-800">
+                      {(options?.registrations.actions || []).map(a => (
+                        <label key={`a_${a}`} className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={filters.action.includes(a)}
+                            onChange={() => toggleArrayString('action', a)}
+                            className="rounded bg-slate-900 border-slate-700 text-emerald-500"
+                          />
+                          <span>Action: {a}</span>
+                        </label>
+                      ))}
+                      {(options?.registrations.updates || []).map(u => (
+                        <label key={`u_${u}`} className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={filters.update.includes(u)}
+                            onChange={() => toggleArrayString('update', u)}
+                            className="rounded bg-slate-900 border-slate-700 text-emerald-500"
+                          />
+                          <span>Update: {u}</span>
+                        </label>
+                      ))}
+                    </div>
                   </div>
                 </div>
-              </div>
+              )}
             </div>
           )}
 
@@ -997,73 +1058,79 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2 border-t border-slate-800">
-                <div>
-                  <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">RAT Technology</div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {(options?.networkCells.rats || []).map(r => (
-                      <button
-                        key={r}
-                        type="button"
-                        onClick={() => toggleArrayString('rat', r)}
-                        className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border ${
-                          filters.rat.includes(r)
-                            ? 'bg-blue-600 border-blue-500 text-white'
-                            : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
-                        }`}
-                      >
-                        {r}
-                      </button>
-                    ))}
-                  </div>
+              {optionsLoading && !options ? (
+                <div className="pt-2 border-t border-slate-800">
+                  <FilterOptionsSkeleton items={3} columnsClass="grid grid-cols-1 md:grid-cols-3 gap-3" />
                 </div>
-
-                <div>
-                  <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">MCC</div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {(options?.networkCells.mccs || []).map(m => {
-                      const val = String(m);
-                      return (
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2 border-t border-slate-800">
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">RAT Technology</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {(options?.networkCells.rats || []).map(r => (
                         <button
-                          key={val}
+                          key={r}
                           type="button"
-                          onClick={() => toggleArrayString('mcc', val)}
-                          className={`px-2 py-1 rounded-md text-[11px] font-mono border ${
-                            filters.mcc.includes(val)
+                          onClick={() => toggleArrayString('rat', r)}
+                          className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border ${
+                            filters.rat.includes(r)
                               ? 'bg-blue-600 border-blue-500 text-white'
                               : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
                           }`}
                         >
-                          {val}
+                          {r}
                         </button>
-                      );
-                    })}
+                      ))}
+                    </div>
                   </div>
-                </div>
 
-                <div>
-                  <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">MNC</div>
-                  <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-                    {(options?.networkCells.mncs || []).map(m => {
-                      const val = String(m);
-                      return (
-                        <button
-                          key={val}
-                          type="button"
-                          onClick={() => toggleArrayString('mnc', val)}
-                          className={`px-2 py-1 rounded-md text-[11px] font-mono border ${
-                            filters.mnc.includes(val)
-                              ? 'bg-blue-600 border-blue-500 text-white'
-                              : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
-                          }`}
-                        >
-                          {val}
-                        </button>
-                      );
-                    })}
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">MCC</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {(options?.networkCells.mccs || []).map(m => {
+                        const val = String(m);
+                        return (
+                          <button
+                            key={val}
+                            type="button"
+                            onClick={() => toggleArrayString('mcc', val)}
+                            className={`px-2 py-1 rounded-md text-[11px] font-mono border ${
+                              filters.mcc.includes(val)
+                                ? 'bg-blue-600 border-blue-500 text-white'
+                                : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
+                            }`}
+                          >
+                            {val}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">MNC</div>
+                    <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
+                      {(options?.networkCells.mncs || []).map(m => {
+                        const val = String(m);
+                        return (
+                          <button
+                            key={val}
+                            type="button"
+                            onClick={() => toggleArrayString('mnc', val)}
+                            className={`px-2 py-1 rounded-md text-[11px] font-mono border ${
+                              filters.mnc.includes(val)
+                                ? 'bg-blue-600 border-blue-500 text-white'
+                                : 'bg-slate-950 border-slate-800 text-slate-300 hover:bg-slate-800'
+                            }`}
+                          >
+                            {val}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
                 </div>
-              </div>
+              )}
             </div>
           )}
 
@@ -1092,11 +1159,15 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
                 )}
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-48 overflow-y-auto">
-                {plmnLoading ? (
-                  <div className="text-xs text-slate-500 p-2">Searching PLMN directory...</div>
-                ) : (
-                  plmnResults.map((p, idx) => (
+              {plmnLoading || (optionsLoading && !options && !filters.plmnQuery.trim()) ? (
+                <FilterOptionsSkeleton items={6} />
+              ) : plmnError ? (
+                <ErrorRetryCard compact message={plmnError} />
+              ) : plmnResults.length === 0 ? (
+                <EmptyStateCard title={t('noRecordsTitle')} description="" />
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 max-h-48 overflow-y-auto">
+                  {plmnResults.map((p, idx) => (
                     <button
                       key={`${p.mcc}-${p.mnc}-${idx}`}
                       type="button"
@@ -1121,9 +1192,9 @@ export const GlobalFilterPanel: React.FC<GlobalFilterPanelProps> = ({
                         {p.mcc}/{p.mnc}
                       </span>
                     </button>
-                  ))
-                )}
-              </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>

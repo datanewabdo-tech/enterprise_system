@@ -1,6 +1,7 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { translations, Language } from '../locales/translations.js';
 import { User, NotificationItem, MissionItem, Role } from '../types/index.js';
+import { requestCache } from '../utils/requestCache.js';
 
 interface AppContextType {
   language: Language;
@@ -12,12 +13,17 @@ interface AppContextType {
   setActiveMission: (m: string) => void;
   missions: MissionItem[];
   missionsList: string[];
+  missionsLoading: boolean;
+  missionsError: string | null;
   refreshMissions: () => void;
   globalSearch: string;
   setGlobalSearch: (q: string) => void;
   currentUser: User | null;
   setCurrentUser: (u: User | null) => void;
   authToken: string | null;
+  authLoading: boolean;
+  authError: string | null;
+  retryAuth: () => void;
   switchRole: (role: Role) => Promise<void>;
   apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   quickImportOpen: boolean;
@@ -40,10 +46,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const [activeMission, setActiveMission] = useState<string>('ALL');
   const [missions, setMissions] = useState<MissionItem[]>([]);
+  const [missionsLoading, setMissionsLoading] = useState<boolean>(true);
+  const [missionsError, setMissionsError] = useState<string | null>(null);
   const [globalSearch, setGlobalSearch] = useState<string>('');
   const [quickImportOpen, setQuickImportOpen] = useState<boolean>(false);
 
   const [authToken, setAuthToken] = useState<string | null>(() => localStorage.getItem('app_jwt_token'));
+  const [authLoading, setAuthLoading] = useState<boolean>(() => !localStorage.getItem('app_jwt_token'));
+  const [authError, setAuthError] = useState<string | null>(null);
+
   const [currentUser, setCurrentUser] = useState<User | null>(() => {
     const saved = localStorage.getItem('app_user');
     if (saved) {
@@ -74,6 +85,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     },
   ]);
 
+  const missionsAbortRef = useRef<AbortController | null>(null);
+  const missionsSeqRef = useRef(0);
+
   // Sync Language and Direction
   useEffect(() => {
     localStorage.setItem('app_lang', language);
@@ -91,26 +105,55 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [theme]);
 
+  const bootstrapAuth = useCallback((signal?: AbortSignal) => {
+    setAuthLoading(true);
+    setAuthError(null);
+    fetch('/api/v1/auth/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'SUPER_ADMIN' }),
+      signal,
+    })
+      .then(async r => {
+        const json = await r.json().catch(() => null);
+        if (!r.ok) {
+          throw new Error(json?.error || 'Session initialization failed');
+        }
+        return json;
+      })
+      .then(res => {
+        if (signal?.aborted) return;
+        if (res?.token && res?.user) {
+          localStorage.setItem('app_jwt_token', res.token);
+          localStorage.setItem('app_user', JSON.stringify(res.user));
+          setAuthToken(res.token);
+          setCurrentUser(res.user);
+        } else {
+          throw new Error('Invalid session response');
+        }
+      })
+      .catch(err => {
+        if (signal?.aborted || err?.name === 'AbortError') return;
+        setAuthError(err?.message || 'Unable to establish session');
+      })
+      .finally(() => {
+        if (!signal?.aborted) setAuthLoading(false);
+      });
+  }, []);
+
   // Initialize authenticated JWT session if not present
   useEffect(() => {
     if (!authToken) {
-      fetch('/api/v1/auth/session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role: 'SUPER_ADMIN' }),
-      })
-        .then(r => (r.ok ? r.json() : null))
-        .then(res => {
-          if (res?.token && res?.user) {
-            localStorage.setItem('app_jwt_token', res.token);
-            localStorage.setItem('app_user', JSON.stringify(res.user));
-            setAuthToken(res.token);
-            setCurrentUser(res.user);
-          }
-        })
-        .catch(() => {});
+      const controller = new AbortController();
+      bootstrapAuth(controller.signal);
+      return () => controller.abort();
     }
-  }, [authToken]);
+    setAuthLoading(false);
+  }, [authToken, bootstrapAuth]);
+
+  const retryAuth = useCallback(() => {
+    bootstrapAuth();
+  }, [bootstrapAuth]);
 
   const switchRole = useCallback(async (role: Role) => {
     const res = await fetch('/api/v1/auth/session', {
@@ -120,6 +163,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
     if (res.ok) {
       const json = await res.json();
+      requestCache.clear();
       localStorage.setItem('app_jwt_token', json.token);
       localStorage.setItem('app_user', JSON.stringify(json.user));
       setAuthToken(json.token);
@@ -142,20 +186,54 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const refreshMissions = useCallback(() => {
     const tok = authToken || localStorage.getItem('app_jwt_token');
     if (!tok) return;
-    apiFetch('/api/v1/tables/missions?pageSize=200')
-      .then(r => (r.ok ? r.json() : null))
+
+    if (missionsAbortRef.current) {
+      missionsAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    missionsAbortRef.current = controller;
+    const seq = ++missionsSeqRef.current;
+
+    setMissionsLoading(true);
+    setMissionsError(null);
+    requestCache.invalidate('dashboard:');
+
+    apiFetch('/api/v1/tables/missions?pageSize=200', { signal: controller.signal })
+      .then(async r => {
+        const json = await r.json().catch(() => null);
+        if (!r.ok) {
+          throw new Error(json?.error || 'Failed to load missions');
+        }
+        return json;
+      })
       .then(res => {
+        if (controller.signal.aborted || seq !== missionsSeqRef.current) return;
         if (res?.data && Array.isArray(res.data)) {
           setMissions(res.data);
+        } else {
+          setMissions([]);
         }
       })
-      .catch(() => {});
+      .catch(err => {
+        if (controller.signal.aborted || err?.name === 'AbortError' || seq !== missionsSeqRef.current) return;
+        setMissionsError(err?.message || 'Failed to load missions');
+      })
+      .finally(() => {
+        if (!controller.signal.aborted && seq === missionsSeqRef.current) {
+          setMissionsLoading(false);
+        }
+      });
   }, [authToken, apiFetch]);
 
   useEffect(() => {
     if (authToken) {
       refreshMissions();
     }
+    return () => {
+      if (missionsAbortRef.current) {
+        missionsAbortRef.current.abort();
+      }
+    };
   }, [authToken, refreshMissions]);
 
   const missionsList = missions.map(m => String(m.id));
@@ -194,12 +272,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setActiveMission,
         missions,
         missionsList,
+        missionsLoading,
+        missionsError,
         refreshMissions,
         globalSearch,
         setGlobalSearch,
         currentUser,
         setCurrentUser,
         authToken,
+        authLoading,
+        authError,
+        retryAuth,
         switchRole,
         apiFetch,
         quickImportOpen,

@@ -11,6 +11,7 @@ import { useApp } from '../../context/AppContext.js';
 import { DashboardFilterState } from '../../types/index.js';
 import { ChartExportMenu } from './ChartExportMenu.js';
 import { captureLeafletMapPng } from '../../utils/mapSnapshot.js';
+import { MapStatusOverlay } from '../common/LoadingStates.js';
 
 export interface BtsLocationItem {
   key?: string;
@@ -43,6 +44,10 @@ interface BtsLocationsMapProps {
   filters?: Partial<DashboardFilterState>;
   onRegisterSnapshotCapture?: (fn: (() => Promise<string | null>) | null) => void;
   mapContainerId?: string;
+  loading?: boolean;
+  refreshing?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
 }
 
 export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
@@ -51,12 +56,17 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
   filters = {},
   onRegisterSnapshotCapture,
   mapContainerId = 'bts-dashboard-map',
+  loading = false,
+  refreshing = false,
+  error = null,
+  onRetry,
 }) => {
   const { language, t } = useApp();
   const isAr = language === 'ar';
 
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
+  const tileLayerRef = useRef<L.TileLayer | null>(null);
   const clusterLayerRef = useRef<any>(null);
   const heatLayerRef = useRef<L.Layer | null>(null);
 
@@ -64,15 +74,19 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
   const [showNetworkCells, setShowNetworkCells] = useState(true);
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [tilesLoading, setTilesLoading] = useState(true);
+  const [tileError, setTileError] = useState(false);
 
   const mapTitle = isAr
     ? 'توزيع مواقع الأبراج وخلايا الشبكة (BTS)'
     : 'BTS & Network Cell Locations Map';
-  const mapSubtitle = `${isAr ? 'مواقع فريدة' : 'Unique Locations'}: ${stats?.uniqueLocations ?? locations.length} • ${
-    isAr ? 'التسجيلات' : 'Reg Coords'
-  }: ${stats?.totalParsedRegistrationCoords ?? 0} • ${isAr ? 'الخلايا' : 'Network Cells'}: ${
-    stats?.networkCellLocationsCount ?? 0
-  }`;
+  const mapSubtitle = loading
+    ? t('loadingMapData')
+    : `${isAr ? 'مواقع فريدة' : 'Unique Locations'}: ${stats?.uniqueLocations ?? locations.length} • ${
+        isAr ? 'التسجيلات' : 'Reg Coords'
+      }: ${stats?.totalParsedRegistrationCoords ?? 0} • ${isAr ? 'الخلايا' : 'Network Cells'}: ${
+        stats?.networkCellLocationsCount ?? 0
+      }`;
 
   // Initialize Leaflet map once using same-origin cached OpenStreetMap tile proxy
   useEffect(() => {
@@ -92,13 +106,35 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
     });
 
     let switchedToFallback = false;
+    let fallbackErrorCount = 0;
+
+    primaryTiles.on('loading', () => {
+      setTilesLoading(true);
+    });
+    primaryTiles.on('load', () => {
+      setTilesLoading(false);
+      setTileError(false);
+    });
+    primaryTiles.on('tileload', () => {
+      fallbackErrorCount = 0;
+      setTileError(false);
+    });
     primaryTiles.on('tileerror', () => {
-      if (switchedToFallback) return;
-      switchedToFallback = true;
-      primaryTiles.setUrl('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png');
+      if (!switchedToFallback) {
+        switchedToFallback = true;
+        fallbackErrorCount = 0;
+        primaryTiles.setUrl('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png');
+        return;
+      }
+      fallbackErrorCount++;
+      if (fallbackErrorCount >= 3) {
+        setTilesLoading(false);
+        setTileError(true);
+      }
     });
 
     primaryTiles.addTo(map);
+    tileLayerRef.current = primaryTiles;
     L.control.zoom({ position: isAr ? 'topleft' : 'topright' }).addTo(map);
 
     mapRef.current = map;
@@ -106,9 +142,16 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
     return () => {
       map.remove();
       mapRef.current = null;
+      tileLayerRef.current = null;
       clusterLayerRef.current = null;
       heatLayerRef.current = null;
     };
+  }, []);
+
+  const handleRetryTiles = useCallback(() => {
+    setTileError(false);
+    setTilesLoading(true);
+    tileLayerRef.current?.redraw();
   }, []);
 
   const fitMapBounds = (pts: BtsLocationItem[]) => {
@@ -231,9 +274,11 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
 
   const toggleFullscreen = () => {
     setIsFullscreen(v => !v);
-    setTimeout(() => {
-      mapRef.current?.invalidateSize();
-    }, 180);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        mapRef.current?.invalidateSize();
+      });
+    });
   };
 
   return (
@@ -249,16 +294,20 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
             <MapPin className="w-4 h-4 text-emerald-400" />
             <span>{mapTitle}</span>
           </h2>
-          <p className="text-[11px] text-slate-400 mt-0.5">
-            {isAr ? 'المواقع الفريدة:' : 'Unique Locations:'}{' '}
-            <strong className="text-slate-200">{stats?.uniqueLocations ?? locations.length}</strong> •{' '}
-            {isAr ? 'إحداثيات التسجيلات:' : 'Parsed Reg Coords:'}{' '}
-            <strong className="text-emerald-400">{stats?.totalParsedRegistrationCoords ?? 0}</strong> •{' '}
-            {isAr ? 'خلايا الشبكة:' : 'Network Cells:'}{' '}
-            <strong className="text-blue-400">{stats?.networkCellLocationsCount ?? 0}</strong> •{' '}
-            {isAr ? 'سجلات متجاوزة:' : 'Invalid Skipped:'}{' '}
-            <strong className="text-amber-400">{stats?.invalidSkippedCount ?? 0}</strong>
-          </p>
+          {loading ? (
+            <div className="mt-1 h-3.5 w-72 bg-slate-800 rounded animate-pulse motion-reduce:animate-none" />
+          ) : (
+            <p className="text-[11px] text-slate-400 mt-0.5 tabular-nums">
+              {isAr ? 'المواقع الفريدة:' : 'Unique Locations:'}{' '}
+              <strong className="text-slate-200">{stats?.uniqueLocations ?? locations.length}</strong> •{' '}
+              {isAr ? 'إحداثيات التسجيلات:' : 'Parsed Reg Coords:'}{' '}
+              <strong className="text-emerald-400">{stats?.totalParsedRegistrationCoords ?? 0}</strong> •{' '}
+              {isAr ? 'خلايا الشبكة:' : 'Network Cells:'}{' '}
+              <strong className="text-blue-400">{stats?.networkCellLocationsCount ?? 0}</strong> •{' '}
+              {isAr ? 'سجلات متجاوزة:' : 'Invalid Skipped:'}{' '}
+              <strong className="text-amber-400">{stats?.invalidSkippedCount ?? 0}</strong>
+            </p>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -336,6 +385,18 @@ export const BtsLocationsMap: React.FC<BtsLocationsMapProps> = ({
         }`}
       >
         <div id={mapContainerId} ref={containerRef} className="w-full h-full" />
+
+        <MapStatusOverlay
+          dataLoading={loading}
+          dataRefreshing={refreshing}
+          dataError={error}
+          onRetryData={onRetry}
+          isEmpty={!loading && !error && locations.length === 0}
+          emptyLabel={t('noMapData')}
+          tilesLoading={tilesLoading}
+          tileError={tileError}
+          onRetryTiles={handleRetryTiles}
+        />
 
         {/* Legend Overlay */}
         <div className="absolute bottom-3 start-3 z-[400] flex flex-wrap items-center gap-3 px-3 py-1.5 rounded-lg bg-slate-950/90 border border-slate-800 text-[11px] text-slate-300 shadow-lg">

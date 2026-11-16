@@ -1,6 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useApp } from '../context/AppContext.js';
 import { ImportInspection, ColumnMeta, SqliteInspectedTable } from '../types/index.js';
+import { useAsyncResource } from '../hooks/useAsyncResource.js';
+import { requestCache } from '../utils/requestCache.js';
+import {
+  TopProgressBar,
+  RefreshingBadge,
+  TableSkeletonRows,
+  EmptyStateCard,
+  ErrorRetryCard,
+} from '../components/common/LoadingStates.js';
 import {
   FileUp,
   Database,
@@ -57,7 +66,7 @@ const KNOWN_DEST_TABLES = [
 ];
 
 export const ImportCenter: React.FC = () => {
-  const { t, addNotification, apiFetch, refreshMissions } = useApp();
+  const { t, addNotification, apiFetch, authToken, refreshMissions } = useApp();
 
   // Wizard Step (1 to 7) for Excel/CSV; Multi-table workflow activates automatically for SQLITE
   const [currentStep, setCurrentStep] = useState(1);
@@ -69,7 +78,6 @@ export const ImportCenter: React.FC = () => {
   // Single-Table (Excel / CSV) State
   const [selectedSheetOrTable, setSelectedSheetOrTable] = useState<string>('');
   const [destinationTable, setDestinationTable] = useState<string>('registrations');
-  const [destColumns, setDestColumns] = useState<ColumnMeta[]>([]);
   const [columnMapping, setColumnMapping] = useState<Record<string, string>>({});
   const [importMode, setImportMode] = useState<'INSERT_ONLY' | 'UPDATE_EXISTING' | 'INSERT_OR_UPDATE'>('INSERT_OR_UPDATE');
   const [matchKey] = useState<string>('id');
@@ -86,6 +94,7 @@ export const ImportCenter: React.FC = () => {
 
   // Multi-Table SQLite State
   const [multiConfigs, setMultiConfigs] = useState<Record<string, MultiSqliteConfigState>>({});
+  const [loadingDestTables, setLoadingDestTables] = useState<Record<string, boolean>>({});
   const [estimating, setEstimating] = useState(false);
   const [estimates, setEstimates] = useState<any[] | null>(null);
   const [multiExecuting, setMultiExecuting] = useState(false);
@@ -98,28 +107,43 @@ export const ImportCenter: React.FC = () => {
   } | null>(null);
   const [multiResult, setMultiResult] = useState<any | null>(null);
 
-  // Import History
-  const [history, setHistory] = useState<any[]>([]);
+  // Destination columns via useAsyncResource (AbortController-safe)
+  const destColsRes = useAsyncResource<ColumnMeta[]>(
+    async signal => {
+      const res = await apiFetch(`/api/v1/tables/${destinationTable}?pageSize=1`, { signal });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(json?.error || `Failed to inspect ${destinationTable} columns`);
+      }
+      return Array.isArray(json?.columns) ? json.columns : [];
+    },
+    [destinationTable, authToken],
+    {
+      enabled: Boolean(authToken && destinationTable),
+      cacheKey: `table:columns:meta:${destinationTable}`,
+      keepPreviousData: false,
+    }
+  );
+  const destColumns = destColsRes.data || [];
 
-  const fetchHistory = () => {
-    apiFetch('/api/v1/imports/history')
-      .then(res => res.json())
-      .then(data => setHistory(Array.isArray(data) ? data : []))
-      .catch(() => {});
-  };
-
-  useEffect(() => {
-    fetchHistory();
-  }, []);
-
-  useEffect(() => {
-    apiFetch(`/api/v1/tables/${destinationTable}?pageSize=1`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.columns) setDestColumns(data.columns);
-      })
-      .catch(() => {});
-  }, [destinationTable, apiFetch]);
+  // Import History via useAsyncResource
+  const historyRes = useAsyncResource<any[]>(
+    async signal => {
+      const res = await apiFetch('/api/v1/imports/history', { signal });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(json?.error || 'Failed to load import history');
+      }
+      return Array.isArray(json) ? json : [];
+    },
+    [authToken],
+    {
+      enabled: Boolean(authToken),
+      keepPreviousData: true,
+      isEmpty: data => !data || data.length === 0,
+    }
+  );
+  const history = historyRes.data || [];
 
   const initializeMultiSqliteConfigs = (tables: SqliteInspectedTable[]) => {
     const next: Record<string, MultiSqliteConfigState> = {};
@@ -184,40 +208,66 @@ export const ImportCenter: React.FC = () => {
     }
   };
 
-  const autoMap = (sourceCols: string[]) => {
-    const mapping: Record<string, string> = {};
-    const destNames = destColumns.map(c => c.name);
-    sourceCols.forEach(src => {
-      const normalizedSrc = src.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const match = destNames.find(dst => dst.toLowerCase().replace(/[^a-z0-9]/g, '') === normalizedSrc);
-      if (match) mapping[src] = match;
-    });
-    setColumnMapping(mapping);
-  };
+  const autoMap = useCallback(
+    (sourceCols: string[], colsOverride?: ColumnMeta[]) => {
+      const mapping: Record<string, string> = {};
+      const destNames = (colsOverride || destColumns).map(c => c.name);
+      sourceCols.forEach(src => {
+        const normalizedSrc = src.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const match = destNames.find(dst => dst.toLowerCase().replace(/[^a-z0-9]/g, '') === normalizedSrc);
+        if (match) mapping[src] = match;
+      });
+      setColumnMapping(mapping);
+    },
+    [destColumns]
+  );
+
+  // Re-run autoMap cleanly once new destination table columns finish loading
+  useEffect(() => {
+    if (!inspection || inspection.type === 'SQLITE' || destColumns.length === 0) return;
+    if (currentStep === 3 || currentStep === 4) {
+      let srcCols: string[] = [];
+      if (inspection.type === 'EXCEL' && inspection.sheets) {
+        srcCols = inspection.sheets.find(x => x.sheetName === selectedSheetOrTable)?.columns || [];
+      } else if (inspection.columns) {
+        srcCols = inspection.columns;
+      }
+      autoMap(srcCols, destColumns);
+    }
+  }, [destColumns, currentStep, inspection, selectedSheetOrTable, autoMap]);
 
   const handleMultiDestChange = async (sourceTable: string, newDest: string) => {
-    const res = await apiFetch(`/api/v1/tables/${newDest}?pageSize=1`);
-    const json = res.ok ? await res.json() : { columns: [] };
-    const cols: ColumnMeta[] = json.columns || [];
-    const srcCols = inspection?.tables?.find(x => x.tableName === sourceTable)?.columns.map(c => c.name) || [];
+    setLoadingDestTables(prev => ({ ...prev, [sourceTable]: true }));
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch(`/api/v1/tables/${newDest}?pageSize=1`);
+      const json = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(json?.error || `Failed to inspect ${newDest} schema`);
+      const cols: ColumnMeta[] = json?.columns || [];
+      const srcCols = inspection?.tables?.find(x => x.tableName === sourceTable)?.columns.map(c => c.name) || [];
 
-    const mapping: Record<string, string> = {};
-    srcCols.forEach(src => {
-      const n = src.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const found = cols.find(d => d.name.toLowerCase().replace(/[^a-z0-9]/g, '') === n);
-      if (found) mapping[src] = found.name;
-    });
+      const mapping: Record<string, string> = {};
+      srcCols.forEach(src => {
+        const n = src.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const found = cols.find(d => d.name.toLowerCase().replace(/[^a-z0-9]/g, '') === n);
+        if (found) mapping[src] = found.name;
+      });
 
-    setMultiConfigs(prev => ({
-      ...prev,
-      [sourceTable]: {
-        ...prev[sourceTable],
-        destinationTable: newDest,
-        destColumns: cols,
-        columnMapping: mapping,
-      },
-    }));
-    setEstimates(null);
+      setMultiConfigs(prev => ({
+        ...prev,
+        [sourceTable]: {
+          ...prev[sourceTable],
+          destinationTable: newDest,
+          destColumns: cols,
+          columnMapping: mapping,
+        },
+      }));
+      setEstimates(null);
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Failed to load target table schema');
+    } finally {
+      setLoadingDestTables(prev => ({ ...prev, [sourceTable]: false }));
+    }
   };
 
   const setAllMultiSelected = (selected: boolean) => {
@@ -325,7 +375,8 @@ export const ImportCenter: React.FC = () => {
       if (!res.ok) throw new Error(json.error || 'Multi-table SQLite import failed');
 
       setMultiResult(json);
-      fetchHistory();
+      requestCache.clear();
+      historyRes.reload({ force: true });
       refreshMissions();
       const wasCancelled = json.status === 'CANCELLED' || json.tableResults?.some((r: any) => r.status === 'CANCELLED');
       addNotification({
@@ -403,7 +454,8 @@ export const ImportCenter: React.FC = () => {
         message: `Imported ${json.result.inserted} rows to ${destinationTable}`,
         type: 'success',
       });
-      fetchHistory();
+      requestCache.clear();
+      historyRes.reload({ force: true });
       refreshMissions();
     } catch (err: any) {
       setErrorMsg(err.message);
@@ -534,9 +586,9 @@ export const ImportCenter: React.FC = () => {
                   )}
                 </div>
                 {uploading && (
-                  <div className="flex items-center gap-2 text-xs text-indigo-400 font-semibold animate-pulse">
+                  <div className="flex items-center gap-2 text-xs text-indigo-400 font-semibold animate-pulse motion-reduce:animate-none">
                     <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Inspecting schema structure and sample rows...</span>
+                    <span>{t('uploadInProgress')} &mdash; Inspecting schema structure and sample rows...</span>
                   </div>
                 )}
               </div>
@@ -721,10 +773,14 @@ export const ImportCenter: React.FC = () => {
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2">
+                        {loadingDestTables[tb.tableName] && (
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                        )}
                         <select
+                          disabled={Boolean(loadingDestTables[tb.tableName])}
                           value={cfg.destinationTable}
                           onChange={e => handleMultiDestChange(tb.tableName, e.target.value)}
-                          className="h-8 px-2 text-xs bg-slate-900 border border-slate-700 rounded-lg text-slate-200"
+                          className="h-8 px-2 text-xs bg-slate-900 border border-slate-700 rounded-lg text-slate-200 disabled:opacity-60"
                         >
                           {KNOWN_DEST_TABLES.map(dt => (
                             <option key={dt} value={dt}>
@@ -1003,13 +1059,18 @@ export const ImportCenter: React.FC = () => {
           <div className="space-y-4">
             <h2 className="text-sm font-bold text-slate-200">{t('step3Target')}</h2>
             <div className="space-y-2">
-              <label className="text-xs text-slate-400 font-semibold uppercase">{t('selectDestinationTable')}</label>
+              <div className="flex items-center justify-between">
+                <label className="text-xs text-slate-400 font-semibold uppercase">{t('selectDestinationTable')}</label>
+                {destColsRes.isLoading && (
+                  <span className="inline-flex items-center gap-1.5 text-[11px] text-indigo-300">
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                    <span>{t('loadingSchema')}</span>
+                  </span>
+                )}
+              </div>
               <select
                 value={destinationTable}
-                onChange={e => {
-                  setDestinationTable(e.target.value);
-                  setTimeout(() => autoMap(getSourceColumns()), 200);
-                }}
+                onChange={e => setDestinationTable(e.target.value)}
                 className="w-full h-10 px-3 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-indigo-500"
               >
                 {KNOWN_DEST_TABLES.map(dt => (
@@ -1020,18 +1081,24 @@ export const ImportCenter: React.FC = () => {
               </select>
             </div>
 
+            {destColsRes.isError && (
+              <ErrorRetryCard compact message={destColsRes.error} onRetry={() => destColsRes.reload({ force: true })} />
+            )}
+
             <div className="flex justify-between pt-4 border-t border-slate-800">
-              <button onClick={() => setCurrentStep(2)} className="px-4 py-2 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">
+              <button type="button" onClick={() => setCurrentStep(2)} className="px-4 py-2 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">
                 Back
               </button>
               <button
+                type="button"
+                disabled={destColsRes.isLoading}
                 onClick={() => {
                   autoMap(getSourceColumns());
                   setCurrentStep(4);
                 }}
-                className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white"
+                className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50"
               >
-                <span>Continue</span>
+                <span>{destColsRes.isLoading ? t('loadingSchema') : 'Continue'}</span>
                 <ArrowRight className="w-4 h-4 rtl:rotate-180" />
               </button>
             </div>
@@ -1062,11 +1129,12 @@ export const ImportCenter: React.FC = () => {
                   </div>
                   <div className="w-1/2">
                     <select
+                      disabled={destColsRes.isLoading}
                       value={columnMapping[srcCol] || ''}
                       onChange={e => setColumnMapping({ ...columnMapping, [srcCol]: e.target.value })}
-                      className="w-full h-8 px-2 text-xs bg-slate-900 border border-slate-700 rounded-lg text-slate-200"
+                      className="w-full h-8 px-2 text-xs bg-slate-900 border border-slate-700 rounded-lg text-slate-200 disabled:opacity-60"
                     >
-                      <option value="">{t('ignoreColumn')}</option>
+                      <option value="">{destColsRes.isLoading ? t('loadingSchema') : t('ignoreColumn')}</option>
                       {destColumns.map(dc => (
                         <option key={dc.name} value={dc.name}>
                           {dc.name} ({dc.type})
@@ -1268,47 +1336,74 @@ export const ImportCenter: React.FC = () => {
       </div>
 
       {/* Previous Import History Table */}
-      <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm space-y-3">
-        <h2 className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
-          <Clock className="w-4 h-4 text-indigo-400" />
-          <span>{t('recentImports')}</span>
-        </h2>
+      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-sm">
+        <TopProgressBar active={historyRes.isLoading || historyRes.isRefreshing} label={t('updatingTable')} />
+        <div className="p-4 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
+              <Clock className="w-4 h-4 text-indigo-400" />
+              <span>{t('recentImports')}</span>
+              {historyRes.isRefreshing && <RefreshingBadge />}
+            </h2>
+            <button
+              type="button"
+              disabled={historyRes.isLoading || historyRes.isRefreshing}
+              onClick={() => historyRes.reload({ force: true })}
+              className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 border border-slate-800 disabled:opacity-50"
+              title={t('refresh')}
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${historyRes.isLoading || historyRes.isRefreshing ? 'animate-spin text-indigo-400' : ''}`} />
+            </button>
+          </div>
 
-        <div className="overflow-x-auto rounded-lg border border-slate-800">
-          <table className="w-full text-left rtl:text-right text-xs">
-            <thead className="bg-slate-950/60 text-slate-400 border-b border-slate-800 text-[11px] uppercase">
-              <tr>
-                <th className="px-4 py-2.5">Date</th>
-                <th className="px-4 py-2.5">Filename</th>
-                <th className="px-4 py-2.5">Destination Table</th>
-                <th className="px-4 py-2.5">Inserted</th>
-                <th className="px-4 py-2.5">Updated</th>
-                <th className="px-4 py-2.5">Skipped</th>
-                <th className="px-4 py-2.5">Errors</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800/60 text-slate-300">
-              {history.length === 0 ? (
+          <div className="overflow-x-auto rounded-lg border border-slate-800">
+            <table className="w-full text-left rtl:text-right text-xs">
+              <thead className="bg-slate-950/60 text-slate-400 border-b border-slate-800 text-[11px] uppercase">
                 <tr>
-                  <td colSpan={7} className="px-4 py-6 text-center text-slate-500">
-                    No import history records found
-                  </td>
+                  <th className="px-4 py-2.5">Date</th>
+                  <th className="px-4 py-2.5">Filename</th>
+                  <th className="px-4 py-2.5">Destination Table</th>
+                  <th className="px-4 py-2.5">Inserted</th>
+                  <th className="px-4 py-2.5">Updated</th>
+                  <th className="px-4 py-2.5">Skipped</th>
+                  <th className="px-4 py-2.5">Errors</th>
                 </tr>
-              ) : (
-                history.map((h, i) => (
-                  <tr key={i} className="hover:bg-slate-800/40">
-                    <td className="px-4 py-2.5 font-mono text-[11px]">{new Date(h.created_at).toLocaleString()}</td>
-                    <td className="px-4 py-2.5 font-medium text-slate-200">{h.filename}</td>
-                    <td className="px-4 py-2.5 font-mono text-indigo-400">{h.destination_table}</td>
-                    <td className="px-4 py-2.5 text-emerald-400 font-mono">{h.inserted_count}</td>
-                    <td className="px-4 py-2.5 text-sky-400 font-mono">{h.updated_count}</td>
-                    <td className="px-4 py-2.5 font-mono text-slate-400">{h.skipped_count}</td>
-                    <td className="px-4 py-2.5 text-rose-400 font-mono">{h.error_count}</td>
+              </thead>
+              <tbody
+                className={`divide-y divide-slate-800/60 text-slate-300 transition-opacity ${
+                  historyRes.isRefreshing ? 'opacity-60' : 'opacity-100'
+                }`}
+              >
+                {historyRes.isLoading && !historyRes.data ? (
+                  <TableSkeletonRows columns={7} rows={4} />
+                ) : historyRes.isError && !historyRes.data ? (
+                  <tr>
+                    <td colSpan={7} className="p-4">
+                      <ErrorRetryCard message={historyRes.error} onRetry={() => historyRes.reload({ force: true })} />
+                    </td>
                   </tr>
-                ))
-              )}
-            </tbody>
-          </table>
+                ) : history.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="p-4">
+                      <EmptyStateCard title={t('noRecordsTitle')} description="No import history records found" />
+                    </td>
+                  </tr>
+                ) : (
+                  history.map((h, i) => (
+                    <tr key={h.id || i} className="hover:bg-slate-800/40">
+                      <td className="px-4 py-2.5 font-mono text-[11px]">{new Date(h.created_at).toLocaleString()}</td>
+                      <td className="px-4 py-2.5 font-medium text-slate-200">{h.filename}</td>
+                      <td className="px-4 py-2.5 font-mono text-indigo-400">{h.destination_table}</td>
+                      <td className="px-4 py-2.5 text-emerald-400 font-mono tabular-nums">{h.inserted_count}</td>
+                      <td className="px-4 py-2.5 text-sky-400 font-mono tabular-nums">{h.updated_count}</td>
+                      <td className="px-4 py-2.5 font-mono tabular-nums text-slate-400">{h.skipped_count}</td>
+                      <td className="px-4 py-2.5 text-rose-400 font-mono tabular-nums">{h.error_count}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>

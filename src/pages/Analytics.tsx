@@ -1,5 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext.js';
+import { useAsyncResource } from '../hooks/useAsyncResource.js';
+import {
+  TopProgressBar,
+  RefreshingBadge,
+  ChartSkeleton,
+  EmptyStateCard,
+  ErrorRetryCard,
+} from '../components/common/LoadingStates.js';
 import {
   BarChart,
   Bar,
@@ -20,15 +28,12 @@ import {
 import {
   BarChart3,
   Play,
-  Download,
   SlidersHorizontal,
-  Table as TableIcon,
   RefreshCw,
-  Sparkles,
 } from 'lucide-react';
 
 export const Analytics: React.FC = () => {
-  const { activeMission, apiFetch, authToken } = useApp();
+  const { t, activeMission, apiFetch, authToken } = useApp();
 
   const [table, setTable] = useState('registrations');
   const [dimensionCol, setDimensionCol] = useState('country');
@@ -37,81 +42,87 @@ export const Analytics: React.FC = () => {
   const [chartType, setChartType] = useState<'bar' | 'line' | 'pie' | 'area'>('bar');
   const [limit, setLimit] = useState(15);
 
-  const [availableColumns, setAvailableColumns] = useState<string[]>([]);
-  const [chartData, setChartData] = useState<any[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // Fetch columns for selected table safely
+  const columnsRes = useAsyncResource<string[]>(
+    async signal => {
+      const res = await apiFetch(`/api/v1/tables/${table}?pageSize=1`, { signal });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(json?.error || `Failed to inspect ${table} columns`);
+      }
+      return Array.isArray(json?.columns) ? json.columns.map((c: any) => c.name) : [];
+    },
+    [table, authToken],
+    {
+      enabled: Boolean(authToken),
+      cacheKey: `table:columns:${table}`,
+      keepPreviousData: false,
+    }
+  );
 
-  // Fetch columns for selected table
-  useEffect(() => {
-    if (!authToken) return;
-    apiFetch(`/api/v1/tables/${table}?pageSize=1`)
-      .then(r => (r.ok ? r.json() : null))
-      .then(res => {
-        if (res?.columns && Array.isArray(res.columns)) {
-          const names = res.columns.map((c: any) => c.name);
-          setAvailableColumns(names);
-          if (!names.includes(dimensionCol)) {
-            setDimensionCol(names[0] || 'id');
-          }
-        }
-      })
-      .catch(() => {});
-  }, [table, authToken]);
-
-  // Execute Dynamic Analytics Query
-  const executeQuery = () => {
-    if (!authToken) return;
-    setLoading(true);
-    setError(null);
-
-    apiFetch('/api/v1/analytics/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        table,
-        dimensionCol,
-        metricCol: metricCol || undefined,
-        aggregation,
-        mission: activeMission,
-        limit,
-      }),
-    })
-      .then(async res => {
-        if (!res.ok) {
-          const json = await res.json();
-          throw new Error(json.error || 'Query failed');
-        }
-        return res.json();
-      })
-      .then(data => {
-        setChartData(data || []);
-      })
-      .catch(err => {
-        setError(err.message);
-        setChartData([]);
-      })
-      .finally(() => setLoading(false));
-  };
+  const availableColumns = columnsRes.data || [];
 
   useEffect(() => {
-    if (!authToken) return;
-    executeQuery();
-  }, [table, dimensionCol, aggregation, activeMission, limit, authToken]);
+    if (availableColumns.length > 0 && !availableColumns.includes(dimensionCol)) {
+      setDimensionCol(availableColumns[0] || 'id');
+    }
+  }, [availableColumns, dimensionCol]);
+
+  const queryReady = Boolean(
+    authToken &&
+      !columnsRes.isLoading &&
+      (availableColumns.length === 0 || availableColumns.includes(dimensionCol))
+  );
+
+  const queryRes = useAsyncResource<any[]>(
+    async signal => {
+      const res = await apiFetch('/api/v1/analytics/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          table,
+          dimensionCol,
+          metricCol: metricCol || undefined,
+          aggregation,
+          mission: activeMission,
+          limit,
+        }),
+        signal,
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(json?.error || 'Query failed');
+      }
+      return Array.isArray(json) ? json : [];
+    },
+    [table, dimensionCol, metricCol, aggregation, activeMission, limit, authToken, queryReady],
+    {
+      enabled: queryReady,
+      keepPreviousData: true,
+      isEmpty: data => !data || data.length === 0,
+    }
+  );
+
+  const chartData = queryRes.data || [];
+  const isInitialChartLoad = (queryRes.isLoading && !queryRes.data) || columnsRes.isLoading;
+  const isRefreshingChart = queryRes.isRefreshing || (queryRes.isLoading && Boolean(queryRes.data));
 
   const COLORS = ['#6366f1', '#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#06b6d4', '#14b8a6', '#f43f5e'];
 
   return (
     <div className="space-y-6">
       {/* Title */}
-      <div>
-        <h1 className="text-xl font-bold text-slate-100 flex items-center gap-2">
-          <BarChart3 className="w-5 h-5 text-indigo-400" />
-          <span>Dynamic Mission Analytics & Custom Chart Studio</span>
-        </h1>
-        <p className="text-xs text-slate-400 mt-0.5">
-          Build multi-dimensional queries, aggregate metrics, and visualize distributions across PostgreSQL tables.
-        </p>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-bold text-slate-100 flex items-center gap-2 flex-wrap">
+            <BarChart3 className="w-5 h-5 text-indigo-400" />
+            <span>Dynamic Mission Analytics &amp; Custom Chart Studio</span>
+            {isRefreshingChart && <RefreshingBadge />}
+          </h1>
+          <p className="text-xs text-slate-400 mt-0.5">
+            Build multi-dimensional queries, aggregate metrics, and visualize distributions across PostgreSQL tables.
+          </p>
+        </div>
       </div>
 
       {/* Query Builder Control Panel */}
@@ -119,15 +130,20 @@ export const Analytics: React.FC = () => {
         <div className="flex items-center justify-between pb-3 border-b border-slate-800">
           <span className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
             <SlidersHorizontal className="w-4 h-4 text-indigo-400" />
-            <span>Aggregation & Dimension Configurator</span>
+            <span>Aggregation &amp; Dimension Configurator</span>
           </span>
           <button
-            onClick={executeQuery}
-            disabled={loading}
+            type="button"
+            onClick={() => queryRes.reload({ force: true })}
+            disabled={isInitialChartLoad || isRefreshingChart}
             className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white shadow-sm shadow-indigo-600/30 disabled:opacity-50 transition-colors"
           >
-            <Play className="w-3.5 h-3.5 fill-current" />
-            <span>{loading ? 'Executing Query...' : 'Run Analysis'}</span>
+            {isInitialChartLoad || isRefreshingChart ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Play className="w-3.5 h-3.5 fill-current" />
+            )}
+            <span>{isInitialChartLoad || isRefreshingChart ? 'Executing Query...' : 'Run Analysis'}</span>
           </button>
         </div>
 
@@ -155,17 +171,27 @@ export const Analytics: React.FC = () => {
 
           {/* Grouping Dimension */}
           <div className="space-y-1">
-            <label className="text-[11px] font-semibold text-slate-400">Grouping Dimension</label>
+            <label className="text-[11px] font-semibold text-slate-400 flex items-center justify-between">
+              <span>Grouping Dimension</span>
+              {columnsRes.isLoading && <RefreshCw className="w-3 h-3 animate-spin text-indigo-400" />}
+            </label>
             <select
+              disabled={columnsRes.isLoading || columnsRes.isError}
               value={dimensionCol}
               onChange={e => setDimensionCol(e.target.value)}
-              className="w-full h-9 px-2.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
+              className="w-full h-9 px-2.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-indigo-500 font-mono disabled:opacity-60"
             >
-              {availableColumns.map(col => (
-                <option key={col} value={col}>
-                  {col}
-                </option>
-              ))}
+              {columnsRes.isLoading ? (
+                <option value="">{t('loadingOptions')}</option>
+              ) : availableColumns.length === 0 ? (
+                <option value="">{t('dropdownUnavailable')}</option>
+              ) : (
+                availableColumns.map(col => (
+                  <option key={col} value={col}>
+                    {col}
+                  </option>
+                ))
+              )}
             </select>
           </div>
 
@@ -218,86 +244,96 @@ export const Analytics: React.FC = () => {
         </div>
       </div>
 
-      {/* Error alert */}
-      {error && (
-        <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-xs text-rose-300">
-          {error}
-        </div>
+      {columnsRes.isError && (
+        <ErrorRetryCard compact message={columnsRes.error} onRetry={() => columnsRes.reload({ force: true })} />
       )}
 
       {/* Chart Canvas */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-sm space-y-4">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-bold text-slate-200">
-            Distribution of {aggregation}({table}) grouped by {dimensionCol}
-          </span>
-          <span className="text-[11px] text-slate-400">
-            {chartData.length} distinct groups returned
-          </span>
-        </div>
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-sm">
+        <TopProgressBar active={isInitialChartLoad || isRefreshingChart} label={t('refreshingData')} />
+        <div className="p-6 space-y-4">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-bold text-slate-200">
+              Distribution of {aggregation}({table}) grouped by {dimensionCol}
+            </span>
+            {!isInitialChartLoad && !queryRes.isError && (
+              <span className="text-[11px] text-slate-400 tabular-nums">
+                {chartData.length} distinct groups returned
+              </span>
+            )}
+          </div>
 
-        <div className="h-96 w-full">
-          {loading ? (
-            <div className="w-full h-full flex items-center justify-center text-xs text-slate-500 gap-2">
-              <RefreshCw className="w-4 h-4 animate-spin text-indigo-400" />
-              <span>Computing SQL aggregations...</span>
-            </div>
-          ) : chartData.length === 0 ? (
-            <div className="w-full h-full flex items-center justify-center text-xs text-slate-500">
-              No aggregated records returned for this combination.
-            </div>
-          ) : chartType === 'bar' ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData} margin={{ top: 20, right: 30, left: 10, bottom: 40 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                <XAxis dataKey="dimension" stroke="#64748b" fontSize={11} angle={-25} textAnchor="end" />
-                <YAxis stroke="#64748b" fontSize={11} />
-                <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '11px' }} />
-                <Bar dataKey="value" name={aggregation} fill="#6366f1" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          ) : chartType === 'line' ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={chartData} margin={{ top: 20, right: 30, left: 10, bottom: 40 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                <XAxis dataKey="dimension" stroke="#64748b" fontSize={11} angle={-25} textAnchor="end" />
-                <YAxis stroke="#64748b" fontSize={11} />
-                <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '11px' }} />
-                <Line type="monotone" dataKey="value" stroke="#10b981" strokeWidth={2} dot={{ r: 4 }} />
-              </LineChart>
-            </ResponsiveContainer>
-          ) : chartType === 'area' ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 20, right: 30, left: 10, bottom: 40 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                <XAxis dataKey="dimension" stroke="#64748b" fontSize={11} angle={-25} textAnchor="end" />
-                <YAxis stroke="#64748b" fontSize={11} />
-                <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '11px' }} />
-                <Area type="monotone" dataKey="value" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.2} />
-              </AreaChart>
-            </ResponsiveContainer>
-          ) : (
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie
-                  data={chartData}
-                  dataKey="value"
-                  nameKey="dimension"
-                  cx="50%"
-                  cy="50%"
-                  outerRadius={120}
-                  innerRadius={60}
-                  paddingAngle={3}
-                >
-                  {chartData.map((_, index) => (
-                    <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                  ))}
-                </Pie>
-                <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '11px' }} />
-                <Legend wrapperStyle={{ fontSize: '11px' }} />
-              </PieChart>
-            </ResponsiveContainer>
-          )}
+          <div className="h-96 w-full">
+            {isInitialChartLoad ? (
+              <ChartSkeleton
+                variant={chartType === 'pie' ? 'pie' : chartType === 'area' || chartType === 'line' ? 'area' : 'bar'}
+                heightClass="h-96"
+              />
+            ) : queryRes.isError && !queryRes.data ? (
+              <ErrorRetryCard
+                message={queryRes.error}
+                onRetry={() => queryRes.reload({ force: true })}
+                className="h-full"
+              />
+            ) : chartData.length === 0 ? (
+              <EmptyStateCard
+                title={t('noChartData')}
+                description="No aggregated records returned for this combination."
+                className="h-full"
+              />
+            ) : chartType === 'bar' ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartData} margin={{ top: 20, right: 30, left: 10, bottom: 40 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                  <XAxis dataKey="dimension" stroke="#64748b" fontSize={11} angle={-25} textAnchor="end" />
+                  <YAxis stroke="#64748b" fontSize={11} />
+                  <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '11px' }} />
+                  <Bar dataKey="value" name={aggregation} fill="#6366f1" radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            ) : chartType === 'line' ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={chartData} margin={{ top: 20, right: 30, left: 10, bottom: 40 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                  <XAxis dataKey="dimension" stroke="#64748b" fontSize={11} angle={-25} textAnchor="end" />
+                  <YAxis stroke="#64748b" fontSize={11} />
+                  <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '11px' }} />
+                  <Line type="monotone" dataKey="value" stroke="#10b981" strokeWidth={2} dot={{ r: 4 }} />
+                </LineChart>
+              </ResponsiveContainer>
+            ) : chartType === 'area' ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={chartData} margin={{ top: 20, right: 30, left: 10, bottom: 40 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                  <XAxis dataKey="dimension" stroke="#64748b" fontSize={11} angle={-25} textAnchor="end" />
+                  <YAxis stroke="#64748b" fontSize={11} />
+                  <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '11px' }} />
+                  <Area type="monotone" dataKey="value" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.2} />
+                </AreaChart>
+              </ResponsiveContainer>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={chartData}
+                    dataKey="value"
+                    nameKey="dimension"
+                    cx="50%"
+                    cy="50%"
+                    outerRadius={120}
+                    innerRadius={60}
+                    paddingAngle={3}
+                  >
+                    {chartData.map((_, index) => (
+                      <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                    ))}
+                  </Pie>
+                  <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '11px' }} />
+                  <Legend wrapperStyle={{ fontSize: '11px' }} />
+                </PieChart>
+              </ResponsiveContainer>
+            )}
+          </div>
         </div>
       </div>
     </div>

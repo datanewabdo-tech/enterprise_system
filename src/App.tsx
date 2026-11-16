@@ -16,6 +16,7 @@ import { BackupRecovery } from './pages/BackupRecovery.js';
 import { SystemHealth } from './pages/SystemHealth.js';
 import { Settings } from './pages/Settings.js';
 import { TableView } from './pages/TableView.js';
+import { PageLoadingScreen, ErrorRetryCard } from './components/common/LoadingStates.js';
 
 // Table Configuration Metadata for all 23 Tables
 const TABLE_CONFIGS: Record<string, { title: string; description: string }> = {
@@ -114,10 +115,24 @@ const TABLE_CONFIGS: Record<string, { title: string; description: string }> = {
 };
 
 const MainLayout: React.FC = () => {
+  const { authToken, authLoading, authError, retryAuth, t } = useApp();
   const [currentPage, setCurrentPage] = useState<string>('dashboard');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   const renderCurrentPage = () => {
+    if (!authToken) {
+      if (authError) {
+        return (
+          <div className="py-12 max-w-lg mx-auto">
+            <ErrorRetryCard message={authError} onRetry={retryAuth} />
+          </div>
+        );
+      }
+      if (authLoading) {
+        return <PageLoadingScreen message={t('initializingSession')} />;
+      }
+    }
+
     switch (currentPage) {
       case 'dashboard':
         return <Dashboard onNavigate={setCurrentPage} />;
@@ -144,10 +159,11 @@ const MainLayout: React.FC = () => {
       case 'settings':
         return <Settings />;
       default:
-        // Render Dedicated Table View for any of the 23 tables
+        // Render Dedicated Table View for any of the 23 tables (keyed by tableId to avoid stale flash)
         if (TABLE_CONFIGS[currentPage]) {
           return (
             <TableView
+              key={currentPage}
               tableId={currentPage}
               title={TABLE_CONFIGS[currentPage].title}
               description={TABLE_CONFIGS[currentPage].description}
