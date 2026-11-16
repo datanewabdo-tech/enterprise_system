@@ -164,10 +164,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
       {/* Sidebar Container */}
       <aside
-        className={`fixed top-0 bottom-0 start-0 z-50 flex flex-col w-72 bg-slate-900 ltr:border-r rtl:border-l border-slate-800 text-slate-200 transition-transform duration-300 ease-in-out lg:translate-x-0 ${
+        className={`fixed top-0 bottom-0 start-0 z-50 flex flex-col w-72 bg-slate-900 ltr:border-r rtl:border-l border-slate-800 text-slate-200 transition-transform duration-300 ease-in-out ${
           isOpenMobile
             ? 'translate-x-0'
-            : 'ltr:-translate-x-full rtl:translate-x-full lg:translate-x-0'
+            : 'max-lg:ltr:-translate-x-full max-lg:rtl:translate-x-full lg:translate-x-0'
         }`}
       >
         {/* Brand Header */}
