@@ -20,6 +20,7 @@ export type ChartExportTargetId =
   | 'networkCellsByMcc'
   | 'militaryNetworks'
   | 'civilianNetworks'
+  | 'mobileNetworksMccMnc'
   | 'btsMap';
 
 interface ChartExportMenuProps {
@@ -72,6 +73,8 @@ export const ChartExportMenu: React.FC<ChartExportMenuProps> = ({
     bsic: filters.bsic || undefined,
     pci: filters.pci || undefined,
     plmnQuery: filters.plmnQuery || undefined,
+    operator: filters.operator || undefined,
+    networkCategory: filters.networkCategory || undefined,
   });
 
   const capturePng = async (): Promise<string | null> => {

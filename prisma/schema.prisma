@@ -595,3 +595,48 @@ model AppSetting {
 
   @@map("app_settings")
 }
+
+model ImportBatch {
+  id               Int            @id @default(autoincrement())
+  batchId          String         @unique @map("batch_id")
+  filename         String
+  fileType         String         @map("file_type")
+  destinationTable String?        @map("destination_table")
+  importMode       String         @map("import_mode")
+  matchKey         String         @map("match_key")
+  totalProcessed   Int            @default(0) @map("total_processed")
+  insertedCount    Int            @default(0) @map("inserted_count")
+  updatedCount     Int            @default(0) @map("updated_count")
+  skippedCount     Int            @default(0) @map("skipped_count")
+  errorCount       Int            @default(0) @map("error_count")
+  errorLog         String?        @map("error_log")
+  status           String         @default("IN_PROGRESS")
+  undoStatus       String         @default("NOT_UNDONE") @map("undo_status")
+  userId           Int?           @map("user_id")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  completedAt      DateTime?      @map("completed_at")
+
+  changes          ImportChange[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([userId])
+  @@map("import_batches")
+}
+
+model ImportChange {
+  id         Int         @id @default(autoincrement())
+  batchId    String      @map("batch_id")
+  tableName  String      @map("table_name")
+  recordId   String      @map("record_id")
+  operation  String
+  beforeData Json?       @map("before_data")
+  afterData  Json?       @map("after_data")
+  createdAt  DateTime    @default(now()) @map("created_at")
+
+  batch      ImportBatch @relation(fields: [batchId], references: [batchId], onDelete: Cascade)
+
+  @@index([batchId])
+  @@index([tableName, recordId])
+  @@map("import_changes")
+}

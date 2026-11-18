@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext.js';
+import { ErrorRetryCard } from '../components/common/LoadingStates.js';
 import {
   FileDown,
   FileSpreadsheet,
@@ -8,64 +9,74 @@ import {
   Layers,
   ShieldCheck,
   CheckCircle2,
+  RefreshCw,
 } from 'lucide-react';
 
 export const ExportCenter: React.FC = () => {
-  const { t, activeMission, missions, authToken } = useApp();
+  const { t, activeMission, missions, missionsLoading, missionsError, refreshMissions, apiFetch } = useApp();
 
   const [selectedTable, setSelectedTable] = useState('registrations');
   const [selectedFormat, setSelectedFormat] = useState<'xlsx' | 'csv' | 'json' | 'geojson'>('xlsx');
   const [selectedMission, setSelectedMission] = useState(activeMission);
   const [downloading, setDownloading] = useState(false);
   const [successNotice, setSuccessNotice] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const tables = [
-    { id: 'missions', label: 'missions (Field Missions)' },
-    { id: 'registrations', label: 'registrations (Device Telemetry)' },
-    { id: 'targets', label: 'targets (Monitored Targets)' },
+    { id: 'missions', label: `${t('missionsField')} (Field Missions)` },
+    { id: 'registrations', label: `${t('registrationsField')} (Device Telemetry)` },
+    { id: 'targets', label: `${t('targetsField')} (Monitored Targets)` },
     { id: 'network_cells', label: 'network_cells (Cellular Antennas & Sectors)' },
-    { id: 'gps_history', label: 'gps_history (GPS Locations & Power Logs)' },
-    { id: 'wifi_access_points', label: 'wifi_access_points (WiFi SSIDs & BSSIDs)' },
+    { id: 'gps_history', label: `${t('gpsHistoryField')} (GPS Locations & Power Logs)` },
+    { id: 'wifi_access_points', label: `${t('wifiAccessPointsField')} (WiFi SSIDs & BSSIDs)` },
     { id: 'wifi_access_point_clients', label: 'wifi_access_point_clients (WiFi Connected MACs)' },
-    { id: 'map_cells', label: 'map_cells (Base Station Coordinate Database)' },
-    { id: 'plmn_storage', label: 'plmn_storage (Mobile Country & Network Codes)' },
-    { id: 'sms_calls', label: 'sms_calls (Intercept Logs)' },
+    { id: 'map_cells', label: `${t('mapCellsField')} (Base Station Coordinate Database)` },
+    { id: 'plmn_storage', label: `${t('plmnStorageField')} (Mobile Country & Network Codes)` },
+    { id: 'sms_calls', label: `${t('smsCallsField')} (Intercept Logs)` },
     { id: 'map_user_markers', label: 'map_user_markers (Tactical Map Pins)' },
     { id: 'map_user_polygons', label: 'map_user_polygons (Perimeter Boundaries)' },
     { id: 'map_user_circles', label: 'map_user_circles (Exclusion Radii)' },
     { id: 'whitelist_targets', label: 'whitelist_targets (Authorized Assets)' },
-    { id: 'tac_numbers', label: 'tac_numbers (Type Allocation Codes)' },
+    { id: 'tac_numbers', label: `${t('tacNumbersField')} (Type Allocation Codes)` },
     { id: 'audit_logs', label: 'audit_logs (Security & Audit Trail)' },
   ];
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     setDownloading(true);
     setSuccessNotice(false);
+    setErrorMsg(null);
 
-    const params = new URLSearchParams({
-      table: selectedTable,
-      format: selectedFormat,
-    });
-    if (selectedMission && selectedMission !== 'ALL') {
-      params.append('mission', selectedMission);
-    }
-    if (authToken) {
-      params.append('token', authToken);
-    }
+    try {
+      const params = new URLSearchParams({
+        table: selectedTable,
+        format: selectedFormat,
+      });
+      if (selectedMission && selectedMission !== 'ALL') {
+        params.append('mission', selectedMission);
+      }
 
-    const downloadUrl = `/api/v1/exports/download?${params.toString()}`;
-    const link = document.createElement('a');
-    link.href = downloadUrl;
-    link.download = `${selectedTable}_export.${selectedFormat}`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
+      const res = await apiFetch(`/api/v1/exports/download?${params.toString()}`);
+      if (!res.ok) {
+        const json = await res.json().catch(() => null);
+        throw new Error(json?.error || `Export failed (${res.status})`);
+      }
 
-    setTimeout(() => {
-      setDownloading(false);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${selectedTable}_export.${selectedFormat}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+
       setSuccessNotice(true);
-      setTimeout(() => setSuccessNotice(false), 4000);
-    }, 800);
+    } catch (err: any) {
+      setErrorMsg(err?.message || t('exportFailedMsg'));
+    } finally {
+      setDownloading(false);
+    }
   };
 
   return (
@@ -106,10 +117,10 @@ export const ExportCenter: React.FC = () => {
           </label>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             {[
-              { id: 'xlsx', label: 'Excel (.xlsx)', desc: 'Full formatting & headers', icon: FileSpreadsheet, color: 'text-emerald-400' },
-              { id: 'csv', label: 'CSV (.csv)', desc: 'Universal raw tabular', icon: Download, color: 'text-sky-400' },
-              { id: 'json', label: 'JSON (.json)', desc: 'REST structured payloads', icon: Database, color: 'text-amber-400' },
-              { id: 'geojson', label: 'GeoJSON (.geojson)', desc: 'GIS & spatial layers', icon: Layers, color: 'text-purple-400' },
+              { id: 'xlsx', label: 'Excel (.xlsx)', desc: t('excelFullFormatting'), icon: FileSpreadsheet, color: 'text-emerald-400' },
+              { id: 'csv', label: 'CSV (.csv)', desc: t('csvUniversalRaw'), icon: Download, color: 'text-sky-400' },
+              { id: 'json', label: 'JSON (.json)', desc: t('jsonRest'), icon: Database, color: 'text-amber-400' },
+              { id: 'geojson', label: 'GeoJSON (.geojson)', desc: t('geojsonGis'), icon: Layers, color: 'text-purple-400' },
             ].map(fmt => {
               const Icon = fmt.icon;
               const isSelected = selectedFormat === fmt.id;
@@ -135,21 +146,30 @@ export const ExportCenter: React.FC = () => {
 
         {/* Mission Filter Selector */}
         <div className="space-y-2">
-          <label className="text-xs font-semibold text-slate-300 uppercase tracking-wider block">
-            {t('applyMissionFilter')}
-          </label>
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-semibold text-slate-300 uppercase tracking-wider block">
+              {t('applyMissionFilter')}
+            </label>
+            {missionsLoading && <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />}
+          </div>
           <select
+            disabled={missionsLoading}
             value={selectedMission}
             onChange={e => setSelectedMission(e.target.value)}
-            className="w-full h-10 px-3.5 text-xs bg-slate-950 border border-slate-800 rounded-xl text-slate-200 focus:outline-none focus:border-indigo-500"
+            className="w-full h-10 px-3.5 text-xs bg-slate-950 border border-slate-800 rounded-xl text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-60"
           >
-            <option value="ALL">{t('allMissions')}</option>
+            <option value="ALL">
+              {missionsLoading ? t('loadingOptions') : t('allMissions')}
+            </option>
             {missions.map(m => (
               <option key={m.id} value={String(m.id)}>
-                {m.mission} — {m.location} (#{m.id})
+                {m.mission} &mdash; {m.location} (#{m.id})
               </option>
             ))}
           </select>
+          {missionsError && (
+            <ErrorRetryCard compact message={missionsError} onRetry={refreshMissions} />
+          )}
         </div>
 
         {/* Audit Compliance Notice */}
@@ -158,22 +178,27 @@ export const ExportCenter: React.FC = () => {
           <span>All data export operations are immutably logged with user identity and timestamp for compliance.</span>
         </div>
 
+        {errorMsg && (
+          <ErrorRetryCard compact message={errorMsg} onRetry={handleDownload} />
+        )}
+
         {/* Success Notice */}
         {successNotice && (
           <div className="p-3 bg-emerald-950/40 border border-emerald-800 rounded-xl text-xs text-emerald-300 flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-            <span>Export stream generated successfully! Your browser download will begin immediately.</span>
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span>{t('exportSuccessMessage')}</span>
           </div>
         )}
 
         {/* Submit Download */}
         <div className="pt-2">
           <button
+            type="button"
             onClick={handleDownload}
             disabled={downloading}
-            className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-lg shadow-indigo-600/25 transition-all"
+            className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white font-bold text-xs shadow-lg shadow-indigo-600/25 transition-all"
           >
-            <Download className="w-4 h-4" />
+            {downloading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
             <span>{downloading ? 'Preparing Stream...' : t('downloadExport')}</span>
           </button>
         </div>

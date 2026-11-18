@@ -60,7 +60,7 @@ describe('Phase 3: SQLite Type Alignment, Leading Zeros & Foreign Keys', () => {
     const dbPath = createTempDbPath('p3_schema');
     const testDb = new DatabaseSync(dbPath);
     try {
-      initDatabase(testDb);
+      initDatabase();
 
       const regCols = testDb.prepare(`PRAGMA table_info("registrations")`).all() as Array<{ name: string; type: string }>;
       const regColNames = new Set(regCols.map(c => c.name));
@@ -124,7 +124,7 @@ describe('Phase 3: SQLite Type Alignment, Leading Zeros & Foreign Keys', () => {
         INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES (602, 10, 'Egypt', 'EGY', 'Egyptian Military');
       `);
 
-      runPhase3TypeAlignmentMigration(legacyDb);
+      runPhase3TypeAlignmentMigration();
 
       const regCount = (legacyDb.prepare(`SELECT COUNT(*) as c FROM registrations`).get() as any).c;
       assert.equal(regCount, 1);
@@ -168,7 +168,7 @@ describe('Phase 3: SQLite Batch Import Conversions, Parent FK Validation & Cance
 
     const dstDb = new DatabaseSync(dstPath);
     try {
-      initDatabase(dstDb);
+      await initDatabase();
 
       const configs: MultiSqliteTableConfig[] = [
         {
@@ -250,7 +250,7 @@ describe('Phase 3: SQLite Batch Import Conversions, Parent FK Validation & Cance
 
     const dstDb = new DatabaseSync(dstPath);
     try {
-      initDatabase(dstDb);
+      await initDatabase();
       const jobId = `job_cancel_${Date.now()}`;
       const promise = executeMultiSqliteImport(
         {
@@ -289,28 +289,28 @@ describe('Phase 3: SQLite Batch Import Conversions, Parent FK Validation & Cance
 });
 
 describe('Phase 3: String Leading-Zero Analytics & Per-Chart / Per-Map Exports', () => {
-  test('NetworkCells MCC/MNC preserve leading zeros ("03") across aggregations', () => {
+  test('NetworkCells MCC/MNC preserve leading zeros ("03") across aggregations', async () => {
     const dbPath = createTempDbPath('p3_analytics');
     const testDb = new DatabaseSync(dbPath);
     try {
-      initDatabase(testDb);
+      await initDatabase();
       testDb.prepare(`INSERT INTO missions (id, mission, location) VALUES (1, 'OP_ZERO', 'Sector Z')`).run();
       testDb.prepare(`INSERT INTO plmn_storage (mcc, mnc, country, code, name) VALUES ('425', '03', 'Israel', 'ISR', 'Pelephone 03')`).run();
       testDb.prepare(`INSERT INTO network_cells (mission_id, mission, mcc, mnc, cell_id, rat, latitude, longitude) VALUES (1, 'OP_ZERO', '425', '03', '00981', 'LTE', 31.77, 35.21)`).run();
       testDb.prepare(`INSERT INTO network_cells (mission_id, mission, mcc, mnc, cell_id, rat, latitude, longitude) VALUES (1, 'OP_ZERO', '602', '10', '00112', 'LTE', 30.05, 31.24)`).run();
 
-      const byMcc = getNetworkCellsByMcc({}, testDb);
+      const byMcc = await getNetworkCellsByMcc({}, testDb as any);
       assert.equal(byMcc.totalDistinctCells, 2);
       assert.ok(byMcc.items.some(i => i.mcc === '425'));
 
-      const mil = getMilitaryNetworks({}, testDb);
+      const mil = await getMilitaryNetworks({}, testDb as any);
       assert.equal(mil.totalDistinctCells, 1);
       assert.equal(mil.items[0].mnc, '10');
 
-      const civ = getCivilianNetworks({}, testDb);
+      const civ = await getCivilianNetworks({}, testDb as any);
       assert.ok(civ.items.some(i => i.mcc === '425' && i.mnc === '03'));
 
-      const mapData = getBtsMapData({}, testDb);
+      const mapData = await getBtsMapData({}, testDb as any);
       const cellLoc = mapData.locations.find(l => l.cellIds.includes('00981'));
       assert.ok(cellLoc, 'Leading-zero cell_id "00981" must appear on BTS map');
       assert.ok(cellLoc.mncs.includes('03'), 'Leading-zero MNC "03" must be preserved in map metadata');
@@ -521,8 +521,8 @@ describe('Phase 3: HTTP Security, RBAC, Path Traversal, Saved View Ownership & M
       assert.equal(adminChartRes.status, 200, 'SUPER_ADMIN must export chart CSV with 200');
       const exportId = adminChartRes.headers.get('x-export-id');
       assert.ok(exportId, 'X-Export-Id response header must be populated');
-      const exportedRow = db.prepare(`SELECT file_path FROM export_history WHERE id = ?`).get(Number(exportId)) as any;
-      if (exportedRow?.file_path && fs.existsSync(exportedRow.file_path)) {
+      const exportedRows = await db.$queryRawUnsafe<any[]>(`SELECT file_path FROM export_history WHERE id = $1`, Number(exportId));
+      const exportedRow = exportedRows[0];      if (exportedRow?.file_path && fs.existsSync(exportedRow.file_path)) {
         fs.unlinkSync(exportedRow.file_path);
       }
 
@@ -582,9 +582,10 @@ describe('Phase 3: HTTP Security, RBAC, Path Traversal, Saved View Ownership & M
       }
     } finally {
       if (createdViewId) {
-        db.prepare(`DELETE FROM saved_views WHERE id = ?`).run(createdViewId);
-      }
+        await db.$executeRawUnsafe(`DELETE FROM saved_views WHERE id = $1`, createdViewId);      }
       await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });
 });
+
+

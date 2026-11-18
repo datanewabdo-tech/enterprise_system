@@ -16,108 +16,63 @@ import { BackupRecovery } from './pages/BackupRecovery.js';
 import { SystemHealth } from './pages/SystemHealth.js';
 import { Settings } from './pages/Settings.js';
 import { TableView } from './pages/TableView.js';
+import { LoginPage } from './pages/LoginPage.js';
+import { PageLoadingScreen, ErrorRetryCard } from './components/common/LoadingStates.js';
 
-// Table Configuration Metadata for all 23 Tables
-const TABLE_CONFIGS: Record<string, { title: string; description: string }> = {
-  'missions': {
-    title: 'Missions (المهام)',
-    description: 'Operational missions, locations, regional assignments, and cross-dataset linkages.',
-  },
-  'registrations': {
-    title: 'Registrations (سجلات التسجيل)',
-    description: 'Device attachment, IMSI/IMEI registrations, distance estimates, and telemetry.',
-  },
-  'targets': {
-    title: 'Targets (الأهداف المرصودة)',
-    description: 'Monitored target profiles, IMSI/IMEI identifiers, redirect frequencies, and actions.',
-  },
-  'mission-extras': {
-    title: 'Mission Extras (معلومات المهام الإضافية)',
-    description: 'Descriptive operational dossiers and narrative logs linked to missions.',
-  },
-  'location-extras': {
-    title: 'Location Extras (معلومات المواقع الإضافية)',
-    description: 'Geographic and structural characteristics of operation locations.',
-  },
-  'mission-files': {
-    title: 'Mission Files (ملفات المهام)',
-    description: 'Secure attachments, operational briefings, spreadsheets, and mission documents.',
-  },
-  'location-files': {
-    title: 'Location Files (ملفات المواقع)',
-    description: 'Geospatial floor plans, imagery, and sector site documents.',
-  },
-  'network-cells': {
-    title: 'Network Cells (خلايا الشبكة)',
-    description: 'Active cellular base stations, frequencies, signal levels (Rx Lev), LAC, and PCI.',
-  },
-  'wifi-access-points': {
-    title: 'WiFi Access Points (نقاط وصول الواي فاي)',
-    description: 'Discovered WiFi BSSIDs, ESSIDs, encryption protocols, channels, and manufacturers.',
-  },
-  'wifi-access-point-clients': {
-    title: 'WiFi AP Clients (عملاء نقاط الوصول)',
-    description: 'Client device MAC addresses probed or associated with access point nodes.',
-  },
-  'gps-history': {
-    title: 'GPS History (تاريخ وسجل الـ GPS)',
-    description: 'Historical geographic coordinates, power levels, and distance telemetry over time.',
-  },
-  'map-cell-databases': {
-    title: 'Map Cell Databases (قواعد خلايا الخريطة)',
-    description: 'Cellular network cluster databases, display headers, and tactical color schemes.',
-  },
-  'map-cells': {
-    title: 'Map Cells (خلايا الخريطة)',
-    description: 'Geographic base stations with sector directions, beam opening angles, and radii.',
-  },
-  'plmn-storage': {
-    title: 'PLMN Storage (سجل مشغلي الاتصالات)',
-    description: 'Mobile Country Codes (MCC) and Network Codes (MNC) carrier identity index.',
-  },
-  'sms-calls': {
-    title: 'SMS & Calls Records (سجلات المكالمات والرسائل)',
-    description: 'Authorized interception records, routing numbers, BTS identity, and timestamps.',
-  },
-  'map-user-markers': {
-    title: 'Map User Markers (علامات المستخدم)',
-    description: 'Tactical points of interest, command posts, checkpoints, and customized pins.',
-  },
-  'map-user-polygons': {
-    title: 'Map User Polygons (مضلعات ونطاقات المستخدم)',
-    description: 'Perimeter boundaries, exclusion zones, and geospatial polygon shapes.',
-  },
-  'map-user-circles': {
-    title: 'Map User Circles (دوائر المستخدم)',
-    description: 'Radial exclusion boundaries, signal reach buffers, and circular zones.',
-  },
-  'target-files': {
-    title: 'Target Files (ملفات الأهداف)',
-    description: 'Dossiers, imagery, and tactical intelligence attachments linked to targets.',
-  },
-  'whitelist-targets': {
-    title: 'Whitelist Targets (القائمة البيضاء)',
-    description: 'Friendly assets and authorized reference identifiers excluded from alerting.',
-  },
-  'tac-numbers': {
-    title: 'TAC Numbers (أرقام تعريف الأجهزة)',
-    description: 'Type Allocation Code database mapping 8-digit TACs to mobile phone models.',
-  },
-  'scheduled-tasks': {
-    title: 'Scheduled Tasks (المهام المجدولة)',
-    description: 'Automated data retention jobs, scheduled analytics aggregations, and snapshots.',
-  },
-  'map-layers': {
-    title: 'Map Layers (طبقات الخريطة)',
-    description: 'GeoJSON vector layers, base map layers, and tactical overlays.',
-  },
+// Table Configuration Metadata for all 23 Tables (localized via translations)
+const TABLE_CONFIGS: Record<string, { titleKey: keyof typeof import('./locales/translations.js')['translations']['en']; descKey: keyof typeof import('./locales/translations.js')['translations']['en'] }> = {
+  missions: { titleKey: 'table_missions_title', descKey: 'table_missions_desc' },
+  registrations: { titleKey: 'table_registrations_title', descKey: 'table_registrations_desc' },
+  targets: { titleKey: 'table_targets_title', descKey: 'table_targets_desc' },
+  'mission-extras': { titleKey: 'table_mission_extras_title', descKey: 'table_mission_extras_desc' },
+  'location-extras': { titleKey: 'table_location_extras_title', descKey: 'table_location_extras_desc' },
+  'mission-files': { titleKey: 'table_mission_files_title', descKey: 'table_mission_files_desc' },
+  'location-files': { titleKey: 'table_location_files_title', descKey: 'table_location_files_desc' },
+  'network-cells': { titleKey: 'table_network_cells_title', descKey: 'table_network_cells_desc' },
+  'wifi-access-points': { titleKey: 'table_wifi_access_points_title', descKey: 'table_wifi_access_points_desc' },
+  'wifi-access-point-clients': { titleKey: 'table_wifi_access_point_clients_title', descKey: 'table_wifi_access_point_clients_desc' },
+  'gps-history': { titleKey: 'table_gps_history_title', descKey: 'table_gps_history_desc' },
+  'map-cell-databases': { titleKey: 'table_map_cell_databases_title', descKey: 'table_map_cell_databases_desc' },
+  'map-cells': { titleKey: 'table_map_cells_title', descKey: 'table_map_cells_desc' },
+  'plmn-storage': { titleKey: 'table_plmn_storage_title', descKey: 'table_plmn_storage_desc' },
+  'sms-calls': { titleKey: 'table_sms_calls_title', descKey: 'table_sms_calls_desc' },
+  'map-user-markers': { titleKey: 'table_map_user_markers_title', descKey: 'table_map_user_markers_desc' },
+  'map-user-polygons': { titleKey: 'table_map_user_polygons_title', descKey: 'table_map_user_polygons_desc' },
+  'map-user-circles': { titleKey: 'table_map_user_circles_title', descKey: 'table_map_user_circles_desc' },
+  'target-files': { titleKey: 'table_target_files_title', descKey: 'table_target_files_desc' },
+  'whitelist-targets': { titleKey: 'table_whitelist_targets_title', descKey: 'table_whitelist_targets_desc' },
+  'tac-numbers': { titleKey: 'table_tac_numbers_title', descKey: 'table_tac_numbers_desc' },
+  'scheduled-tasks': { titleKey: 'table_scheduled_tasks_title', descKey: 'table_scheduled_tasks_desc' },
+  'map-layers': { titleKey: 'table_map_layers_title', descKey: 'table_map_layers_desc' },
 };
 
 const MainLayout: React.FC = () => {
+  const { authToken, authLoading, authError, retryAuth, t } = useApp();
   const [currentPage, setCurrentPage] = useState<string>('dashboard');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
+  if (!authToken) {
+    if (authLoading) {
+      return (
+        <div className="min-h-screen bg-slate-950 text-slate-100">
+          <PageLoadingScreen message={t('initializingSession')} />
+        </div>
+      );
+    }
+    if (authError) {
+      return (
+        <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-4">
+          <div className="w-full max-w-lg">
+            <ErrorRetryCard message={authError} onRetry={retryAuth} />
+          </div>
+        </div>
+      );
+    }
+    return <LoginPage />;
+  }
+
   const renderCurrentPage = () => {
+
     switch (currentPage) {
       case 'dashboard':
         return <Dashboard onNavigate={setCurrentPage} />;
@@ -144,13 +99,15 @@ const MainLayout: React.FC = () => {
       case 'settings':
         return <Settings />;
       default:
-        // Render Dedicated Table View for any of the 23 tables
+        // Render Dedicated Table View for any of the 23 tables (keyed by tableId to avoid stale flash)
         if (TABLE_CONFIGS[currentPage]) {
+          const cfg = TABLE_CONFIGS[currentPage];
           return (
             <TableView
+              key={currentPage}
               tableId={currentPage}
-              title={TABLE_CONFIGS[currentPage].title}
-              description={TABLE_CONFIGS[currentPage].description}
+              title={t(cfg.titleKey)}
+              description={t(cfg.descKey)}
             />
           );
         }

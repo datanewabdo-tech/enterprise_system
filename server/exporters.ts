@@ -3,169 +3,375 @@ import { db, queryTable, getTableColumns } from './db.js';
 import { maskSensitiveRecord } from './auth.js';
 
 const IDENTIFIER_TEXT_COLUMNS = new Set([
-  'reg_id',
-  'imsi',
-  'imei',
-  'tmsi',
-  'mcc',
-  'mnc',
-  'lac',
-  'cell_id',
-  'cid',
-  'bsic',
-  'psc',
-  'pci',
-  'tac',
-  'tac_id',
-  'bssid',
-  'mac',
+  'reg_id', 'imsi', 'imei', 'tmsi',
+  'mcc', 'mnc', 'lac', 'cell_id',
+  'cid', 'bsic', 'psc', 'pci',
+  'tac', 'tac_id', 'bssid', 'mac',
   'cid_lac_mnc',
 ]);
 
-export async function exportDataset(options: {
+interface ExportOptions {
   tableName: string;
   format: 'xlsx' | 'csv' | 'json' | 'geojson';
   mission?: string;
   search?: string;
   filters?: any[];
   username?: string;
+  userId?: number;
+  ipAddress?: string;
   canUnmask?: boolean;
-}) {
-  // Query data (up to 10,000 records for export)
-  const result = queryTable(options.tableName, {
-    page: 1,
-    pageSize: 10000,
-    mission: options.mission,
-    search: options.search,
-    filters: options.filters,
-  });
+}
 
-  const allowUnmask = Boolean(options.canUnmask);
-  const records = (result.data as Record<string, any>[]).map(r => maskSensitiveRecord(r, allowUnmask));
+interface ExportResult {
+  contentType: string;
+  filename: string;
+  content: Buffer;
+}
 
-  // Audit Log
-  db.prepare(`
-    INSERT INTO audit_logs (username, action, module, record_id, ip_address, result, details)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    options.username || 'admin',
-    'DATA_EXPORT',
-    options.tableName,
-    options.format.toUpperCase(),
-    '127.0.0.1',
-    'SUCCESS',
-    `Exported ${records.length} records in ${options.format.toUpperCase()} format (unmasked=${allowUnmask})`
+// PostgreSQL BigInt serialization support
+function serializeJSON(data: any): string {
+  return JSON.stringify(
+    data,
+    (_key, value) =>
+      typeof value === 'bigint' ? value.toString() : value,
+    2
+  );
+}
+
+// Safe CSV escaping
+function escapeCSV(value: unknown): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+
+  let str = String(value);
+
+  // Prevent spreadsheet formula injection, but leave real numbers alone
+  // (otherwise negative values such as -12.5 become text).
+  const isNumeric =
+    typeof value === 'number' || typeof value === 'bigint' ||
+    /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(str.trim());
+
+  if (!isNumeric && /^[\s]*[=+\-@]/.test(str)) {
+    str = "'" + str;
+  }
+
+  return `"${str.replace(/"/g, '""')}"`;
+}
+
+// Parse BTS coordinates
+function parseCoordinates(record: Record<string, any>): {
+  lat: number;
+  lng: number;
+} | null {
+  let lat = record.latitude ?? record.lat;
+  let lng = record.longitude ?? record.lng;
+
+  // Support both Prisma camelCase and SQLite-style column names
+  const btsLocation = record.bts_location ?? record.btsLocation;
+
+  if (
+    (lat === null || lat === undefined || lat === '') ||
+    (lng === null || lng === undefined || lng === '')
+  ) {
+    if (btsLocation) {
+      const parts = String(btsLocation)
+        .trim()
+        .split(/[\r\n;,]+/)
+        .map((part: string) => part.trim())
+        .filter(Boolean);
+
+      if (parts.length >= 2) {
+        lat = parts[0];
+        lng = parts[1];
+      }
+    }
+  }
+
+  lat = Number(lat);
+  lng = Number(lng);
+
+  if (
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    lat < -90 ||
+    lat > 90 ||
+    lng < -180 ||
+    lng > 180
+  ) {
+    return null;
+  }
+
+  return { lat, lng };
+}
+
+function safeFilename(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+// Main export function
+export async function exportDataset(
+  options: ExportOptions
+): Promise<ExportResult> {
+
+  const {
+    tableName,
+    format,
+    mission,
+    search,
+    filters,
+    username = 'system',
+    userId,
+    ipAddress,
+    canUnmask = false,
+  } = options;
+
+  const timestamp = Date.now();
+  const filenameBase = `${safeFilename(tableName)}_export_${timestamp}`;
+
+  // 1. Retrieve ALL matching records (queryTable caps a page at 10,000 rows,
+  //    so page through instead of silently truncating the export).
+  const PAGE_SIZE = 10000;
+  const MAX_EXPORT_ROWS = 500000;
+  const fetchedRows: Record<string, any>[] = [];
+
+  for (let page = 1; fetchedRows.length < MAX_EXPORT_ROWS; page++) {
+    const chunk = await queryTable(tableName, {
+      page,
+      pageSize: PAGE_SIZE,
+      mission,
+      search,
+      filters,
+      sortOrder: 'ASC',
+    });
+
+    fetchedRows.push(...chunk.rows);
+
+    if (chunk.rows.length < PAGE_SIZE || fetchedRows.length >= chunk.total) break;
+  }
+
+  const result = { rows: fetchedRows };
+
+  const allowUnmask = Boolean(canUnmask);
+
+  const records = (
+    result.rows as Record<string, any>[]
+  ).map(record =>
+    maskSensitiveRecord(record, allowUnmask)
   );
 
-  if (options.format === 'json') {
-    return {
-      contentType: 'application/json',
-      filename: `${options.tableName}_export_${Date.now()}.json`,
-      content: Buffer.from(JSON.stringify(records, null, 2)),
+  // 2. Retrieve database column metadata
+  const columnMetadata = await getTableColumns(tableName);
+  const columns = columnMetadata.map(column => column.name);
+
+  let exportResult: ExportResult;
+
+  // 3. JSON Export
+  if (format === 'json') {
+    exportResult = {
+      contentType: 'application/json; charset=utf-8',
+      filename: `${filenameBase}.json`,
+      content: Buffer.from(serializeJSON(records), 'utf8'),
     };
   }
 
-  if (options.format === 'geojson') {
+  // 4. GeoJSON Export
+  else if (format === 'geojson') {
     const features: any[] = [];
-    for (const r of records) {
-      let lat = r.latitude ?? r.lat;
-      let lng = r.longitude ?? r.lng;
+    let invalidCoordinates = 0;
 
-      if ((lat === undefined || lng === undefined) && r.bts_location) {
-        const parts = String(r.bts_location).split(/[;,]/);
-        if (parts.length >= 2) {
-          lat = parseFloat(parts[0]);
-          lng = parseFloat(parts[1]);
-        }
+    for (const record of records) {
+      const coordinates = parseCoordinates(record);
+
+      if (!coordinates) {
+        invalidCoordinates++;
+        continue;
       }
 
-      if (lat !== undefined && lng !== undefined && !isNaN(lat) && !isNaN(lng)) {
-        features.push({
-          type: 'Feature',
-          geometry: {
-            type: 'Point',
-            coordinates: [lng, lat],
-          },
-          properties: r,
-        });
-      }
+      features.push({
+        type: 'Feature',
+        geometry: {
+          type: 'Point',
+          coordinates: [
+            coordinates.lng,
+            coordinates.lat,
+          ],
+        },
+        properties: record,
+      });
     }
 
     const geojson = {
       type: 'FeatureCollection',
-      name: `${options.tableName}_layer`,
-      crs: { type: 'name', properties: { name: 'EPSG:4326' } },
+      name: `${tableName}_layer`,
+      crs: {
+        type: 'name',
+        properties: {
+          name: 'EPSG:4326',
+        },
+      },
       features,
     };
 
-    return {
+    exportResult = {
       contentType: 'application/geo+json',
-      filename: `${options.tableName}_export_${Date.now()}.geojson`,
-      content: Buffer.from(JSON.stringify(geojson, null, 2)),
+      filename: `${filenameBase}.geojson`,
+      content: Buffer.from(serializeJSON(geojson), 'utf8'),
     };
+
+    console.info(
+      `GeoJSON export: ${features.length} valid coordinates, ${invalidCoordinates} invalid coordinates`
+    );
   }
 
-  if (options.format === 'csv') {
-    const columns = getTableColumns(options.tableName).map(c => c.name);
-    const headerRow = columns.join(',');
-    const rows = records.map(rec => {
-      return columns.map(c => {
-        let val = rec[c];
-        if (val === null || val === undefined) return '';
-        val = String(val).replace(/"/g, '""');
-        return `"${val}"`;
-      }).join(',');
-    });
-    const csvContent = '\uFEFF' + [headerRow, ...rows].join('\n');
+  // 5. CSV Export
+  else if (format === 'csv') {
+    const headerRow = columns.map(escapeCSV).join(',');
 
-    return {
+    const rows = records.map(record =>
+      columns.map(column =>
+        escapeCSV(record[column])
+      ).join(',')
+    );
+
+    const csvContent =
+      '\uFEFF' +
+      [headerRow, ...rows].join('\r\n');
+
+    exportResult = {
       contentType: 'text/csv; charset=utf-8',
-      filename: `${options.tableName}_export_${Date.now()}.csv`,
+      filename: `${filenameBase}.csv`,
       content: Buffer.from(csvContent, 'utf8'),
     };
   }
 
-  // Excel (.xlsx)
-  const workbook = new ExcelJS.Workbook();
-  const worksheet = workbook.addWorksheet(options.tableName);
-  const colMetas = getTableColumns(options.tableName);
-  const columns = colMetas.map(c => ({
-    header: c.name,
-    key: c.name,
-    width: Math.max(14, c.name.length + 4),
-  }));
-  worksheet.columns = columns;
+  // 6. Excel Export
+  else {
+    const workbook = new ExcelJS.Workbook();
 
-  // Add stylish header styling
-  worksheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-  worksheet.getRow(1).fill = {
-    type: 'pattern',
-    pattern: 'solid',
-    fgColor: { argb: 'FF1E293B' },
-  };
+    workbook.creator = 'Enterprise Data Management Dashboard';
+    workbook.created = new Date();
 
-  for (const r of records) {
-    const rowObj: Record<string, any> = {};
-    for (const cm of colMetas) {
-      const val = r[cm.name];
-      if (val !== null && val !== undefined && IDENTIFIER_TEXT_COLUMNS.has(cm.name)) {
-        rowObj[cm.name] = String(val);
-      } else {
-        rowObj[cm.name] = val;
+    const worksheet = workbook.addWorksheet(
+      safeFilename(tableName).substring(0, 31)
+    );
+
+    worksheet.columns = columnMetadata.map(column => ({
+      header: column.name,
+      key: column.name,
+      width: Math.max(14, column.name.length + 4),
+    }));
+
+    // Header styling
+    worksheet.getRow(1).font = {
+      bold: true,
+      color: { argb: 'FFFFFFFF' },
+    };
+
+    worksheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF1E293B' },
+    };
+
+    worksheet.getRow(1).alignment = {
+      vertical: 'middle',
+      horizontal: 'center',
+    };
+
+    worksheet.views = [
+      { state: 'frozen', ySplit: 1 },
+    ];
+
+    // Add data
+    for (const record of records) {
+      const rowObject: Record<string, any> = {};
+
+      for (const column of columnMetadata) {
+        const name = column.name;
+        const value = record[name];
+
+        if (value === null || value === undefined) {
+          rowObject[name] = null;
+        } else if (IDENTIFIER_TEXT_COLUMNS.has(name)) {
+          rowObject[name] = String(value);
+        } else if (typeof value === 'bigint') {
+          rowObject[name] = value.toString();
+        } else {
+          rowObject[name] = value;
+        }
       }
+
+      const row = worksheet.addRow(rowObject);
+
+      columnMetadata.forEach((column, index) => {
+        if (IDENTIFIER_TEXT_COLUMNS.has(column.name)) {
+          row.getCell(index + 1).numFmt = '@';
+        }
+      });
     }
-    const row = worksheet.addRow(rowObj);
-    colMetas.forEach((cm, idx) => {
-      if (IDENTIFIER_TEXT_COLUMNS.has(cm.name)) {
-        row.getCell(idx + 1).numFmt = '@';
-      }
-    });
+
+    worksheet.autoFilter = {
+      from: {
+        row: 1,
+        column: 1,
+      },
+      to: {
+        row: 1,
+        column: Math.max(columns.length, 1),
+      },
+    };
+
+    const buffer = await workbook.xlsx.writeBuffer();
+
+    exportResult = {
+      contentType:
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      filename: `${filenameBase}.xlsx`,
+      content: Buffer.from(buffer),
+    };
   }
 
-  const buffer = await workbook.xlsx.writeBuffer();
-  return {
-    contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    filename: `${options.tableName}_export_${Date.now()}.xlsx`,
-    content: Buffer.from(buffer),
-  };
+  // 7. Record export history in PostgreSQL
+  try {
+    const historyData = {
+      username,
+      format: format.toUpperCase(),
+      scope: tableName,
+      selectedMissions: mission ?? null,
+      appliedFilters: JSON.stringify({
+        search: search ?? null,
+        filters: filters ?? [],
+      }),
+      status: 'COMPLETED',
+      fileName: exportResult.filename,
+      fileSize: exportResult.content.length,
+      ...(userId !== undefined ? { userId } : {}),
+    };
+
+    await db.$transaction([
+      db.exportHistory.create({
+        data: historyData,
+      }),
+
+      db.auditLog.create({
+        data: {
+          ...(userId !== undefined ? { userId } : {}),
+          username,
+          action: 'DATA_EXPORT',
+          module: tableName,
+          recordId: format.toUpperCase(),
+          ipAddress: ipAddress ?? null,
+          result: 'SUCCESS',
+          details:
+            `Exported ${records.length} records in ${format.toUpperCase()} format. Unmasked=${allowUnmask}`,
+        },
+      }),
+    ]);
+  } catch (error) {
+    // Do not lose a completed export because of an audit failure.
+    console.error('Export audit logging failed:', error);
+  }
+
+  return exportResult;
 }

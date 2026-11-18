@@ -22,17 +22,17 @@ export const Settings: React.FC = () => {
       <div>
         <h1 className="text-xl font-bold text-slate-100 flex items-center gap-2">
           <SettingsIcon className="w-5 h-5 text-indigo-400" />
-          <span>Platform & Operational Governance Settings</span>
+          <span>{t('platformGovernanceSettings')}</span>
         </h1>
         <p className="text-xs text-slate-400 mt-0.5">
-          Configure telemetry retention windows, privacy masking thresholds, and regional parameters.
+          {t('platformGovernanceSettingsDesc')}
         </p>
       </div>
 
       {savedNotice && (
         <div className="p-3 bg-emerald-950/40 border border-emerald-800 rounded-xl text-xs text-emerald-300 flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-          <span>Settings saved and applied across platform controllers.</span>
+          <span>{t('settingsSavedApplied')}</span>
         </div>
       )}
 
@@ -41,10 +41,10 @@ export const Settings: React.FC = () => {
         {/* Retention Policy */}
         <div className="space-y-1.5">
           <label className="text-xs font-semibold text-slate-200 uppercase tracking-wider block">
-            Data Retention Window (Days)
+            {t('dataRetentionWindowDays')}
           </label>
           <p className="text-[11px] text-slate-400">
-            Historical GPS tracking points and temporary registrations older than this period are queued for scheduled deletion.
+            {t('dataRetentionWindowDesc')}
           </p>
           <input
             type="number"
@@ -89,7 +89,7 @@ export const Settings: React.FC = () => {
             className="flex items-center gap-2 px-5 py-2 text-xs font-bold rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white shadow-md shadow-indigo-600/30 transition-colors"
           >
             <Save className="w-4 h-4" />
-            <span>Save Configuration</span>
+            <span>{t('saveConfiguration')}</span>
           </button>
         </div>
       </form>

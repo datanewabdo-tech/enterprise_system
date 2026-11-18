@@ -49,6 +49,7 @@ export interface DashboardExportScope {
   networkCellsByMcc: boolean;
   militaryNetworks: boolean;
   civilianNetworks: boolean;
+  mobileNetworksMccMnc: boolean;
   includeDetailedRecords: boolean;
   includeSensitiveIdentifiers: boolean;
 }
@@ -94,7 +95,7 @@ function decodeBase64Png(dataUrl?: string): Buffer | null {
   }
 }
 
-function summarizeAppliedFilters(filters: Partial<DashboardFilters>, language: 'en' | 'ar'): Array<{ key: string; value: string }> {
+async function summarizeAppliedFilters(filters: Partial<DashboardFilters>, language: 'en' | 'ar'): Promise<Array<{ key: string; value: string }>> {
   const entries: Array<{ key: string; value: string }> = [];
   const push = (kEn: string, kAr: string, val: any) => {
     if (val === undefined || val === null || val === '' || val === 'all') return;
@@ -106,10 +107,10 @@ function summarizeAppliedFilters(filters: Partial<DashboardFilters>, language: '
   };
 
   if (filters.missionIds && filters.missionIds.length > 0) {
-    const placeholders = filters.missionIds.map(() => '?').join(', ');
-    const missions = db
-      .prepare(`SELECT id, mission, location FROM missions WHERE id IN (${placeholders})`)
-      .all(...filters.missionIds) as Array<{ id: number; mission: string; location: string }>;
+    const missions = await db.$queryRawUnsafe<Array<{ id: number; mission: string; location: string }>>(
+      'SELECT id, mission, location FROM missions WHERE id = ANY($1::int[]) ORDER BY id',
+      filters.missionIds,
+    );
     const label = missions.map(m => `${m.mission} (${m.location} #${m.id})`).join('; ');
     push('Selected Missions', 'المهام المحددة', label || filters.missionIds.join(', '));
   } else if (filters.mission && filters.mission !== 'ALL') {
@@ -169,8 +170,8 @@ function getKpiRows(kpis: any, language: 'en' | 'ar'): Array<{ metric: string; v
 }
 
 export async function generateDashboardExport(options: DashboardExportOptions) {
-  const dashboard = getDashboardKPIs(options.filters);
-  const filterRows = summarizeAppliedFilters(options.filters, options.language);
+  const dashboard = await getDashboardKPIs(options.filters);
+  const filterRows = await summarizeAppliedFilters(options.filters, options.language);
   const kpiRows = getKpiRows(dashboard.kpis, options.language);
   const isAr = options.language === 'ar';
   const generatedAt = new Date().toISOString();
@@ -178,10 +179,12 @@ export async function generateDashboardExport(options: DashboardExportOptions) {
   // Optional detailed registration rows (respects RBAC and explicit opt-in)
   let detailedRegRows: any[] = [];
   if (options.scope.includeDetailedRecords) {
-    const regWhere = buildRegistrationWhere(options.filters);
-    const raw = db
-      .prepare(`SELECT id, reg_id, mission_id, mission, bts, bts_name, country, country_code, ue_model, imsi, imei, tmsi, bts_location, last_seen, action FROM registrations ${regWhere.whereSql} ORDER BY id DESC LIMIT 1000`)
-      .all(...regWhere.params) as any[];
+    const regWhere = await  buildRegistrationWhere(options.filters);
+    const whereSql = String(regWhere.whereSql || '').replace(/\?/g, (_match, offset) => `$${(String(regWhere.whereSql).slice(0, offset).match(/\?/g) || []).length + 1}`);
+    const raw = await db.$queryRawUnsafe<any[]>(
+      `SELECT id, reg_id, mission_id, mission, bts, bts_name, country, country_code, ue_model, imsi, imei, tmsi, bts_location, last_seen, action FROM registrations ${whereSql} ORDER BY id DESC LIMIT 1000`,
+      ...regWhere.params,
+    );
     const allowUnmask = Boolean(options.canUnmask && options.scope.includeSensitiveIdentifiers);
     detailedRegRows = raw.map(r => maskSensitiveRecord(r, allowUnmask));
   }
@@ -211,38 +214,40 @@ export async function generateDashboardExport(options: DashboardExportOptions) {
     .map(([k]) => k)
     .join(',');
 
-  const info = db
-    .prepare(`
-      INSERT INTO export_history (user_id, username, format, scope, selected_missions, applied_filters, status, file_path, file_name, file_size)
-      VALUES (?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?, ?)
-    `)
-    .run(
-      options.userId || null,
-      options.username,
-      options.format.toUpperCase(),
-      scopeSummary,
-      JSON.stringify(options.filters.missionIds || []),
-      JSON.stringify(options.filters),
-      filePath,
-      fileName,
-      buffer.length
-    );
-
-  db.prepare(`
-    INSERT INTO audit_logs (user_id, username, action, module, record_id, ip_address, result, details)
-    VALUES (?, ?, 'DASHBOARD_EXPORT', 'export_history', ?, '127.0.0.1', 'SUCCESS', ?)
-  `).run(
-    options.userId || null,
+  const infoRows = await db.$queryRawUnsafe<Array<{ id: number | bigint }>>(`
+    INSERT INTO export_history
+      (user_id, username, format, scope, selected_missions, applied_filters, status, file_path, file_name, file_size)
+    VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, 'COMPLETED', $7, $8, $9)
+    RETURNING id
+  `,
+    options.userId ?? null,
     options.username,
-    String(info.lastInsertRowid),
-    `Exported dashboard report in ${options.format.toUpperCase()} (${options.language.toUpperCase()}) scope=[${scopeSummary}]`
+    options.format.toUpperCase(),
+    scopeSummary,
+    JSON.stringify(options.filters.missionIds || []),
+    JSON.stringify(options.filters),
+    filePath,
+    fileName,
+    buffer.length,
+  );
+  const exportId = Number(infoRows[0]?.id);
+  if (!Number.isFinite(exportId)) throw new Error('PostgreSQL did not return an export history ID');
+
+  await db.$executeRawUnsafe(`
+    INSERT INTO audit_logs (user_id, username, action, module, record_id, ip_address, result, details)
+    VALUES ($1, $2, 'DASHBOARD_EXPORT', 'export_history', $3, '127.0.0.1', 'SUCCESS', $4)
+  `,
+    options.userId ?? null,
+    options.username,
+    String(exportId),
+    `Exported dashboard report in ${options.format.toUpperCase()} (${options.language.toUpperCase()}) scope=[${scopeSummary}]`,
   );
 
   // Clean up export files older than 24 hours
   cleanupOldExports();
 
   return {
-    exportId: Number(info.lastInsertRowid),
+    exportId,
     fileName,
     filePath,
     contentType,
@@ -270,6 +275,7 @@ export type ExportableChartId =
   | 'networkCellsByMcc'
   | 'militaryNetworks'
   | 'civilianNetworks'
+  | 'mobileNetworksMccMnc'
   | 'btsMap';
 
 export type ChartExportFormat = 'png' | 'pdf' | 'xlsx' | 'csv' | 'geojson';
@@ -427,6 +433,40 @@ function getChartExportMeta(chartId: ExportableChartId, dashboard: any, language
         ],
       };
     }
+    case 'mobileNetworksMccMnc': {
+      const items = dashboard.mobileNetworksMccMnc?.items || [];
+      return {
+        title: isAr ? dashboard.mobileNetworksMccMnc?.titleAr : dashboard.mobileNetworksMccMnc?.titleEn,
+        sheetName: isAr ? 'شبكات المحمول MCC/MNC' : 'Mobile Networks — MCC/MNC Analysis',
+        headers: [
+          isAr ? 'الترتيب' : 'Rank',
+          isAr ? 'المشغل' : 'Operator',
+          'MCC',
+          'MNC',
+          isAr ? 'الخلايا الفريدة' : 'Distinct Cells',
+          isAr ? 'إجمالي السجلات' : 'Total Records',
+        ],
+        colWidths: [12, 32, 12, 12, 18, 18],
+        colRatios: [0.08, 0.34, 0.12, 0.12, 0.17, 0.17],
+        textCols: [1],
+        rows: items.map((i: any) => [
+          i.rank,
+          i.operator,
+          String(i.mcc),
+          String(i.mnc),
+          i.distinctCellCount,
+          i.totalRecords,
+        ]),
+        totalsRow: [
+          '',
+          isAr ? 'الإجمالي' : 'TOTAL',
+          '',
+          '',
+          dashboard.mobileNetworksMccMnc?.totalDistinctCells ?? 0,
+          dashboard.mobileNetworksMccMnc?.totalRecords ?? 0,
+        ],
+      };
+    }
     case 'btsMap': {
       const locs = dashboard.btsMap?.locations || [];
       return {
@@ -484,9 +524,9 @@ export async function generateChartExport(options: ChartExportOptions) {
     throw new Error('GeoJSON export is only supported for the geographic BTS map');
   }
 
-  const dashboard = getDashboardKPIs(options.filters);
+  const dashboard = await getDashboardKPIs(options.filters);
   const meta = getChartExportMeta(options.chartId, dashboard, options.language);
-  const filterRows = summarizeAppliedFilters(options.filters, options.language);
+  const filterRows = await summarizeAppliedFilters(options.filters, options.language);
   const isAr = options.language === 'ar';
   const generatedAt = new Date().toISOString();
 
@@ -769,37 +809,39 @@ export async function generateChartExport(options: ChartExportOptions) {
   fs.writeFileSync(filePath, buffer);
 
   const scopeLabel = `chart:${options.chartId}`;
-  const info = db
-    .prepare(`
-      INSERT INTO export_history (user_id, username, format, scope, selected_missions, applied_filters, status, file_path, file_name, file_size)
-      VALUES (?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?, ?)
-    `)
-    .run(
-      options.userId || null,
-      options.username,
-      options.format.toUpperCase(),
-      scopeLabel,
-      JSON.stringify(options.filters.missionIds || []),
-      JSON.stringify(options.filters),
-      filePath,
-      fileName,
-      buffer.length
-    );
-
-  db.prepare(`
-    INSERT INTO audit_logs (user_id, username, action, module, record_id, ip_address, result, details)
-    VALUES (?, ?, 'CHART_EXPORT', 'export_history', ?, '127.0.0.1', 'SUCCESS', ?)
-  `).run(
-    options.userId || null,
+  const infoRows = await db.$queryRawUnsafe<Array<{ id: number | bigint }>>(`
+    INSERT INTO export_history
+      (user_id, username, format, scope, selected_missions, applied_filters, status, file_path, file_name, file_size)
+    VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, 'COMPLETED', $7, $8, $9)
+    RETURNING id
+  `,
+    options.userId ?? null,
     options.username,
-    String(info.lastInsertRowid),
-    `Exported ${options.chartId} as ${options.format.toUpperCase()} (${options.language.toUpperCase()})`
+    options.format.toUpperCase(),
+    scopeLabel,
+    JSON.stringify(options.filters.missionIds || []),
+    JSON.stringify(options.filters),
+    filePath,
+    fileName,
+    buffer.length,
+  );
+  const exportId = Number(infoRows[0]?.id);
+  if (!Number.isFinite(exportId)) throw new Error('PostgreSQL did not return an export history ID');
+
+  await db.$executeRawUnsafe(`
+    INSERT INTO audit_logs (user_id, username, action, module, record_id, ip_address, result, details)
+    VALUES ($1, $2, 'CHART_EXPORT', 'export_history', $3, '127.0.0.1', 'SUCCESS', $4)
+  `,
+    options.userId ?? null,
+    options.username,
+    String(exportId),
+    `Exported ${options.chartId} as ${options.format.toUpperCase()} (${options.language.toUpperCase()})`,
   );
 
   cleanupOldExports();
 
   return {
-    exportId: Number(info.lastInsertRowid),
+    exportId,
     fileName,
     filePath,
     contentType,

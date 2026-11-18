@@ -1,9 +1,13 @@
+
 import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
 import zlib from 'node:zlib';
 import bcrypt from 'bcryptjs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
 import {
   db,
   queryTable,
@@ -12,7 +16,9 @@ import {
   updateRecord,
   deleteRecord,
   getTableColumns,
+  getTableStats,
 } from './db.js';
+
 import {
   authenticateUser,
   generateToken,
@@ -22,12 +28,22 @@ import {
   AuthUser,
   UserRole,
 } from './auth.js';
+
 import {
   getDashboardKPIs,
+  getDashboardWidget,
+  DashboardWidgetId,
   executeDynamicAnalytics,
   getDashboardFilterOptions,
   getBtsMapData,
 } from './analytics.js';
+
+import { generateAnalyticsExport } from './analyticsExporter.js';
+import {
+  previewBackfillCountries,
+  backfillCountries,
+} from './countryDetection.js';
+
 import {
   DashboardFilterSchema,
   MultiSqliteImportRequestSchema,
@@ -37,111 +53,191 @@ import {
 
 export const apiRouter = Router();
 
+const execFileAsync = promisify(execFile);
+
 const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-}
-
 const BACKUPS_DIR = path.resolve(process.cwd(), 'backups');
-if (!fs.existsSync(BACKUPS_DIR)) {
-  fs.mkdirSync(BACKUPS_DIR, { recursive: true });
-}
-
 const EXPORTS_DIR = path.resolve(process.cwd(), 'exports');
-if (!fs.existsSync(EXPORTS_DIR)) {
-  fs.mkdirSync(EXPORTS_DIR, { recursive: true });
-}
-
 const TILE_CACHE_DIR = path.resolve(process.cwd(), 'data', 'tile-cache');
-if (!fs.existsSync(TILE_CACHE_DIR)) {
-  fs.mkdirSync(TILE_CACHE_DIR, { recursive: true });
+
+for (const dir of [
+  UPLOADS_DIR,
+  BACKUPS_DIR,
+  EXPORTS_DIR,
+  TILE_CACHE_DIR,
+]) {
+  fs.mkdirSync(dir, { recursive: true });
 }
 
 function assertUploadPathSafe(inputPath: string): string {
   const resolved = path.resolve(String(inputPath || ''));
+
   if (!resolved.startsWith(UPLOADS_DIR + path.sep)) {
-    throw new Error('Path traversal rejected: file path must reside within uploads directory');
+    throw new Error(
+      'Path traversal rejected: file path must reside within uploads directory',
+    );
   }
+
   return resolved;
 }
 
-// Minimal valid 256x256 dark-slate grid PNG generated in pure Node for offline fallback
+function isSafeIdentifier(value: string): boolean {
+  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(value);
+}
+
+function quoteIdentifier(value: string): string {
+  if (!isSafeIdentifier(value)) {
+    throw new Error(`Invalid database identifier: ${value}`);
+  }
+
+  return `"${value}"`;
+}
+
+async function pgQuery<T = any>(
+  sql: string,
+  ...params: any[]
+): Promise<T[]> {
+  return db.$queryRawUnsafe<T[]>(sql, ...params);
+}
+
+async function pgExecute(
+  sql: string,
+  ...params: any[]
+): Promise<number> {
+  return db.$executeRawUnsafe(sql, ...params);
+}
+
+async function writeAuditLog(data: {
+  userId?: number | null;
+  username?: string | null;
+  action: string;
+  module: string;
+  recordId?: string | null;
+  ipAddress?: string | null;
+  result?: string;
+  details?: string | null;
+}): Promise<void> {
+  await db.auditLog.create({
+    data: {
+      userId: data.userId ?? null,
+      username: data.username?.trim() || 'system',
+      action: data.action,
+      module: data.module,
+      recordId: data.recordId ?? null,
+      ipAddress: data.ipAddress ?? '',
+      result: data.result ?? 'SUCCESS',
+      details: data.details ?? null,
+    },
+  });
+}
 let cachedOfflineTilePng: Buffer | null = null;
+
 function crc32(buf: Buffer): number {
   let crc = 0xffffffff;
+
   for (let i = 0; i < buf.length; i++) {
     crc ^= buf[i];
+
     for (let j = 0; j < 8; j++) {
       crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
     }
   }
+
   return (crc ^ 0xffffffff) >>> 0;
 }
+
 function pngChunk(type: string, data: Buffer): Buffer {
   const len = Buffer.alloc(4);
   len.writeUInt32BE(data.length, 0);
+
   const typeBuf = Buffer.from(type, 'ascii');
   const crcBuf = Buffer.alloc(4);
-  crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+
+  crcBuf.writeUInt32BE(
+    crc32(Buffer.concat([typeBuf, data])),
+    0,
+  );
+
   return Buffer.concat([len, typeBuf, data, crcBuf]);
 }
+
 function getOfflineFallbackTilePng(): Buffer {
   if (cachedOfflineTilePng) return cachedOfflineTilePng;
+
   const size = 256;
   const raw = Buffer.alloc(size * (1 + size * 3));
+
   for (let y = 0; y < size; y++) {
     const rowStart = y * (1 + size * 3);
-    raw[rowStart] = 0; // filter type 0
+    raw[rowStart] = 0;
+
     for (let x = 0; x < size; x++) {
       const idx = rowStart + 1 + x * 3;
       const isGrid = x % 64 === 0 || y % 64 === 0;
+
       raw[idx] = isGrid ? 30 : 15;
       raw[idx + 1] = isGrid ? 41 : 23;
       raw[idx + 2] = isGrid ? 59 : 42;
     }
   }
+
   const ihdr = Buffer.alloc(13);
+
   ihdr.writeUInt32BE(size, 0);
   ihdr.writeUInt32BE(size, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // RGB
-  ihdr[10] = 0;
-  ihdr[11] = 0;
-  ihdr[12] = 0;
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+
   const idat = zlib.deflateSync(raw);
+
   cachedOfflineTilePng = Buffer.concat([
     Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
     pngChunk('IHDR', ihdr),
     pngChunk('IDAT', idat),
     pngChunk('IEND', Buffer.alloc(0)),
   ]);
+
   return cachedOfflineTilePng;
 }
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
-  filename: (_req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`),
+  filename: (_req, file, cb) =>
+    cb(
+      null,
+      `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`,
+    ),
 });
 
 const upload = multer({
   storage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
+  limits: { fileSize: 100 * 1024 * 1024 },
 });
 
-// Middleware to extract user from Authorization Bearer header or ?token= query param
-export function authMiddleware(req: Request, _res: Response, next: () => void) {
+export function authMiddleware(
+  req: Request,
+  _res: Response,
+  next: () => void,
+) {
   const authHeader = req.headers.authorization;
-  const queryToken = typeof req.query.token === 'string' ? req.query.token : null;
-  const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7) : queryToken;
+  const queryToken =
+    typeof req.query.token === 'string' ? req.query.token : null;
+
+  const token =
+    authHeader && authHeader.startsWith('Bearer ')
+      ? authHeader.substring(7)
+      : queryToken;
 
   if (token) {
     const user = verifyToken(token);
+
     if (user) {
       (req as any).user = user;
     } else {
       (req as any).invalidToken = true;
     }
   }
+
   next();
 }
 
@@ -149,173 +245,52 @@ apiRouter.use(authMiddleware);
 
 function getUserPerms(req: Request) {
   const user = (req as any).user as AuthUser | undefined;
+
   if (!user) return null;
-  return { user, perms: ROLE_PERMISSIONS[user.role as UserRole] };
+
+  return {
+    user,
+    perms: ROLE_PERMISSIONS[user.role as UserRole],
+  };
 }
 
 function requireAuth(req: Request, res: Response) {
   const auth = getUserPerms(req);
+
   if (!auth) {
     res.status(401).json({ error: 'Authentication required' });
     return null;
   }
+
   return auth;
 }
 
-// Same-origin cached OpenStreetMap tile proxy (eliminates CARTO API key errors and cross-origin canvas tainting)
-apiRouter.get('/map/tiles/:z/:x/:y.png', async (req: Request, res: Response) => {
-  const z = Number(req.params.z);
-  const x = Number(req.params.x);
-  const y = Number(req.params.y);
+function parseMissionIds(value: unknown): number[] | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
 
-  if (!Number.isInteger(z) || !Number.isInteger(x) || !Number.isInteger(y) || z < 0 || z > 19) {
-    return res.status(400).json({ error: 'Invalid tile coordinates' });
-  }
-  const maxCoord = Math.pow(2, z);
-  if (x < 0 || x >= maxCoord || y < 0 || y >= maxCoord) {
-    return res.status(400).json({ error: 'Tile coordinates out of zoom bounds' });
-  }
+  const ids = value
+    .split(',')
+    .map(Number)
+    .filter((n) => Number.isInteger(n) && n > 0);
 
-  const tilePath = path.resolve(TILE_CACHE_DIR, String(z), String(x), `${y}.png`);
-  if (!tilePath.startsWith(TILE_CACHE_DIR + path.sep)) {
-    return res.status(400).json({ error: 'Invalid tile path' });
-  }
+  return ids.length ? ids : undefined;
+}
 
-  const setTileHeaders = (cacheState: string) => {
-    res.setHeader('Content-Type', 'image/png');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.setHeader('X-Tile-Cache', cacheState);
-  };
+function parseFilters(value: unknown): any[] {
+  if (typeof value !== 'string') return [];
 
   try {
-    if (fs.existsSync(tilePath)) {
-      const stat = fs.statSync(tilePath);
-      const ageMs = Date.now() - stat.mtimeMs;
-      if (ageMs < 7 * 24 * 60 * 60 * 1000 && stat.size > 100) {
-        setTileHeaders('HIT');
-        return res.sendFile(tilePath);
-      }
-    }
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
-    // proceed to upstream fetch
+    return [];
   }
-
-  try {
-    const upstreamUrl = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
-    const upstream = await fetch(upstreamUrl, {
-      headers: {
-        'User-Agent': 'Enterprise-Mission-Mapping-Platform/3.0 (tile-proxy)',
-        Accept: 'image/png,image/*;q=0.8',
-      },
-      signal: AbortSignal.timeout(6000),
-    });
-
-    if (upstream.ok) {
-      const contentType = upstream.headers.get('content-type') || '';
-      const arrBuf = await upstream.arrayBuffer();
-      const buf = Buffer.from(arrBuf);
-      if (contentType.includes('image') && buf.length > 64) {
-        fs.mkdirSync(path.dirname(tilePath), { recursive: true });
-        fs.writeFileSync(tilePath, buf);
-        setTileHeaders('MISS');
-        return res.send(buf);
-      }
-    }
-  } catch {
-    // fallback below
-  }
-
-  // Serve stale cache if upstream temporarily failed
-  if (fs.existsSync(tilePath)) {
-    setTileHeaders('STALE');
-    return res.sendFile(tilePath);
-  }
-
-  setTileHeaders('FALLBACK');
-  res.setHeader('X-Tile-Fallback', 'offline');
-  return res.send(getOfflineFallbackTilePng());
-});
-
-// --- 1. Authentication Endpoints ---
-
-apiRouter.post('/auth/login', (req: Request, res: Response) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
-  }
-
-  const result = authenticateUser(username, password);
-  if (!result) {
-    db.prepare(`
-      INSERT INTO audit_logs (username, action, module, record_id, ip_address, result, details)
-      VALUES (?, 'AUTH_FAILED', 'Authentication', NULL, ?, 'DENIED', 'Invalid credentials provided')
-    `).run(username, req.ip || '127.0.0.1');
-
-    return res.status(401).json({ error: 'Invalid credentials or inactive account' });
-  }
-
-  db.prepare(`
-    INSERT INTO audit_logs (username, action, module, record_id, ip_address, result, details)
-    VALUES (?, 'AUTH_LOGIN', 'Authentication', ?, ?, 'SUCCESS', 'User logged in successfully')
-  `).run(result.user.username, String(result.user.id), req.ip || '127.0.0.1');
-
-  return res.json(result);
-});
-
-// Issues a signed session token for initial UI exploration or role switching in demo workspace
-apiRouter.post('/auth/session', (req: Request, res: Response) => {
-  const requestedRole = req.body?.role as UserRole | undefined;
-  const usernameMap: Record<string, string> = {
-    SUPER_ADMIN: 'admin',
-    DATA_MANAGER: 'manager',
-    DATA_ANALYST: 'analyst',
-    VIEWER: 'viewer',
-  };
-  const targetUsername = requestedRole && usernameMap[requestedRole] ? usernameMap[requestedRole] : 'admin';
-  const row = db
-    .prepare(`SELECT id, username, email, full_name, role, status FROM users WHERE username = ? AND status = 'ACTIVE'`)
-    .get(targetUsername) as any;
-
-  if (!row) return res.status(404).json({ error: 'Session user not found' });
-
-  const user: AuthUser = {
-    id: row.id,
-    username: row.username,
-    email: row.email,
-    fullName: row.full_name,
-    role: row.role as UserRole,
-    status: row.status,
-  };
-  const token = generateToken(user);
-  return res.json({ user, token });
-});
-
-apiRouter.get('/auth/me', (req: Request, res: Response) => {
-  const user = (req as any).user as AuthUser | undefined;
-  if (!user) {
-    return res.status(401).json({ error: 'Unauthenticated' });
-  }
-  return res.json(user);
-});
-
-apiRouter.post('/auth/logout', (req: Request, res: Response) => {
-  const user = (req as any).user;
-  if (user) {
-    db.prepare(`
-      INSERT INTO audit_logs (username, action, module, record_id, ip_address, result, details)
-      VALUES (?, 'AUTH_LOGOUT', 'Authentication', ?, ?, 'SUCCESS', 'User logged out')
-    `).run(user.username, String(user.id), req.ip || '127.0.0.1');
-  }
-  return res.json({ success: true });
-});
-
-// --- 2. Generic Table CRUD Route Handler ---
+}
 
 const TABLE_MAP: Record<string, string> = {
-  'missions': 'missions',
-  'registrations': 'registrations',
-  'targets': 'targets',
+  missions: 'missions',
+  registrations: 'registrations',
+  targets: 'targets',
   'mission-extras': 'mission_extras',
   'location-extras': 'location_extras',
   'mission-files': 'mission_files',
@@ -338,81 +313,519 @@ const TABLE_MAP: Record<string, string> = {
   'map-layers': 'map_layers',
 };
 
-apiRouter.get('/tables/:table', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
+function resolveTableName(urlTable: string): string {
+  const table = TABLE_MAP[urlTable] || urlTable.replace(/-/g, '_');
 
-  const urlTable = req.params.table;
-  const dbTable = TABLE_MAP[urlTable] || urlTable.replace(/-/g, '_');
+  if (!Object.values(TABLE_MAP).includes(table)) {
+    throw new Error(`Table is not allowed: ${urlTable}`);
+  }
 
-  const { page, pageSize, search, sortBy, sortOrder, mission, missionIds, filters, unmask } = req.query;
+  return table;
+}
 
-  let parsedFilters = [];
-  if (filters && typeof filters === 'string') {
+const ALLOWED_WIDGET_IDS = new Set<DashboardWidgetId>([
+  'kpis',
+  'registrationsByCountry',
+  'btsMap',
+  'networkCellsByMcc',
+  'militaryNetworks',
+  'civilianNetworks',
+  'mobileNetworksMccMnc',
+  'operationalSummary',
+  'qualityStats',
+]);
+
+// -----------------------------------------------------------------------------
+// Map tile proxy
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/map/tiles/:z/:x/:y.png',
+  async (req: Request, res: Response) => {
+    const z = Number(req.params.z);
+    const x = Number(req.params.x);
+    const y = Number(req.params.y);
+
+    if (
+      !Number.isInteger(z) ||
+      !Number.isInteger(x) ||
+      !Number.isInteger(y) ||
+      z < 0 ||
+      z > 19
+    ) {
+      return res.status(400).json({ error: 'Invalid tile coordinates' });
+    }
+
+    const maxCoord = Math.pow(2, z);
+
+    if (x < 0 || x >= maxCoord || y < 0 || y >= maxCoord) {
+      return res.status(400).json({
+        error: 'Tile coordinates out of zoom bounds',
+      });
+    }
+
+    const tilePath = path.resolve(
+      TILE_CACHE_DIR,
+      String(z),
+      String(x),
+      `${y}.png`,
+    );
+
+    if (!tilePath.startsWith(TILE_CACHE_DIR + path.sep)) {
+      return res.status(400).json({ error: 'Invalid tile path' });
+    }
+
+    const setTileHeaders = (cacheState: string) => {
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('X-Tile-Cache', cacheState);
+    };
+
     try {
-      parsedFilters = JSON.parse(filters);
+      if (fs.existsSync(tilePath)) {
+        const stat = fs.statSync(tilePath);
+        const ageMs = Date.now() - stat.mtimeMs;
+
+        if (ageMs < 7 * 24 * 60 * 60 * 1000 && stat.size > 100) {
+          setTileHeaders('HIT');
+          return res.sendFile(tilePath);
+        }
+      }
     } catch {
-      parsedFilters = [];
+      // Continue to upstream request.
+    }
+
+    try {
+      const upstream = await fetch(
+        `https://tile.openstreetmap.org/${z}/${x}/${y}.png`,
+        {
+          headers: {
+            'User-Agent':
+              'Enterprise-Mission-Mapping-Platform/3.0 (tile-proxy)',
+            Accept: 'image/png,image/*;q=0.8',
+          },
+          signal: AbortSignal.timeout(6000),
+        },
+      );
+
+      if (upstream.ok) {
+        const contentType = upstream.headers.get('content-type') || '';
+        const buffer = Buffer.from(await upstream.arrayBuffer());
+
+        if (contentType.includes('image') && buffer.length > 64) {
+          fs.mkdirSync(path.dirname(tilePath), { recursive: true });
+          fs.writeFileSync(tilePath, buffer);
+          setTileHeaders('MISS');
+          return res.send(buffer);
+        }
+      }
+    } catch {
+      // Continue to stale cache or fallback.
+    }
+
+    if (fs.existsSync(tilePath)) {
+      setTileHeaders('STALE');
+      return res.sendFile(tilePath);
+    }
+
+    setTileHeaders('FALLBACK');
+    res.setHeader('X-Tile-Fallback', 'offline');
+
+    return res.send(getOfflineFallbackTilePng());
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Authentication
+// -----------------------------------------------------------------------------
+
+apiRouter.post('/auth/login', async (req: Request, res: Response) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        error: 'Username and password are required',
+      });
+    }
+
+    const result = await authenticateUser(username, password);
+
+    if (!result) {
+      try {
+        await writeAuditLog({
+          username,
+          action: 'AUTH_FAILED',
+          module: 'Authentication',
+          ipAddress: req.ip || '127.0.0.1',
+          result: 'DENIED',
+          details: 'Invalid credentials provided',
+        });
+      } catch {
+        // Do not expose audit logging errors to the login response.
+      }
+
+      return res.status(401).json({
+        error: 'Invalid credentials or inactive account',
+      });
+    }
+
+    try {
+      await writeAuditLog({
+        username: result.user.username,
+        userId: result.user.id,
+        action: 'AUTH_LOGIN',
+        module: 'Authentication',
+        recordId: String(result.user.id),
+        ipAddress: req.ip || '127.0.0.1',
+        result: 'SUCCESS',
+        details: 'User logged in successfully',
+      });
+    } catch {
+      // Login remains successful if audit logging fails.
+    }
+
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.post('/auth/session', async (req: Request, res: Response) => {
+  try {
+    const requestedRole = req.body?.role as UserRole | undefined;
+
+    const usernameMap: Record<string, string> = {
+      SUPER_ADMIN: 'admin',
+      DATA_MANAGER: 'manager',
+      DATA_ANALYST: 'analyst',
+      VIEWER: 'viewer',
+    };
+
+    const targetUsername =
+      requestedRole && usernameMap[requestedRole]
+        ? usernameMap[requestedRole]
+        : 'admin';
+
+    const row = await db.user.findFirst({
+      where: {
+        username: targetUsername,
+        status: 'ACTIVE',
+      },
+    });
+
+    if (!row) {
+      return res.status(404).json({ error: 'Session user not found' });
+    }
+
+    const user: AuthUser = {
+      id: row.id,
+      username: row.username,
+      email: row.email,
+      fullName: row.fullName,
+      role: row.role as UserRole,
+      status: row.status,
+    };
+
+    return res.json({
+      user,
+      token: generateToken(user),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.get('/auth/me', (req: Request, res: Response) => {
+  const user = (req as any).user as AuthUser | undefined;
+
+  if (!user) {
+    return res.status(401).json({ error: 'Unauthenticated' });
+  }
+
+  return res.json(user);
+});
+
+apiRouter.post('/auth/logout', async (req: Request, res: Response) => {
+  const user = (req as any).user as AuthUser | undefined;
+
+  if (user) {
+    try {
+      await writeAuditLog({
+        userId: user.id,
+        username: user.username,
+        action: 'AUTH_LOGOUT',
+        module: 'Authentication',
+        recordId: String(user.id),
+        ipAddress: req.ip || '127.0.0.1',
+        result: 'SUCCESS',
+        details: 'User logged out',
+      });
+    } catch {
+      // Preserve logout response.
     }
   }
 
-  let parsedMissionIds: number[] | undefined;
-  if (typeof missionIds === 'string' && missionIds.trim()) {
-    parsedMissionIds = missionIds.split(',').map(Number).filter(n => Number.isInteger(n) && n > 0);
-  }
-
-  const result = queryTable(dbTable, {
-    page: page ? Number(page) : 1,
-    pageSize: pageSize ? Number(pageSize) : 25,
-    search: search as string,
-    sortBy: sortBy as string,
-    sortOrder: sortOrder as any,
-    mission: mission as string,
-    missionIds: parsedMissionIds,
-    filters: parsedFilters,
-  });
-
-  const canUnmask = Boolean(auth.perms.canViewUnmaskedData);
-  const shouldUnmask = unmask === 'true' && canUnmask;
-
-  const maskedData = (result.data as any[]).map(r => maskSensitiveRecord(r, shouldUnmask));
-
-  return res.json({
-    table: dbTable,
-    columns: getTableColumns(dbTable),
-    data: maskedData,
-    pagination: result.pagination,
-  });
+  return res.json({ success: true });
 });
 
-apiRouter.get('/tables/:table/:id', (req: Request, res: Response) => {
+// -----------------------------------------------------------------------------
+// Generic table CRUD
+// -----------------------------------------------------------------------------
+
+apiRouter.get('/tables/:table', async (req: Request, res: Response) => {
   const auth = requireAuth(req, res);
   if (!auth) return;
-
-  const urlTable = req.params.table;
-  const dbTable = TABLE_MAP[urlTable] || urlTable.replace(/-/g, '_');
-  const record = getRecord(dbTable, req.params.id);
-  if (!record) return res.status(404).json({ error: 'Record not found' });
-
-  const canUnmask = Boolean(auth.perms.canViewUnmaskedData);
-  return res.json(maskSensitiveRecord(record as any, canUnmask));
-});
-
-apiRouter.post('/tables/:table', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canEditRecords) {
-    return res.status(403).json({ error: 'Insufficient permissions to create records' });
-  }
-  const urlTable = req.params.table;
-  const dbTable = TABLE_MAP[urlTable] || urlTable.replace(/-/g, '_');
 
   try {
-    const created = insertRecord(dbTable, req.body);
-    db.prepare(`
-      INSERT INTO audit_logs (user_id, username, action, module, record_id, ip_address, result, details)
-      VALUES (?, ?, 'CREATE_RECORD', ?, ?, ?, 'SUCCESS', 'New record created')
-    `).run(auth.user.id, auth.user.username, dbTable, String((created as any).id || ''), req.ip || '127.0.0.1');
+    const dbTable = resolveTableName(req.params.table);
+
+    const {
+      page,
+      pageSize,
+      search,
+      sortBy,
+      sortOrder,
+      mission,
+      missionIds,
+      filters,
+    } = req.query;
+
+    const parsedFilters = parseFilters(filters);
+    const parsedMissionIds = parseMissionIds(missionIds);
+
+    const result = await queryTable(dbTable, {
+      page: page ? Number(page) : 1,
+      pageSize: pageSize ? Number(pageSize) : 25,
+      search: search as string,
+      sortBy: sortBy as string,
+      sortOrder: sortOrder as any,
+      mission: mission as string,
+      missionIds: parsedMissionIds,
+      filters: parsedFilters,
+    });
+
+    const visibleData = (result.rows as any[]).map((row) =>
+      maskSensitiveRecord(row, auth.perms.canViewUnmaskedData),
+    );
+
+    return res.json({
+      table: dbTable,
+      columns: await getTableColumns(dbTable),
+      data: visibleData,
+      pagination: {
+        page: result.page,
+        pageSize: result.pageSize,
+        total: result.total,
+        totalPages: Math.ceil(result.total / result.pageSize),
+      },
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+apiRouter.get(
+  '/registrations/backfill-countries/preview',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canImport) {
+      return res.status(403).json({
+        error: 'Insufficient permissions',
+      });
+    }
+
+    try {
+      return res.json(await previewBackfillCountries());
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.post(
+  '/registrations/backfill-countries',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canImport) {
+      return res.status(403).json({
+        error: 'Insufficient permissions',
+      });
+    }
+
+    try {
+      const result = await backfillCountries(auth.user.id);
+
+      try {
+        await writeAuditLog({
+          userId: auth.user.id,
+          username: auth.user.username,
+          action: 'BACKFILL_COUNTRIES',
+          module: 'Registrations',
+          details: `Filled ${result.updated} missing country values from IMSI`,
+          ipAddress: req.ip || '',
+        });
+      } catch {
+        // Preserve the successful backfill result.
+      }
+
+      return res.json({ success: true, ...result });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.get(
+  '/tables/:table/stats',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const dbTable = resolveTableName(req.params.table);
+
+      const stats = await getTableStats({
+        table: dbTable,
+        search:
+          typeof req.query.search === 'string'
+            ? req.query.search
+            : undefined,
+        mission:
+          typeof req.query.mission === 'string'
+            ? req.query.mission
+            : undefined,
+        missionIds: parseMissionIds(req.query.missionIds),
+        filters: parseFilters(req.query.filters),
+      });
+
+      return res.json(stats);
+    } catch (err: any) {
+      return res.status(400).json({
+        error: err.message || 'Failed to compute table statistics',
+      });
+    }
+  },
+);
+
+/**
+ * Export the exact same table statistics shown in the UI to PDF / Word / CSV.
+ * Uses the shared statistics service and the shared report exporters, so
+ * filters, mission selection and all numbers match the frontend.
+ */
+apiRouter.get(
+  '/tables/:table/stats/export',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canExport) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to export table statistics',
+      });
+    }
+
+    try {
+      const dbTable = resolveTableName(req.params.table);
+      const format = String(req.query.format || 'csv').toLowerCase();
+      if (!['pdf', 'docx', 'csv'].includes(format)) {
+        return res.status(400).json({
+          error: 'Unsupported statistics export format. Use pdf, docx or csv.',
+        });
+      }
+
+      const stats = await getTableStats({
+        table: dbTable,
+        search:
+          typeof req.query.search === 'string' ? req.query.search : undefined,
+        mission:
+          typeof req.query.mission === 'string' ? req.query.mission : undefined,
+        missionIds: parseMissionIds(req.query.missionIds),
+        filters: parseFilters(req.query.filters),
+      });
+
+      const pageName =
+        typeof req.query.pageName === 'string' && req.query.pageName.trim()
+          ? req.query.pageName.trim()
+          : dbTable;
+
+      const { exportTableStatistics } = await import('./tableStats.js');
+      const exported = await exportTableStatistics({
+        format: format as 'pdf' | 'docx' | 'csv',
+        language: req.query.lang === 'ar' ? 'ar' : 'en',
+        stats,
+        pageName,
+      });
+
+      res.setHeader('Content-Type', exported.contentType);
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${exported.filename}"`,
+      );
+      res.setHeader('X-Export-Filename', exported.filename);
+      return res.send(exported.content);
+    } catch (err: any) {
+      return res.status(500).json({
+        error: err.message || 'Failed to export table statistics',
+      });
+    }
+  },
+);
+
+apiRouter.get(
+  '/tables/:table/:id',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const dbTable = resolveTableName(req.params.table);
+      const record = await getRecord(dbTable, req.params.id);
+
+      if (!record) {
+        return res.status(404).json({ error: 'Record not found' });
+      }
+
+      return res.json(
+        maskSensitiveRecord(
+          record as any,
+          auth.perms.canViewUnmaskedData,
+        ),
+      );
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.post('/tables/:table', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+
+  if (!auth.perms.canEditRecords) {
+    return res.status(403).json({
+      error: 'Insufficient permissions to create records',
+    });
+  }
+
+  try {
+    const dbTable = resolveTableName(req.params.table);
+    const created = await insertRecord(dbTable, req.body);
+
+    await writeAuditLog({
+      userId: auth.user.id,
+      username: auth.user.username,
+      action: 'CREATE_RECORD',
+      module: dbTable,
+      recordId: String((created as any).id || ''),
+      ipAddress: req.ip || '127.0.0.1',
+      details: 'New record created',
+    });
 
     return res.status(201).json(created);
   } catch (err: any) {
@@ -420,176 +833,380 @@ apiRouter.post('/tables/:table', (req: Request, res: Response) => {
   }
 });
 
-apiRouter.put('/tables/:table/:id', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canEditRecords) {
-    return res.status(403).json({ error: 'Insufficient permissions to update records' });
-  }
-  const urlTable = req.params.table;
-  const dbTable = TABLE_MAP[urlTable] || urlTable.replace(/-/g, '_');
+apiRouter.put(
+  '/tables/:table/:id',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
 
-  try {
-    const updated = updateRecord(dbTable, req.params.id, req.body);
-    db.prepare(`
-      INSERT INTO audit_logs (user_id, username, action, module, record_id, ip_address, result, details)
-      VALUES (?, ?, 'UPDATE_RECORD', ?, ?, ?, 'SUCCESS', 'Record modified')
-    `).run(auth.user.id, auth.user.username, dbTable, String(req.params.id), req.ip || '127.0.0.1');
-
-    return res.json(updated);
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message });
-  }
-});
-
-apiRouter.delete('/tables/:table/:id', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canDeleteRecords) {
-    return res.status(403).json({ error: 'Insufficient permissions to delete records' });
-  }
-  const urlTable = req.params.table;
-  const dbTable = TABLE_MAP[urlTable] || urlTable.replace(/-/g, '_');
-
-  try {
-    deleteRecord(dbTable, req.params.id);
-    db.prepare(`
-      INSERT INTO audit_logs (user_id, username, action, module, record_id, ip_address, result, details)
-      VALUES (?, ?, 'DELETE_RECORD', ?, ?, ?, 'SUCCESS', 'Record removed')
-    `).run(auth.user.id, auth.user.username, dbTable, String(req.params.id), req.ip || '127.0.0.1');
-
-    return res.json({ success: true });
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message });
-  }
-});
-
-// --- 2b. Mission Ambiguity Resolution Endpoints ---
-
-apiRouter.get('/missions/ambiguities', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const rows = db
-    .prepare(`SELECT * FROM migration_ambiguities WHERE status = 'PENDING' ORDER BY id ASC`)
-    .all();
-  return res.json(rows);
-});
-
-apiRouter.post('/missions/ambiguities/:id/resolve', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canEditRecords) {
-    return res.status(403).json({ error: 'Insufficient permissions to resolve migration ambiguities' });
-  }
-  const ambId = Number(req.params.id);
-  const missionId = Number(req.body.missionId);
-  if (!Number.isInteger(missionId) || missionId <= 0) {
-    return res.status(400).json({ error: 'Valid missionId is required' });
-  }
-
-  const amb = db.prepare(`SELECT * FROM migration_ambiguities WHERE id = ?`).get(ambId) as any;
-  if (!amb) return res.status(404).json({ error: 'Ambiguity record not found' });
-
-  const missionRow = db.prepare(`SELECT id, mission FROM missions WHERE id = ?`).get(missionId) as any;
-  if (!missionRow) return res.status(404).json({ error: 'Selected mission not found' });
-
-  db.exec('BEGIN TRANSACTION');
-  try {
-    db.prepare(`UPDATE "${amb.table_name}" SET mission_id = ? WHERE id = ?`).run(missionId, amb.record_id);
-    db.prepare(`UPDATE migration_ambiguities SET resolved_mission_id = ?, status = 'RESOLVED' WHERE id = ?`).run(missionId, ambId);
-    db.exec('COMMIT');
-  } catch (e: any) {
-    db.exec('ROLLBACK');
-    return res.status(500).json({ error: e.message });
-  }
-
-  return res.json({ success: true, resolvedMissionId: missionId });
-});
-
-// --- 3. Interactive Map Unified Spatial Endpoint ---
-
-apiRouter.get('/map/all-layers', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-
-  const mission = req.query.mission as string;
-  const missionIdsRaw = req.query.missionIds as string;
-
-  let whereSql = '';
-  let params: any[] = [];
-
-  if (missionIdsRaw && missionIdsRaw.trim()) {
-    const ids = missionIdsRaw.split(',').map(Number).filter(n => Number.isInteger(n) && n > 0);
-    if (ids.length > 0) {
-      whereSql = `WHERE mission_id IN (${ids.map(() => '?').join(', ')})`;
-      params = ids;
+    if (!auth.perms.canEditRecords) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to update records',
+      });
     }
-  } else if (mission && mission !== 'ALL') {
-    const num = Number(mission);
-    if (!Number.isNaN(num) && Number.isInteger(num) && num > 0) {
-      whereSql = 'WHERE mission_id = ?';
-      params = [num];
-    } else {
-      whereSql = 'WHERE mission = ?';
-      params = [mission];
+
+    try {
+      const dbTable = resolveTableName(req.params.table);
+      const updated = await updateRecord(
+        dbTable,
+        req.params.id,
+        req.body,
+      );
+
+      await writeAuditLog({
+        userId: auth.user.id,
+        username: auth.user.username,
+        action: 'UPDATE_RECORD',
+        module: dbTable,
+        recordId: String(req.params.id),
+        ipAddress: req.ip || '127.0.0.1',
+        details: 'Record modified',
+      });
+
+      return res.json(updated);
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
     }
-  }
+  },
+);
 
-  const andPrefix = whereSql ? `${whereSql} AND` : 'WHERE';
+apiRouter.delete(
+  '/tables/:table/:id',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
 
-  const mapCells = db.prepare(`SELECT * FROM map_cells LIMIT 1000`).all();
-  const netCells = db
-    .prepare(`SELECT * FROM network_cells ${andPrefix} latitude IS NOT NULL AND longitude IS NOT NULL LIMIT 1000`)
-    .all(...params);
-  const gpsPoints = db
-    .prepare(`SELECT * FROM gps_history ${andPrefix} latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY timestamp ASC LIMIT 2000`)
-    .all(...params);
-  const markers = db.prepare(`SELECT * FROM map_user_markers ${whereSql}`).all(...params);
-  const polygons = db.prepare(`SELECT * FROM map_user_polygons ${whereSql}`).all(...params);
-  const circles = db.prepare(`SELECT * FROM map_user_circles ${whereSql}`).all(...params);
+    if (!auth.perms.canDeleteRecords) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to delete records',
+      });
+    }
 
-  return res.json({
-    mapCells,
-    netCells,
-    gpsPoints,
-    markers,
-    polygons,
-    circles,
-  });
-});
+    try {
+      const dbTable = resolveTableName(req.params.table);
 
-// --- 4. Data Import Center Endpoints (Single + Multi-Table SQLite) ---
+      await deleteRecord(dbTable, req.params.id);
 
-apiRouter.post('/imports/inspect', upload.single('file'), async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canImport) {
-    return res.status(403).json({ error: 'Role does not have permission to import datasets' });
-  }
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
+      await writeAuditLog({
+        userId: auth.user.id,
+        username: auth.user.username,
+        action: 'DELETE_RECORD',
+        module: dbTable,
+        recordId: String(req.params.id),
+        ipAddress: req.ip || '127.0.0.1',
+        details: 'Record removed',
+      });
 
-  try {
-    const { inspectFile } = await import('./importers.js');
-    const inspection = await inspectFile(req.file.path, req.file.originalname);
-    return res.json({
-      filePath: req.file.path,
-      originalName: req.file.originalname,
-      size: req.file.size,
-      ...inspection,
-    });
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message });
-  }
-});
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Mission ambiguity resolution
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/missions/ambiguities',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const rows = await pgQuery(
+        `SELECT * FROM migration_ambiguities
+         WHERE status = $1
+         ORDER BY id ASC`,
+        'PENDING',
+      );
+
+      return res.json(rows);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.post(
+  '/missions/ambiguities/:id/resolve',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canEditRecords) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to resolve migration ambiguities',
+      });
+    }
+
+    const ambId = Number(req.params.id);
+    const missionId = Number(req.body.missionId);
+
+    if (
+      !Number.isInteger(ambId) ||
+      ambId <= 0 ||
+      !Number.isInteger(missionId) ||
+      missionId <= 0
+    ) {
+      return res.status(400).json({
+        error: 'Valid ambiguity id and missionId are required',
+      });
+    }
+
+    try {
+      const result = await db.$transaction(async (tx) => {
+        const ambiguityRows = await tx.$queryRawUnsafe<any[]>(
+          `SELECT * FROM migration_ambiguities
+           WHERE id = $1
+           FOR UPDATE`,
+          ambId,
+        );
+
+        const ambiguity = ambiguityRows[0];
+
+        if (!ambiguity) {
+          throw new Error('AMBIGUITY_NOT_FOUND');
+        }
+
+        const missionRows = await tx.$queryRawUnsafe<any[]>(
+          `SELECT id, mission FROM missions WHERE id = $1`,
+          missionId,
+        );
+
+        if (!missionRows.length) {
+          throw new Error('MISSION_NOT_FOUND');
+        }
+
+        const tableName = String(ambiguity.table_name || '');
+        const allowedTables = new Set([
+          'registrations',
+          'targets',
+          'network_cells',
+          'wifi_access_points',
+          'gps_history',
+          'sms_calls',
+          'mission_extras',
+          'location_extras',
+          'mission_files',
+          'location_files',
+          'map_user_markers',
+          'map_user_polygons',
+          'map_user_circles',
+        ]);
+
+        if (!allowedTables.has(tableName)) {
+          throw new Error('INVALID_AMBIGUITY_TABLE');
+        }
+
+        const recordId = Number(ambiguity.record_id);
+
+        if (!Number.isInteger(recordId) || recordId <= 0) {
+          throw new Error('INVALID_AMBIGUITY_RECORD');
+        }
+
+        await tx.$executeRawUnsafe(
+          `UPDATE ${quoteIdentifier(tableName)}
+           SET mission_id = $1
+           WHERE id = $2`,
+          missionId,
+          recordId,
+        );
+
+        await tx.$executeRawUnsafe(
+          `UPDATE migration_ambiguities
+           SET resolved_mission_id = $1,
+               status = 'RESOLVED'
+           WHERE id = $2`,
+          missionId,
+          ambId,
+        );
+
+        return { success: true, resolvedMissionId: missionId };
+      });
+
+      return res.json(result);
+    } catch (err: any) {
+      if (err.message === 'AMBIGUITY_NOT_FOUND') {
+        return res.status(404).json({
+          error: 'Ambiguity record not found',
+        });
+      }
+
+      if (err.message === 'MISSION_NOT_FOUND') {
+        return res.status(404).json({
+          error: 'Selected mission not found',
+        });
+      }
+
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Unified map endpoint
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/map/all-layers',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const mission = req.query.mission as string | undefined;
+      const missionIds = parseMissionIds(req.query.missionIds);
+
+      let whereSql = '';
+      let params: any[] = [];
+
+      if (missionIds?.length) {
+        const placeholders = missionIds
+          .map((_, i) => `$${i + 1}`)
+          .join(', ');
+
+        whereSql = `WHERE mission_id IN (${placeholders})`;
+        params = missionIds;
+      } else if (mission && mission !== 'ALL') {
+        const missionNumber = Number(mission);
+
+        if (
+          Number.isInteger(missionNumber) &&
+          missionNumber > 0
+        ) {
+          whereSql = 'WHERE mission_id = $1';
+          params = [missionNumber];
+        } else {
+          whereSql = 'WHERE mission = $1';
+          params = [mission];
+        }
+      }
+
+      const andPrefix = whereSql ? `${whereSql} AND` : 'WHERE';
+
+      const [
+        mapCells,
+        netCells,
+        gpsPoints,
+        markers,
+        polygons,
+        circles,
+      ] = await Promise.all([
+         await pgQuery(
+  `
+  SELECT mc.*
+  FROM map_cells mc
+  INNER JOIN map_cell_databases mdb
+    ON mdb.id = mc.db_id
+  WHERE (
+    $1::int[] IS NULL
+    OR mdb.mission_id = ANY($1::int[])
+  )
+  ORDER BY mc.id
+  LIMIT 1000
+  `,
+  missionIds && missionIds.length > 0
+  ? missionIds
+  : null
+),
+        pgQuery(
+          `SELECT * FROM network_cells
+           ${andPrefix}
+           latitude IS NOT NULL
+           AND longitude IS NOT NULL
+           LIMIT 1000`,
+          ...params,
+        ),
+        pgQuery(
+          `SELECT * FROM gps_history
+           ${andPrefix}
+           latitude IS NOT NULL
+           AND longitude IS NOT NULL
+           ORDER BY timestamp ASC
+           LIMIT 2000`,
+          ...params,
+        ),
+        pgQuery(
+          `SELECT * FROM map_user_markers ${whereSql}`,
+          ...params,
+        ),
+        pgQuery(
+          `SELECT * FROM map_user_polygons ${whereSql}`,
+          ...params,
+        ),
+        pgQuery(
+          `SELECT * FROM map_user_circles ${whereSql}`,
+          ...params,
+        ),
+      ]);
+
+      return res.json({
+        mapCells,
+        netCells,
+        gpsPoints,
+        markers,
+        polygons,
+        circles,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Imports
+// -----------------------------------------------------------------------------
+
+apiRouter.post(
+  '/imports/inspect',
+  upload.single('file'),
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canImport) {
+      return res.status(403).json({
+        error: 'Role does not have permission to import datasets',
+      });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    try {
+      const { inspectFile } = await import('./importers.js');
+
+      const inspection = await inspectFile(
+        req.file.path,
+        req.file.originalname,
+      );
+
+      return res.json({
+        filePath: req.file.path,
+        originalName: req.file.originalname,
+        size: req.file.size,
+        ...inspection,
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
 
 apiRouter.post('/imports/execute', async (req: Request, res: Response) => {
   const auth = requireAuth(req, res);
   if (!auth) return;
+
   if (!auth.perms.canImport) {
-    return res.status(403).json({ error: 'Role does not have permission to execute imports' });
+    return res.status(403).json({
+      error: 'Role does not have permission to execute imports',
+    });
   }
+
   const {
     filePath,
     originalName,
@@ -602,18 +1219,22 @@ apiRouter.post('/imports/execute', async (req: Request, res: Response) => {
   } = req.body;
 
   if (!filePath || !originalName || !destinationTable || !columnMapping) {
-    return res.status(400).json({ error: 'Missing required import parameters' });
+    return res.status(400).json({
+      error: 'Missing required import parameters',
+    });
   }
 
   let safePath: string;
+
   try {
     safePath = assertUploadPathSafe(filePath);
-  } catch (e: any) {
-    return res.status(403).json({ error: e.message });
+  } catch (err: any) {
+    return res.status(403).json({ error: err.message });
   }
 
   try {
     const { executeImport } = await import('./importers.js');
+
     const result = await executeImport({
       filePath: safePath,
       originalName,
@@ -629,177 +1250,396 @@ apiRouter.post('/imports/execute', async (req: Request, res: Response) => {
 
     return res.json({ success: true, result });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
-  }
-});
+    const msg = String(err?.message || err);
+    let description = msg;
 
-apiRouter.post('/imports/sqlite/estimate', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canImport) {
-    return res.status(403).json({ error: 'Role does not have permission to inspect/import SQLite files' });
-  }
-  const parsed = MultiSqliteImportRequestSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: 'Invalid multi-table import request', details: parsed.error.flatten() });
-  }
-
-  let safePath: string;
-  try {
-    safePath = assertUploadPathSafe(parsed.data.filePath);
-  } catch (e: any) {
-    return res.status(403).json({ error: e.message });
-  }
-
-  try {
-    const { estimateMultiSqliteImport } = await import('./importers.js');
-    const result = estimateMultiSqliteImport(safePath, parsed.data.tables);
-    return res.json(result);
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message });
-  }
-});
-
-apiRouter.post('/imports/sqlite/multi-execute', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canImport) {
-    return res.status(403).json({ error: 'Insufficient role privileges to execute SQLite multi-table import' });
-  }
-
-  const parsed = MultiSqliteImportRequestSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: 'Invalid multi-table import payload', details: parsed.error.flatten() });
-  }
-
-  let safePath: string;
-  try {
-    safePath = assertUploadPathSafe(parsed.data.filePath);
-  } catch (e: any) {
-    return res.status(403).json({ error: e.message });
-  }
-
-  try {
-    const { executeMultiSqliteImport } = await import('./importers.js');
-    const requestedJobId = typeof req.body.jobId === 'string' && /^job_[a-zA-Z0-9_-]{4,40}$/.test(req.body.jobId)
-      ? req.body.jobId
-      : `job_${Date.now()}`;
-    const result = await executeMultiSqliteImport({
-      filePath: safePath,
-      originalName: parsed.data.originalName,
-      tables: parsed.data.tables,
-      userId: auth.user.id,
-      username: auth.user.username,
-      jobId: requestedJobId,
-    });
-    return res.json({ success: true, ...result });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-apiRouter.get('/imports/sqlite/progress/:jobId', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const { getMultiImportProgress } = await import('./importers.js');
-  const prog = getMultiImportProgress(req.params.jobId);
-  if (!prog) return res.status(404).json({ error: 'Import job not found' });
-  return res.json(prog);
-});
-
-apiRouter.post('/imports/sqlite/cancel/:jobId', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canImport) {
-    return res.status(403).json({ error: 'Insufficient permissions to cancel import jobs' });
-  }
-  const { cancelMultiSqliteImport } = await import('./importers.js');
-  const cancelled = cancelMultiSqliteImport(req.params.jobId);
-  if (!cancelled) {
-    return res.status(404).json({ error: 'Import job not found or already completed' });
-  }
-  return res.json({ success: true, jobId: req.params.jobId, status: 'CANCELLED' });
-});
-
-apiRouter.get('/imports/history', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const rows = db
-    .prepare(`
-      SELECT h.*, u.username as user_name
-      FROM import_history h
-      LEFT JOIN users u ON h.user_id = u.id
-      ORDER BY h.created_at DESC
-      LIMIT 100
-    `)
-    .all();
-  return res.json(rows);
-});
-
-// --- 5. Data Export Center & Dashboard Export Endpoints ---
-
-apiRouter.get('/exports/download', async (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canExport) {
-    return res.status(403).json({ error: 'Insufficient permissions to export data' });
-  }
-
-  const { table, format, mission, search, filters } = req.query;
-  if (!table) return res.status(400).json({ error: 'Table is required' });
-  const exportFormat = (format as any) || 'csv';
-
-  let parsedFilters = [];
-  if (filters && typeof filters === 'string') {
-    try {
-      parsedFilters = JSON.parse(filters);
-    } catch {
-      parsedFilters = [];
+    if (/FOREIGN KEY/i.test(msg)) {
+      description =
+        'Foreign key constraint failed. A referenced record does not exist. ' +
+        msg;
+    } else if (/UNIQUE/i.test(msg)) {
+      description = 'Duplicate/unique constraint failed: ' + msg;
+    } else if (/NOT NULL/i.test(msg)) {
+      description = 'Required field missing: ' + msg;
     }
-  }
 
-  try {
-    const { exportDataset } = await import('./exporters.js');
-    const exported = await exportDataset({
-      tableName: String(table),
-      format: exportFormat,
-      mission: mission as string,
-      search: search as string,
-      filters: parsedFilters,
-      username: auth.user.username,
-      canUnmask: auth.perms.canViewUnmaskedData,
-    });
-
-    res.setHeader('Content-Type', exported.contentType);
-    res.setHeader('Content-Disposition', `attachment; filename="${exported.filename}"`);
-    return res.send(exported.content);
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: description });
   }
 });
+
+apiRouter.post(
+  '/imports/sqlite/estimate',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canImport) {
+      return res.status(403).json({
+        error: 'Role does not have permission to inspect/import SQLite files',
+      });
+    }
+
+    const parsed = MultiSqliteImportRequestSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'Invalid multi-table import request',
+        details: parsed.error.flatten(),
+      });
+    }
+
+    let safePath: string;
+
+    try {
+      safePath = assertUploadPathSafe(parsed.data.filePath);
+    } catch (err: any) {
+      return res.status(403).json({ error: err.message });
+    }
+
+    try {
+      const { estimateMultiSqliteImport } =
+        await import('./importers.js');
+
+      const result = await estimateMultiSqliteImport(
+        safePath,
+        parsed.data.tables,
+      );
+
+      return res.json({ success: true, ...result });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.post(
+  '/imports/sqlite/multi-execute',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canImport) {
+      return res.status(403).json({
+        error: 'Insufficient role privileges to execute SQLite multi-table import',
+      });
+    }
+
+    const parsed = MultiSqliteImportRequestSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'Invalid multi-table import payload',
+        details: parsed.error.flatten(),
+      });
+    }
+
+    let safePath: string;
+
+    try {
+      safePath = assertUploadPathSafe(parsed.data.filePath);
+    } catch (err: any) {
+      return res.status(403).json({ error: err.message });
+    }
+
+    try {
+      const { executeMultiSqliteImport } =
+        await import('./importers.js');
+
+      const requestedJobId =
+        typeof req.body.jobId === 'string' &&
+        /^job_[a-zA-Z0-9_-]{4,40}$/.test(req.body.jobId)
+          ? req.body.jobId
+          : `job_${Date.now()}`;
+
+      const result = await executeMultiSqliteImport({
+        filePath: safePath,
+        originalName: parsed.data.originalName,
+        tables: parsed.data.tables,
+        userId: auth.user.id,
+        username: auth.user.username,
+        jobId: requestedJobId,
+      });
+
+      return res.json(result);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.get(
+  '/imports/sqlite/progress/:jobId',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    const { getMultiImportProgress } =
+      await import('./importers.js');
+
+    const progress = getMultiImportProgress(req.params.jobId);
+
+    if (!progress) {
+      return res.status(404).json({ error: 'Import job not found' });
+    }
+
+    return res.json(progress);
+  },
+);
+
+apiRouter.post(
+  '/imports/sqlite/cancel/:jobId',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canImport) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to cancel import jobs',
+      });
+    }
+
+    const { cancelMultiSqliteImport } =
+      await import('./importers.js');
+
+    const cancelled = cancelMultiSqliteImport(req.params.jobId);
+
+    if (!cancelled) {
+      return res.status(404).json({
+        error: 'Import job not found or already completed',
+      });
+    }
+
+    return res.json({
+      success: true,
+      jobId: req.params.jobId,
+      status: 'CANCELLED',
+    });
+  },
+);
+
+apiRouter.get(
+  '/imports/history',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const rows = await pgQuery(`
+        SELECT
+          h.*,
+          u.username AS user_name
+        FROM import_history h
+        LEFT JOIN users u ON h.user_id = u.id
+        ORDER BY h.created_at DESC
+        LIMIT 100
+      `);
+
+      return res.json(rows);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.get(
+  '/imports/batches',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const tableName =
+        typeof req.query.tableName === 'string'
+          ? req.query.tableName
+          : undefined;
+
+      const status =
+        typeof req.query.status === 'string'
+          ? req.query.status
+          : undefined;
+
+      const user =
+        typeof req.query.user === 'string'
+          ? req.query.user
+          : undefined;
+
+      const conditions: string[] = [];
+      const params: any[] = [];
+
+      if (tableName) {
+        params.push(tableName);
+        conditions.push(`b.destination_table = $${params.length}`);
+      }
+
+      if (status) {
+        params.push(status);
+        conditions.push(`b.status = $${params.length}`);
+      }
+
+      if (user) {
+        params.push(user);
+        const usernameParam = params.length;
+
+        params.push(Number(user) || -1);
+        const userIdParam = params.length;
+
+        conditions.push(
+          `(u.username = $${usernameParam} OR b.user_id = $${userIdParam})`,
+        );
+      }
+
+      const where = conditions.length
+        ? `WHERE ${conditions.join(' AND ')}`
+        : '';
+
+      const rows = await pgQuery(
+        `SELECT
+           b.*,
+           u.username AS user_name
+         FROM import_batches b
+         LEFT JOIN users u ON b.user_id = u.id
+         ${where}
+         ORDER BY b.created_at DESC
+         LIMIT 200`,
+        ...params,
+      );
+
+      return res.json(rows);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.post(
+  '/imports/:batchId/undo',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canImport) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to undo imports',
+      });
+    }
+
+    try {
+      const { undoBatch } = await import('./db.js');
+
+      const result = await undoBatch(
+        req.params.batchId,
+        auth.user.id,
+      );
+
+      try {
+        await writeAuditLog({
+          userId: auth.user.id,
+          username: auth.user.username,
+          action: 'IMPORT_UNDO',
+          module: 'ImportCenter',
+          details:
+            `Undo batch ${req.params.batchId}: ` +
+            `deleted ${result.deleted}, restored ${result.restored}`,
+          ipAddress: req.ip || '',
+        });
+      } catch {
+        // Preserve undo result.
+      }
+
+      return res.json(result);
+    } catch (err: any) {
+      return res.status(400).json({
+        error: err.message || 'Undo failed',
+      });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Exports
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/exports/download',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canExport) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to export data',
+      });
+    }
+
+    const { table, format, mission, search, filters } = req.query;
+
+    if (!table) {
+      return res.status(400).json({ error: 'Table is required' });
+    }
+
+    try {
+      const { exportDataset } = await import('./exporters.js');
+
+      const exported = await exportDataset({
+        tableName: String(table),
+        format: (format as any) || 'csv',
+        mission: mission as string,
+        search: search as string,
+        filters: parseFilters(filters),
+        username: auth.user.username,
+        canUnmask: auth.perms.canViewUnmaskedData,
+      });
+
+      res.setHeader('Content-Type', exported.contentType);
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${exported.filename}"`,
+      );
+
+      return res.send(exported.content);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
 
 apiRouter.post('/exports/chart', async (req: Request, res: Response) => {
   const auth = requireAuth(req, res);
   if (!auth) return;
+
   if (!auth.perms.canExport) {
-    return res.status(403).json({ error: 'Insufficient role permissions to export charts or map views' });
+    return res.status(403).json({
+      error: 'Insufficient role permissions to export charts or map views',
+    });
   }
 
   const parsed = ChartExportRequestSchema.safeParse(req.body);
+
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Invalid chart export request', details: parsed.error.flatten() });
+    return res.status(400).json({
+      error: 'Invalid chart export request',
+      details: parsed.error.flatten(),
+    });
   }
 
   const { chartId, format, language, filters, chartImage } = parsed.data;
+
   if (filters.tmsi && !auth.perms.canViewUnmaskedData) {
-    return res.status(403).json({ error: 'Role is not authorized to filter or export by TMSI' });
+    return res.status(403).json({
+      error: 'Role is not authorized to filter or export by TMSI',
+    });
   }
+
   if (format === 'geojson' && chartId !== 'btsMap') {
-    return res.status(400).json({ error: 'GeoJSON format is only supported for the BTS geographic map' });
+    return res.status(400).json({
+      error: 'GeoJSON format is only supported for the BTS geographic map',
+    });
   }
 
   try {
-    const { generateChartExport } = await import('./dashboardExporter.js');
+    const { generateChartExport } =
+      await import('./dashboardExporter.js');
+
     const result = await generateChartExport({
       chartId,
       format,
@@ -815,401 +1655,1419 @@ apiRouter.post('/exports/chart', async (req: Request, res: Response) => {
         success: true,
         exportId: result.exportId,
         fileName: result.fileName,
-        downloadUrl: `/api/v1/exports/dashboard/${result.exportId}/download`,
+        downloadUrl:
+          `/api/v1/exports/dashboard/${result.exportId}/download`,
       });
     }
 
     res.setHeader('Content-Type', result.contentType);
-    res.setHeader('Content-Disposition', `attachment; filename="${result.fileName}"`);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${result.fileName}"`,
+    );
     res.setHeader('X-Export-Id', String(result.exportId));
     res.setHeader('X-Export-Filename', result.fileName);
+
     return res.send(result.buffer);
   } catch (err: any) {
     return res.status(400).json({ error: err.message });
   }
 });
 
-apiRouter.post('/exports/dashboard', async (req: Request, res: Response) => {
-  const auth = getUserPerms(req);
-  if (!auth) {
-    return res.status(401).json({ error: 'Authentication required to export dashboard reports' });
-  }
-  if (!auth.perms.canExport) {
-    return res.status(403).json({ error: 'Insufficient role permissions to export dashboard reports' });
-  }
+apiRouter.post(
+  '/exports/dashboard',
+  async (req: Request, res: Response) => {
+    const auth = getUserPerms(req);
 
-  const parsed = DashboardExportRequestSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: 'Invalid export parameters', details: parsed.error.flatten() });
-  }
+    if (!auth) {
+      return res.status(401).json({
+        error: 'Authentication required to export dashboard reports',
+      });
+    }
 
-  const { format, language, filters, scope, chartImages } = parsed.data;
+    if (!auth.perms.canExport) {
+      return res.status(403).json({
+        error: 'Insufficient role permissions to export dashboard reports',
+      });
+    }
 
-  // Enforce RBAC on TMSI filter & unmasked sensitive identifiers
-  if (filters.tmsi && !auth.perms.canViewUnmaskedData) {
-    return res.status(403).json({ error: 'Role is not authorized to filter or export by TMSI' });
-  }
-  if (scope.includeSensitiveIdentifiers && !auth.perms.canViewUnmaskedData) {
-    return res.status(403).json({ error: 'Role is not authorized to export unmasked IMSI/IMEI/TMSI identifiers' });
+    const parsed = DashboardExportRequestSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'Invalid export parameters',
+        details: parsed.error.flatten(),
+      });
+    }
+
+    const { format, language, filters, scope, chartImages } = parsed.data;
+
+    if (filters.tmsi && !auth.perms.canViewUnmaskedData) {
+      return res.status(403).json({
+        error: 'Role is not authorized to filter or export by TMSI',
+      });
+    }
+
+    if (
+      scope.includeSensitiveIdentifiers &&
+      !auth.perms.canViewUnmaskedData
+    ) {
+      return res.status(403).json({
+        error:
+          'Role is not authorized to export unmasked IMSI/IMEI/TMSI identifiers',
+      });
+    }
+
+    try {
+      const { generateDashboardExport } =
+        await import('./dashboardExporter.js');
+
+      const result = await generateDashboardExport({
+        format,
+        language,
+        filters,
+        scope,
+        chartImages,
+        userId: auth.user.id,
+        username: auth.user.username,
+        canUnmask: auth.perms.canViewUnmaskedData,
+      });
+
+      if (req.query.stream === 'true') {
+        res.setHeader('Content-Type', result.contentType);
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${result.fileName}"`,
+        );
+
+        return res.send(result.buffer);
+      }
+
+      return res.status(201).json({
+        success: true,
+        exportId: result.exportId,
+        fileName: result.fileName,
+        downloadUrl:
+          `/api/v1/exports/dashboard/${result.exportId}/download`,
+      });
+    } catch (err: any) {
+      try {
+        await pgExecute(
+          `INSERT INTO export_history
+             (user_id, username, format, scope, status, error_details)
+           VALUES ($1, $2, $3, 'dashboard', 'FAILED', $4)`,
+          auth.user.id,
+          auth.user.username,
+          String(format).toUpperCase(),
+          err.message,
+        );
+      } catch {
+        // Preserve original export error.
+      }
+
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.get(
+  '/exports/dashboard/:id/download',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canExport) {
+      return res.status(403).json({
+        error: 'Insufficient role permissions',
+      });
+    }
+
+    try {
+      const id = Number(req.params.id);
+
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid export id' });
+      }
+
+      const rows = await pgQuery<any>(
+        `SELECT * FROM export_history WHERE id = $1`,
+        id,
+      );
+
+      const row = rows[0];
+
+      if (!row || !row.file_path || !fs.existsSync(row.file_path)) {
+        return res.status(404).json({
+          error: 'Export file not found or expired',
+        });
+      }
+
+      const resolved = path.resolve(row.file_path);
+
+      if (!resolved.startsWith(EXPORTS_DIR + path.sep)) {
+        return res.status(403).json({
+          error: 'Invalid export file path',
+        });
+      }
+
+      const ext = path
+        .extname(row.file_name || row.file_path)
+        .toLowerCase();
+
+      const mime =
+        ext === '.pdf'
+          ? 'application/pdf'
+          : ext === '.docx'
+            ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            : ext === '.png'
+              ? 'image/png'
+              : ext === '.csv'
+                ? 'text/csv; charset=utf-8'
+                : ext === '.geojson'
+                  ? 'application/geo+json; charset=utf-8'
+                  : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+      res.setHeader('Content-Type', mime);
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${path.basename(row.file_name || resolved)}"`,
+      );
+
+      return res.sendFile(resolved);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.get(
+  '/exports/history',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canExport) {
+      return res.status(403).json({
+        error: 'Insufficient role permissions',
+      });
+    }
+
+    try {
+      const rows = await pgQuery(`
+        SELECT
+          id,
+          user_id,
+          username,
+          format,
+          scope,
+          selected_missions,
+          applied_filters,
+          status,
+          file_name,
+          file_size,
+          error_details,
+          created_at
+        FROM export_history
+        ORDER BY created_at DESC
+        LIMIT 100
+      `);
+
+      return res.json(rows);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Analytics, dashboard, BTS map
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/analytics/filter-options',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      return res.json(await getDashboardFilterOptions());
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.get(
+  '/analytics/dashboard',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    const parsed = DashboardFilterSchema.safeParse(req.query);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'Invalid filter query parameters',
+        details: parsed.error.flatten(),
+      });
+    }
+
+    if (
+      parsed.data.tmsi &&
+      !auth.perms.canViewUnmaskedData
+    ) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to filter by TMSI',
+      });
+    }
+
+    try {
+      return res.json(await getDashboardKPIs(parsed.data));
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.post(
+  '/analytics/dashboard',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    const parsed = DashboardFilterSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'Invalid filter payload',
+        details: parsed.error.flatten(),
+      });
+    }
+
+    if (
+      parsed.data.tmsi &&
+      !auth.perms.canViewUnmaskedData
+    ) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to filter by TMSI',
+      });
+    }
+
+    try {
+      return res.json(await getDashboardKPIs(parsed.data));
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.get(
+  '/analytics/bts-map',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    const parsed = DashboardFilterSchema.safeParse(req.query);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'Invalid map filter parameters',
+        details: parsed.error.flatten(),
+      });
+    }
+
+    if (
+      parsed.data.tmsi &&
+      !auth.perms.canViewUnmaskedData
+    ) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to filter map by TMSI',
+      });
+    }
+
+    try {
+      return res.json(await getBtsMapData(parsed.data));
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.post(
+  '/analytics/widget/:widgetId',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    const widgetId = req.params.widgetId as DashboardWidgetId;
+
+    if (!ALLOWED_WIDGET_IDS.has(widgetId)) {
+      return res.status(404).json({
+        error: `Unknown dashboard widget: ${widgetId}`,
+      });
+    }
+
+    const parsed = DashboardFilterSchema.safeParse(req.body || {});
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'Invalid filter payload',
+        details: parsed.error.flatten(),
+      });
+    }
+
+    if (
+      parsed.data.tmsi &&
+      !auth.perms.canViewUnmaskedData
+    ) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to filter by TMSI',
+      });
+    }
+
+    try {
+      return res.json(await getDashboardWidget(widgetId, parsed.data));
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// MCC/MNC operator mappings
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/analytics/mcc-mnc-operators',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const rows = await pgQuery(`
+        SELECT
+          id,
+          mcc,
+          mnc,
+          operator_name,
+          country,
+          network_category,
+          is_military,
+          is_active,
+          created_at,
+          updated_at
+        FROM mcc_mnc_operator_mappings
+        ORDER BY mcc, mnc
+      `);
+
+      return res.json(rows);
+    } catch (err: any) {
+      return res.status(500).json({
+        error: err.message || 'Failed to load operator mappings',
+      });
+    }
+  },
+);
+
+apiRouter.post(
+  '/analytics/mcc-mnc-operators',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (
+      !['SUPER_ADMIN', 'ADMIN', 'DATA_MANAGER'].includes(
+        auth.user.role,
+      )
+    ) {
+      return res.status(403).json({
+        error: 'Insufficient role privileges to manage MCC/MNC mappings',
+      });
+    }
+
+    const {
+      mcc,
+      mnc,
+      operatorName,
+      country,
+      networkCategory,
+      isMilitary,
+    } = req.body || {};
+
+    if (!mcc || !mnc || !operatorName) {
+      return res.status(400).json({
+        error: 'mcc, mnc and operatorName are required',
+      });
+    }
+
+    try {
+      const rows = await pgQuery<any>(
+        `INSERT INTO mcc_mnc_operator_mappings
+           (mcc, mnc, operator_name, country, network_category,
+            is_military, is_active)
+         VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+         RETURNING id`,
+        String(mcc).trim(),
+        String(mnc).trim(),
+        String(operatorName).trim(),
+        String(country || 'Unknown').trim(),
+        networkCategory || null,
+        Boolean(isMilitary),
+      );
+
+      return res.status(201).json({
+        id: rows[0].id,
+        mcc,
+        mnc,
+        operatorName,
+        country: country || 'Unknown',
+        networkCategory: networkCategory || null,
+        isMilitary: Boolean(isMilitary),
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.put(
+  '/analytics/mcc-mnc-operators/:id',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (
+      !['SUPER_ADMIN', 'ADMIN', 'DATA_MANAGER'].includes(
+        auth.user.role,
+      )
+    ) {
+      return res.status(403).json({
+        error: 'Insufficient role privileges to update MCC/MNC mappings',
+      });
+    }
+
+    const id = Number(req.params.id);
+
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid mapping id' });
+    }
+
+    const {
+      mcc,
+      mnc,
+      operatorName,
+      country,
+      networkCategory,
+      isMilitary,
+      isActive,
+    } = req.body || {};
+
+    try {
+      const rows = await pgQuery<any>(
+        `UPDATE mcc_mnc_operator_mappings
+         SET mcc = $1,
+             mnc = $2,
+             operator_name = $3,
+             country = $4,
+             network_category = $5,
+             is_military = $6,
+             is_active = $7,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $8
+         RETURNING id`,
+        String(mcc || '').trim(),
+        String(mnc || '').trim(),
+        String(operatorName || '').trim(),
+        String(country || 'Unknown').trim(),
+        networkCategory || null,
+        Boolean(isMilitary),
+        isActive !== false,
+        id,
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({ error: 'Mapping not found' });
+      }
+
+      return res.json({ updated: true, id });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.delete(
+  '/analytics/mcc-mnc-operators/:id',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (
+      !['SUPER_ADMIN', 'ADMIN', 'DATA_MANAGER'].includes(
+        auth.user.role,
+      )
+    ) {
+      return res.status(403).json({
+        error: 'Insufficient role privileges to remove MCC/MNC mappings',
+      });
+    }
+
+    const id = Number(req.params.id);
+
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid mapping id' });
+    }
+
+    try {
+      const rows = await pgQuery<any>(
+        `DELETE FROM mcc_mnc_operator_mappings
+         WHERE id = $1
+         RETURNING id`,
+        id,
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({ error: 'Mapping not found' });
+      }
+
+      return res.json({ deleted: true, id });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// PLMN lookup
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/plmn/search',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const q =
+        typeof req.query.q === 'string'
+          ? req.query.q.trim()
+          : '';
+
+      if (!q) {
+        const rows = await pgQuery(`
+          SELECT mcc, mnc, country, code, name
+          FROM plmn_storage
+          ORDER BY mcc, mnc
+          LIMIT 100
+        `);
+
+        return res.json(rows);
+      }
+
+      const term = `%${q}%`;
+
+      const rows = await pgQuery(
+        `SELECT mcc, mnc, country, code, name
+         FROM plmn_storage
+         WHERE name ILIKE $1
+            OR country ILIKE $2
+            OR code ILIKE $3
+            OR CAST(mcc AS TEXT) ILIKE $4
+            OR CAST(mnc AS TEXT) ILIKE $5
+         ORDER BY mcc, mnc
+         LIMIT 100`,
+        term,
+        term,
+        term,
+        term,
+        term,
+      );
+
+      return res.json(rows);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Saved views
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/saved-views',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const tableName =
+        typeof req.query.tableName === 'string'
+          ? req.query.tableName
+          : 'dashboard';
+
+      const isAdmin = ['SUPER_ADMIN', 'ADMIN'].includes(
+        auth.user.role,
+      );
+
+      const rows = isAdmin
+        ? await pgQuery(
+            `SELECT id, user_id, table_name, view_name,
+                    filters_json, is_default, created_at
+             FROM saved_views
+             WHERE table_name = $1
+             ORDER BY created_at DESC`,
+            tableName,
+          )
+        : await pgQuery(
+            `SELECT id, user_id, table_name, view_name,
+                    filters_json, is_default, created_at
+             FROM saved_views
+             WHERE table_name = $1
+               AND (user_id = $2 OR user_id IS NULL)
+             ORDER BY created_at DESC`,
+            tableName,
+            auth.user.id,
+          );
+
+      return res.json(rows);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.post(
+  '/saved-views',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    const { tableName, viewName, filters } = req.body || {};
+
+    if (!viewName || filters === undefined || filters === null) {
+      return res.status(400).json({
+        error: 'viewName and filters are required',
+      });
+    }
+
+    try {
+      const resolvedTable = tableName || 'dashboard';
+      const resolvedName = String(viewName).trim();
+      const filtersJson = JSON.stringify(filters);
+
+      const rows = await pgQuery<any>(
+        `INSERT INTO saved_views
+           (user_id, table_name, view_name, filters_json)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id`,
+        auth.user.id,
+        resolvedTable,
+        resolvedName,
+        filtersJson,
+      );
+
+      return res.status(201).json({
+        id: rows[0].id,
+        user_id: auth.user.id,
+        table_name: resolvedTable,
+        view_name: resolvedName,
+        filters_json: filtersJson,
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.put(
+  '/saved-views/:id',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    const viewId = Number(req.params.id);
+
+    if (!Number.isInteger(viewId) || viewId <= 0) {
+      return res.status(400).json({ error: 'Invalid saved view id' });
+    }
+
+    try {
+      const rows = await pgQuery<any>(
+        `SELECT id, user_id
+         FROM saved_views
+         WHERE id = $1`,
+        viewId,
+      );
+
+      const existing = rows[0];
+
+      if (!existing) {
+        return res.status(404).json({
+          error: 'Saved view not found',
+        });
+      }
+
+      const isAdmin = ['SUPER_ADMIN', 'ADMIN'].includes(
+        auth.user.role,
+      );
+
+      if (!isAdmin && existing.user_id !== auth.user.id) {
+        return res.status(403).json({
+          error: 'You do not have permission to update another user saved view',
+        });
+      }
+
+      const { viewName, filters } = req.body || {};
+      const updates: string[] = [];
+      const params: any[] = [];
+
+      if (viewName !== undefined) {
+        params.push(String(viewName).trim());
+        updates.push(`view_name = $${params.length}`);
+      }
+
+      if (filters !== undefined) {
+        params.push(JSON.stringify(filters));
+        updates.push(`filters_json = $${params.length}`);
+      }
+
+      if (updates.length) {
+        params.push(viewId);
+
+        await pgExecute(
+          `UPDATE saved_views
+           SET ${updates.join(', ')}
+           WHERE id = $${params.length}`,
+          ...params,
+        );
+      }
+
+      return res.json({ success: true, id: viewId });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.delete(
+  '/saved-views/:id',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    const viewId = Number(req.params.id);
+
+    if (!Number.isInteger(viewId) || viewId <= 0) {
+      return res.status(400).json({ error: 'Invalid saved view id' });
+    }
+
+    try {
+      const rows = await pgQuery<any>(
+        `SELECT id, user_id FROM saved_views WHERE id = $1`,
+        viewId,
+      );
+
+      const existing = rows[0];
+
+      if (!existing) {
+        return res.status(404).json({
+          error: 'Saved view not found',
+        });
+      }
+
+      const isAdmin = ['SUPER_ADMIN', 'ADMIN'].includes(
+        auth.user.role,
+      );
+
+      if (!isAdmin && existing.user_id !== auth.user.id) {
+        return res.status(403).json({
+          error: 'You do not have permission to delete another user saved view',
+        });
+      }
+
+      await pgExecute(
+        `DELETE FROM saved_views WHERE id = $1`,
+        viewId,
+      );
+
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Dynamic analytics
+// -----------------------------------------------------------------------------
+
+apiRouter.post(
+  '/analytics/query',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    const body = req.body || {};
+    const table = body.table;
+
+    const dimensions = Array.isArray(body.dimensions)
+      ? body.dimensions
+      : body.dimensionCol
+        ? [body.dimensionCol]
+        : [];
+
+    if (!table || dimensions.length === 0) {
+      return res.status(400).json({
+        error:
+          'Table and at least one grouping dimension are required',
+      });
+    }
+
+    try {
+      const data = await executeDynamicAnalytics({
+        table,
+        dimensionCol: body.dimensionCol,
+        dimensions,
+        metricCol: body.metricCol,
+        metrics: body.metrics,
+        aggregation: body.aggregation || 'COUNT',
+        mission: body.mission,
+        missionIds: body.missionIds,
+        filters: body.filters,
+        limit: body.limit,
+        offset: body.offset,
+        sortBy: body.sortBy,
+        sortOrder: body.sortOrder,
+      });
+
+      return res.json(data);
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.post(
+  '/exports/analytics',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (!auth.perms.canExport) {
+      return res.status(403).json({
+        error: 'Insufficient permissions to export data',
+      });
+    }
+
+    const body = req.body || {};
+    const format = String(body.format || 'xlsx').toLowerCase();
+
+    if (!['csv', 'xlsx', 'pdf', 'docx', 'zip'].includes(format)) {
+      return res.status(400).json({
+        error: 'Unsupported export format',
+      });
+    }
+
+    const analyses = Array.isArray(body.analyses)
+      ? body.analyses
+      : [];
+
+    if (!analyses.length) {
+      return res.status(400).json({
+        error: 'At least one analysis is required',
+      });
+    }
+
+    try {
+      const { buffer, filename, mime } =
+        await generateAnalyticsExport({
+          format: format as any,
+          language: body.language === 'ar' ? 'ar' : 'en',
+          analyses,
+        });
+
+      try {
+        await writeAuditLog({
+          userId: auth.user.id,
+          username: auth.user.username,
+          action: 'EXPORT',
+          module: 'Analytics',
+          details:
+            `Exported ${analyses.length} analysis(es) as ${format.toUpperCase()}`,
+          ipAddress: req.ip || '',
+        });
+      } catch {
+        // Preserve export result.
+      }
+
+      try {
+   await pgExecute(
+  `INSERT INTO export_history
+     (user_id, username, format, scope, file_path, file_name, status)
+   VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+  auth.user.id,
+  auth.user.username,
+  format.toUpperCase(),
+  'analytics',
+  path.resolve(EXPORTS_DIR, filename),
+  filename,
+  'COMPLETED',
+);
+      } catch {
+        // Preserve export result.
+      }
+
+      res.setHeader('Content-Type', mime);
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${filename}"`,
+      );
+      res.setHeader('X-Export-Filename', filename);
+
+      return res.send(buffer);
+    } catch (err: any) {
+      try {
+        await writeAuditLog({
+          userId: auth.user.id,
+          username: auth.user.username,
+          action: 'EXPORT_FAILED',
+          module: 'Analytics',
+          details: err?.message || 'Export failed',
+          ipAddress: req.ip || '',
+          result: 'FAILED',
+        });
+      } catch {
+        // Preserve original error.
+      }
+
+      return res.status(400).json({
+        error: err?.message || 'Export failed',
+      });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Users
+// -----------------------------------------------------------------------------
+
+apiRouter.get('/users', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+
+  if (!auth.perms.canManageUsers) {
+    return res.status(403).json({
+      error: 'Insufficient permissions to view user accounts',
+    });
   }
 
   try {
-    const { generateDashboardExport } = await import('./dashboardExporter.js');
-    const result = await generateDashboardExport({
-      format,
-      language,
-      filters,
-      scope,
-      chartImages,
-      userId: auth.user.id,
-      username: auth.user.username,
-      canUnmask: auth.perms.canViewUnmaskedData,
-    });
+    const rows = await pgQuery(`
+      SELECT
+        id,
+        username,
+        email,
+        full_name,
+        role,
+        status,
+        created_at,
+        last_login
+      FROM users
+      ORDER BY id ASC
+    `);
 
-    if (req.query.stream === 'true') {
-      res.setHeader('Content-Type', result.contentType);
-      res.setHeader('Content-Disposition', `attachment; filename="${result.fileName}"`);
-      return res.send(result.buffer);
-    }
-
-    return res.status(201).json({
-      success: true,
-      exportId: result.exportId,
-      fileName: result.fileName,
-      downloadUrl: `/api/v1/exports/dashboard/${result.exportId}/download`,
-    });
+    return res.json(rows);
   } catch (err: any) {
-    db.prepare(`
-      INSERT INTO export_history (user_id, username, format, scope, status, error_details)
-      VALUES (?, ?, ?, 'dashboard', 'FAILED', ?)
-    `).run(auth.user.id, auth.user.username, format.toUpperCase(), err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.get('/exports/dashboard/:id/download', (req: Request, res: Response) => {
+apiRouter.post('/users', async (req: Request, res: Response) => {
   const auth = requireAuth(req, res);
   if (!auth) return;
-  if (!auth.perms.canExport) {
-    return res.status(403).json({ error: 'Insufficient role permissions' });
+
+  if (!auth.perms.canManageUsers) {
+    return res.status(403).json({
+      error: 'Insufficient permissions to manage users',
+    });
   }
 
-  const row = db.prepare(`SELECT * FROM export_history WHERE id = ?`).get(Number(req.params.id)) as any;
-  if (!row || !row.file_path || !fs.existsSync(row.file_path)) {
-    return res.status(404).json({ error: 'Export file not found or expired' });
+  const {
+    username,
+    email,
+    password,
+    full_name,
+    role,
+  } = req.body || {};
+
+  if (!username || !email || !password) {
+    return res.status(400).json({
+      error: 'Username, email and password are required',
+    });
   }
 
-  const resolved = path.resolve(row.file_path);
-  if (!resolved.startsWith(EXPORTS_DIR + path.sep)) {
-    return res.status(403).json({ error: 'Invalid export file path' });
-  }
+  const validRoles: UserRole[] = [
+    'SUPER_ADMIN',
+    'ADMIN',
+    'DATA_MANAGER',
+    'DATA_ANALYST',
+    'VIEWER',
+  ];
 
-  const ext = path.extname(row.file_name || row.file_path).toLowerCase();
-  const mime =
-    ext === '.pdf'
-      ? 'application/pdf'
-      : ext === '.docx'
-      ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-      : ext === '.png'
-      ? 'image/png'
-      : ext === '.csv'
-      ? 'text/csv; charset=utf-8'
-      : ext === '.geojson'
-      ? 'application/geo+json; charset=utf-8'
-      : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-
-  res.setHeader('Content-Type', mime);
-  res.setHeader('Content-Disposition', `attachment; filename="${row.file_name}"`);
-  return res.sendFile(resolved);
-});
-
-apiRouter.get('/exports/history', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canExport) {
-    return res.status(403).json({ error: 'Insufficient role permissions' });
-  }
-  const rows = db
-    .prepare(`SELECT id, user_id, username, format, scope, selected_missions, applied_filters, status, file_name, file_size, error_details, created_at FROM export_history ORDER BY created_at DESC LIMIT 100`)
-    .all();
-  return res.json(rows);
-});
-
-// --- 6. Analytics, Filter Options, BTS Map, PLMN Lookup & Saved Views ---
-
-apiRouter.get('/analytics/filter-options', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  return res.json(getDashboardFilterOptions());
-});
-
-apiRouter.get('/analytics/dashboard', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const parsed = DashboardFilterSchema.safeParse(req.query);
-  if (!parsed.success) {
-    return res.status(400).json({ error: 'Invalid filter query parameters', details: parsed.error.flatten() });
-  }
-  if (parsed.data.tmsi && !auth.perms.canViewUnmaskedData) {
-    return res.status(403).json({ error: 'Insufficient permissions to filter by TMSI' });
-  }
-  const data = getDashboardKPIs(parsed.data);
-  return res.json(data);
-});
-
-apiRouter.post('/analytics/dashboard', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const parsed = DashboardFilterSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: 'Invalid filter payload', details: parsed.error.flatten() });
-  }
-  if (parsed.data.tmsi && !auth.perms.canViewUnmaskedData) {
-    return res.status(403).json({ error: 'Insufficient permissions to filter by TMSI' });
-  }
-  const data = getDashboardKPIs(parsed.data);
-  return res.json(data);
-});
-
-apiRouter.get('/analytics/bts-map', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const parsed = DashboardFilterSchema.safeParse(req.query);
-  if (!parsed.success) {
-    return res.status(400).json({ error: 'Invalid map filter parameters', details: parsed.error.flatten() });
-  }
-  if (parsed.data.tmsi && !auth.perms.canViewUnmaskedData) {
-    return res.status(403).json({ error: 'Insufficient permissions to filter map by TMSI' });
-  }
-  return res.json(getBtsMapData(parsed.data));
-});
-
-apiRouter.get('/plmn/search', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
-  if (!q) {
-    const all = db.prepare(`SELECT mcc, mnc, country, code, name FROM plmn_storage ORDER BY mcc, mnc LIMIT 100`).all();
-    return res.json(all);
-  }
-  const term = `%${q}%`;
-  const rows = db
-    .prepare(`
-      SELECT mcc, mnc, country, code, name
-      FROM plmn_storage
-      WHERE name LIKE ? OR country LIKE ? OR code LIKE ? OR CAST(mcc AS TEXT) LIKE ? OR CAST(mnc AS TEXT) LIKE ?
-      ORDER BY mcc, mnc
-      LIMIT 100
-    `)
-    .all(term, term, term, term, term);
-  return res.json(rows);
-});
-
-apiRouter.get('/saved-views', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const tableName = (req.query.tableName as string) || 'dashboard';
-  const isAdmin = auth.user.role === 'SUPER_ADMIN' || auth.user.role === 'ADMIN';
-  const rows = isAdmin
-    ? db
-        .prepare(`SELECT id, user_id, table_name, view_name, filters_json, is_default, created_at FROM saved_views WHERE table_name = ? ORDER BY created_at DESC`)
-        .all(tableName)
-    : db
-        .prepare(`SELECT id, user_id, table_name, view_name, filters_json, is_default, created_at FROM saved_views WHERE table_name = ? AND (user_id = ? OR user_id IS NULL) ORDER BY created_at DESC`)
-        .all(tableName, auth.user.id);
-  return res.json(rows);
-});
-
-apiRouter.post('/saved-views', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const { tableName, viewName, filters } = req.body;
-  if (!viewName || !filters) {
-    return res.status(400).json({ error: 'viewName and filters are required' });
-  }
-  const info = db
-    .prepare(`INSERT INTO saved_views (user_id, table_name, view_name, filters_json) VALUES (?, ?, ?, ?)`)
-    .run(auth.user.id, tableName || 'dashboard', String(viewName).trim(), JSON.stringify(filters));
-  return res.status(201).json({
-    id: Number(info.lastInsertRowid),
-    user_id: auth.user.id,
-    table_name: tableName || 'dashboard',
-    view_name: String(viewName).trim(),
-    filters_json: JSON.stringify(filters),
-  });
-});
-
-apiRouter.delete('/saved-views/:id', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const viewId = Number(req.params.id);
-  const existing = db.prepare(`SELECT id, user_id FROM saved_views WHERE id = ?`).get(viewId) as any;
-  if (!existing) {
-    return res.status(404).json({ error: 'Saved view not found' });
-  }
-  const isAdmin = auth.user.role === 'SUPER_ADMIN' || auth.user.role === 'ADMIN';
-  if (!isAdmin && existing.user_id !== auth.user.id) {
-    return res.status(403).json({ error: 'You do not have permission to delete another user saved view' });
-  }
-  db.prepare(`DELETE FROM saved_views WHERE id = ?`).run(viewId);
-  return res.json({ success: true });
-});
-
-apiRouter.post('/analytics/query', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const { table, dimensionCol, metricCol, aggregation, mission, missionIds, limit } = req.body;
-  if (!table || !dimensionCol) {
-    return res.status(400).json({ error: 'Table and dimension column are required' });
-  }
+  const assignedRole: UserRole = validRoles.includes(role)
+    ? role
+    : 'VIEWER';
 
   try {
-    const data = executeDynamicAnalytics({
-      table,
-      dimensionCol,
-      metricCol,
-      aggregation: aggregation || 'COUNT',
-      mission,
-      missionIds,
-      limit,
+    const hash = await bcrypt.hash(String(password), 10);
+
+    const rows = await pgQuery<any>(
+      `INSERT INTO users
+         (username, email, password_hash, full_name, role)
+       VALUES ($1, $2, $3, $4, $5::"Role")
+       RETURNING id`,
+      String(username).trim(),
+      String(email).trim(),
+      hash,
+      full_name || username,
+      assignedRole,
+    );
+
+    return res.status(201).json({
+      id: rows[0].id,
+      username,
+      email,
+      role: assignedRole,
     });
-    return res.json(data);
   } catch (err: any) {
     return res.status(400).json({ error: err.message });
   }
 });
 
-// --- 7. Users, Audit, System & Backups Endpoints ---
+// -----------------------------------------------------------------------------
+// Audit logs
+// -----------------------------------------------------------------------------
 
-apiRouter.get('/users', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canManageUsers) {
-    return res.status(403).json({ error: 'Insufficient permissions to view user accounts' });
-  }
-  const rows = db.prepare('SELECT id, username, email, full_name, role, status, created_at, last_login FROM users ORDER BY id ASC').all();
-  return res.json(rows);
-});
+apiRouter.get(
+  '/audit-logs',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
 
-apiRouter.post('/users', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!auth.perms.canManageUsers) {
-    return res.status(403).json({ error: 'Insufficient permissions to manage users' });
-  }
-  const { username, email, password, full_name, role } = req.body;
-  if (!username || !email || !password) {
-    return res.status(400).json({ error: 'Username, email and password are required' });
-  }
-  const validRoles: UserRole[] = ['SUPER_ADMIN', 'ADMIN', 'DATA_MANAGER', 'DATA_ANALYST', 'VIEWER'];
-  const assignedRole: UserRole = validRoles.includes(role) ? role : 'VIEWER';
-  const hash = bcrypt.hashSync(String(password), 10);
-  try {
-    const stmt = db.prepare('INSERT INTO users (username, email, password_hash, full_name, role) VALUES (?, ?, ?, ?, ?)');
-    const info = stmt.run(String(username).trim(), String(email).trim(), hash, full_name || username, assignedRole);
-    return res.status(201).json({ id: Number(info.lastInsertRowid), username, email, role: assignedRole });
-  } catch (e: any) {
-    return res.status(400).json({ error: e.message });
-  }
-});
+    const p = Math.max(1, Number(req.query.page) || 1);
+    const ps = Math.min(
+      100,
+      Math.max(1, Number(req.query.pageSize) || 30),
+    );
+    const offset = (p - 1) * ps;
 
-apiRouter.get('/audit-logs', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const { page, pageSize, search, module } = req.query;
-  const p = Math.max(1, Number(page) || 1);
-  const ps = Math.min(100, Math.max(1, Number(pageSize) || 30));
-  const offset = (p - 1) * ps;
+    const moduleName =
+      typeof req.query.module === 'string'
+        ? req.query.module
+        : undefined;
 
-  const whereClauses: string[] = [];
-  const params: any[] = [];
+    const search =
+      typeof req.query.search === 'string'
+        ? req.query.search.trim()
+        : '';
 
-  if (module && module !== 'ALL') {
-    whereClauses.push('module = ?');
-    params.push(module);
-  }
-  if (search) {
-    whereClauses.push('(username LIKE ? OR action LIKE ? OR details LIKE ?)');
-    const term = `%${search}%`;
-    params.push(term, term, term);
-  }
+    const conditions: string[] = [];
+    const params: any[] = [];
 
-  const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-  const total = (db.prepare(`SELECT COUNT(*) as total FROM audit_logs ${whereSql}`).get(...params) as any).total;
-  const logs = db.prepare(`SELECT * FROM audit_logs ${whereSql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`).all(...params, ps, offset);
+    if (moduleName && moduleName !== 'ALL') {
+      params.push(moduleName);
+      conditions.push(`module = $${params.length}`);
+    }
 
-  return res.json({ logs, pagination: { page: p, pageSize: ps, total, totalPages: Math.ceil(total / ps) } });
-});
+    if (search) {
+      params.push(`%${search}%`);
+      const n = params.length;
 
-apiRouter.get('/system/health', (_req: Request, res: Response) => {
-  const mem = process.memoryUsage();
-  return res.json({
-    status: 'HEALTHY',
-    uptimeSeconds: Math.floor(process.uptime()),
-    database: {
-      connected: true,
-      engine: 'PostgreSQL-Compatible Engine (with SQLite Persistent Storage)',
-      walMode: true,
-      foreignKeys: true,
-    },
-    system: {
-      nodeVersion: process.version,
-      platform: process.platform,
-      memoryRssMb: Math.round(mem.rss / 1024 / 1024),
-      memoryHeapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
-      storageUsedMb: 12.4,
-      storageAvailableMb: 51200,
-    },
-    version: '3.0.0-enterprise',
-  });
-});
+      conditions.push(
+        `(username ILIKE $${n}
+          OR action ILIKE $${n}
+          OR details ILIKE $${n})`,
+      );
+    }
 
-apiRouter.get('/system/data-dictionary', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  const tables = Object.values(TABLE_MAP);
-  const dict = tables.map(tbl => {
-    const cols = getTableColumns(tbl);
-    const rowCount = (db.prepare(`SELECT COUNT(*) as count FROM "${tbl}"`).get() as any)?.count || 0;
-    return {
-      table: tbl,
-      rowCount,
-      columns: cols.map(c => ({
-        name: c.name,
-        type: c.type,
-        primaryKey: c.pk === 1,
-        nullable: c.notnull === 0,
-      })),
-    };
-  });
-  return res.json(dict);
-});
+    const where = conditions.length
+      ? `WHERE ${conditions.join(' AND ')}`
+      : '';
 
-apiRouter.post('/system/backups/create', (req: Request, res: Response) => {
-  const auth = requireAuth(req, res);
-  if (!auth) return;
-  if (!['SUPER_ADMIN', 'ADMIN', 'DATA_MANAGER'].includes(auth.user.role)) {
-    return res.status(403).json({ error: 'Insufficient role privileges to create system backups' });
-  }
-  const backupName = `backup_${Date.now()}.sqlite`;
-  const backupPath = path.join(BACKUPS_DIR, backupName);
-  const dbPath = path.resolve(process.cwd(), 'data', 'enterprise.sqlite');
+    try {
+      const countRows = await pgQuery<any>(
+        `SELECT COUNT(*)::int AS total
+         FROM audit_logs
+         ${where}`,
+        ...params,
+      );
 
-  try {
-    db.exec('PRAGMA wal_checkpoint(PASSIVE)');
-    fs.copyFileSync(dbPath, backupPath);
-    db.prepare(`
-      INSERT INTO audit_logs (user_id, username, action, module, record_id, ip_address, result, details)
-      VALUES (?, ?, 'SYSTEM_BACKUP', 'System', ?, ?, 'SUCCESS', 'Created manual database snapshot')
-    `).run(auth.user.id, auth.user.username, backupName, req.ip || '127.0.0.1');
+      const total = Number(countRows[0]?.total || 0);
 
-    return res.json({
-      success: true,
-      backupName,
-      created: new Date().toISOString(),
-      sizeBytes: fs.statSync(backupPath).size,
-    });
-  } catch (e: any) {
-    return res.status(500).json({ error: e.message });
-  }
-});
+      const logs = await pgQuery(
+        `SELECT *
+         FROM audit_logs
+         ${where}
+         ORDER BY timestamp DESC
+         LIMIT $${params.length + 1}
+         OFFSET $${params.length + 2}`,
+        ...params,
+        ps,
+        offset,
+      );
+
+      return res.json({
+        logs,
+        pagination: {
+          page: p,
+          pageSize: ps,
+          total,
+          totalPages: Math.ceil(total / ps),
+        },
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// System health
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/system/health',
+  async (_req: Request, res: Response) => {
+    const mem = process.memoryUsage();
+
+    try {
+      await db.$queryRaw`SELECT 1`;
+
+      return res.json({
+        status: 'HEALTHY',
+        uptimeSeconds: Math.floor(process.uptime()),
+        database: {
+          connected: true,
+          engine: 'PostgreSQL',
+          foreignKeys: true,
+        },
+        system: {
+          nodeVersion: process.version,
+          platform: process.platform,
+          memoryRssMb: Math.round(mem.rss / 1024 / 1024),
+          memoryHeapUsedMb: Math.round(
+            mem.heapUsed / 1024 / 1024,
+          ),
+        },
+        version: '3.0.0-enterprise',
+      });
+    } catch (err: any) {
+      return res.status(503).json({
+        status: 'DEGRADED',
+        uptimeSeconds: Math.floor(process.uptime()),
+        database: {
+          connected: false,
+          engine: 'PostgreSQL',
+          error: err.message,
+        },
+        system: {
+          nodeVersion: process.version,
+          platform: process.platform,
+          memoryRssMb: Math.round(mem.rss / 1024 / 1024),
+          memoryHeapUsedMb: Math.round(
+            mem.heapUsed / 1024 / 1024,
+          ),
+        },
+        version: '3.0.0-enterprise',
+      });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Data dictionary
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/system/data-dictionary',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const tables = Object.values(TABLE_MAP);
+
+      const dict = await Promise.all(
+        tables.map(async (table) => {
+          const cols = await getTableColumns(table);
+
+          const countRows = await pgQuery<any>(
+            `SELECT COUNT(*)::int AS count
+             FROM ${quoteIdentifier(table)}`,
+          );
+
+          return {
+            table,
+            rowCount: Number(countRows[0]?.count || 0),
+            columns: cols.map((column: any) => ({
+              name: column.name,
+              type: column.type,
+              primaryKey: column.pk === 1,
+              nullable: column.notnull === 0,
+            })),
+          };
+        }),
+      );
+
+      return res.json(dict);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// -----------------------------------------------------------------------------
+// PostgreSQL backups
+// -----------------------------------------------------------------------------
+
+apiRouter.get(
+  '/system/backups',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    try {
+      const entries = fs.existsSync(BACKUPS_DIR)
+        ? fs.readdirSync(BACKUPS_DIR)
+        : [];
+
+      const files = entries
+        .filter((name) => /\.sql$/i.test(name))
+        .map((name) => {
+          const fullPath = path.join(BACKUPS_DIR, name);
+          const stat = fs.statSync(fullPath);
+
+          return {
+            name,
+            created: stat.mtime.toISOString(),
+            sizeBytes: stat.size,
+            type: 'PG_DUMP',
+            status: stat.size > 0 ? 'AVAILABLE' : 'EMPTY',
+          };
+        })
+        .sort(
+          (a, b) =>
+            new Date(b.created).getTime() -
+            new Date(a.created).getTime(),
+        );
+
+      return res.json(files);
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+apiRouter.post(
+  '/system/backups/create',
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+
+    if (
+      !['SUPER_ADMIN', 'ADMIN', 'DATA_MANAGER'].includes(
+        auth.user.role,
+      )
+    ) {
+      return res.status(403).json({
+        error: 'Insufficient role privileges to create system backups',
+      });
+    }
+
+    const databaseUrl = process.env.DATABASE_URL;
+
+    if (!databaseUrl) {
+      return res.status(500).json({
+        error: 'DATABASE_URL is not configured',
+      });
+    }
+
+    const backupName =
+      `postgres_backup_${new Date()
+        .toISOString()
+        .replace(/[:.]/g, '-')}.sql`;
+
+    const backupPath = path.resolve(BACKUPS_DIR, backupName);
+
+    if (!backupPath.startsWith(BACKUPS_DIR + path.sep)) {
+      return res.status(400).json({
+        error: 'Invalid backup path',
+      });
+    }
+
+    try {
+      // Requires PostgreSQL client tools (pg_dump) to be installed
+      // and available on the server PATH.
+      await execFileAsync(
+        'pg_dump',
+        [
+          '--dbname',
+          databaseUrl,
+          '--no-owner',
+          '--no-acl',
+          '--format=plain',
+          '--file',
+          backupPath,
+        ],
+        {
+          windowsHide: true,
+          maxBuffer: 10 * 1024 * 1024,
+        },
+      );
+
+      const stat = fs.statSync(backupPath);
+
+      if (!stat.size) {
+        throw new Error('pg_dump produced an empty backup file');
+      }
+
+      try {
+        await writeAuditLog({
+          userId: auth.user.id,
+          username: auth.user.username,
+          action: 'SYSTEM_BACKUP',
+          module: 'System',
+          recordId: backupName,
+          ipAddress: req.ip || '127.0.0.1',
+          result: 'SUCCESS',
+          details: 'Created PostgreSQL database backup',
+        });
+      } catch {
+        // Backup itself remains successful.
+      }
+
+      return res.json({
+        success: true,
+        backupName,
+        created: stat.mtime.toISOString(),
+        sizeBytes: stat.size,
+      });
+    } catch (err: any) {
+      try {
+        if (fs.existsSync(backupPath)) {
+          fs.unlinkSync(backupPath);
+        }
+      } catch {
+        // Ignore cleanup errors.
+      }
+
+      return res.status(500).json({
+        error:
+          err.code === 'ENOENT'
+            ? 'pg_dump was not found. Install PostgreSQL client tools and add pg_dump to PATH.'
+            : err.message,
+      });
+    }
+  },
+);

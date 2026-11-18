@@ -16,13 +16,15 @@ A modern, enterprise-grade web application for managing, importing, visualizing,
 
 ---
 
-## 2. Default Operator Accounts
+## 2. Default Operator Account
+
+On a brand-new database, the application creates only an initial admin account (no dummy missions, registrations, cells, or other sample datasets).
 
 | Username | Role | Default Password | Permissions |
 | :--- | :--- | :--- | :--- |
 | **admin** | `SUPER_ADMIN` | `admin123` | Full access, user management, backups, settings, unmasked data |
-| **manager** | `DATA_MANAGER` | `admin123` | CRUD operations, batch imports, exports, unmasked data |
-| **analyst** | `DATA_ANALYST` | `admin123` | Advanced analytics, chart studio, exports, masked identifiers |
+
+Create additional users from the user management UI/API as needed.
 
 ---
 

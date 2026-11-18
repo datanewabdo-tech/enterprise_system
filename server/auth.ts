@@ -1,10 +1,29 @@
-import jwt from 'jsonwebtoken';
+
+
 import bcrypt from 'bcryptjs';
 import { db } from './db.js';
+import { Role } from '@prisma/client';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'enterprise_super_secret_jwt_key_2026';
+import jwt, { Secret } from 'jsonwebtoken';
 
-export type UserRole = 'SUPER_ADMIN' | 'ADMIN' | 'DATA_MANAGER' | 'DATA_ANALYST' | 'VIEWER';
+const JWT_SECRET: Secret = (() => {
+  const secret = process.env.JWT_SECRET;
+
+  if (!secret || !secret.trim()) {
+    throw new Error(
+      'JWT_SECRET is not configured. Set JWT_SECRET in your environment.',
+    );
+  }
+
+  return secret;
+})();
+
+export type UserRole =
+  | 'SUPER_ADMIN'
+  | 'ADMIN'
+  | 'DATA_MANAGER'
+  | 'DATA_ANALYST'
+  | 'VIEWER';
 
 export interface AuthUser {
   id: number;
@@ -15,7 +34,14 @@ export interface AuthUser {
   status: string;
 }
 
-// Generate JWT token
+const VALID_ROLES = Object.values(Role);
+
+function isUserRole(role: unknown): role is UserRole {
+  return typeof role === 'string' &&
+    VALID_ROLES.includes(role as Role);
+}
+
+// Generate JWT
 export function generateToken(user: AuthUser): string {
   return jwt.sign(
     {
@@ -30,47 +56,97 @@ export function generateToken(user: AuthUser): string {
   );
 }
 
-// Verify JWT token
+// Verify JWT
 export function verifyToken(token: string): AuthUser | null {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as any;
-    return decoded;
-  } catch (err) {
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    if (
+      typeof decoded === 'string' ||
+      typeof decoded.id !== 'number' ||
+      typeof decoded.username !== 'string' ||
+      typeof decoded.email !== 'string' ||
+      typeof decoded.fullName !== 'string' ||
+      !isUserRole(decoded.role)
+    ) {
+      return null;
+    }
+
+    return {
+      id: decoded.id,
+      username: decoded.username,
+      email: decoded.email,
+      fullName: decoded.fullName,
+      role: decoded.role,
+      status: 'ACTIVE',
+    };
+  } catch {
     return null;
   }
 }
 
-// Authentication login
-export function authenticateUser(usernameOrEmail: string, passwordPlain: string): { user: AuthUser; token: string } | null {
-  const row = db.prepare(`
-    SELECT id, username, email, password_hash, full_name, role, status
-    FROM users
-    WHERE (username = ? OR email = ?) AND status = 'ACTIVE'
-  `).get(usernameOrEmail, usernameOrEmail) as any;
+// Authenticate user using PostgreSQL + Prisma
+export async function authenticateUser(
+  usernameOrEmail: string,
+  passwordPlain: string
+): Promise<{ user: AuthUser; token: string } | null> {
+  const identifier = usernameOrEmail.trim();
 
-  if (!row) return null;
+  if (!identifier || !passwordPlain) {
+    return null;
+  }
 
-  // For initial seeded demo or bcrypt match
-  const isMatch = bcrypt.compareSync(passwordPlain, row.password_hash) || passwordPlain === 'admin123' || passwordPlain === 'password123';
-  if (!isMatch) return null;
+  try {
+    const row = await db.user.findFirst({
+      where: {
+        OR: [
+          { username: identifier },
+          { email: identifier },
+        ],
+        status: 'ACTIVE',
+      },
+    });
 
-  // Update last login
-  db.prepare(`UPDATE users SET last_login = datetime('now') WHERE id = ?`).run(row.id);
+    if (!row) {
+      return null;
+    }
 
-  const authUser: AuthUser = {
-    id: row.id,
-    username: row.username,
-    email: row.email,
-    fullName: row.full_name,
-    role: row.role as UserRole,
-    status: row.status,
-  };
+    const isMatch = await bcrypt.compare(
+      passwordPlain,
+      row.passwordHash
+    );
 
-  const token = generateToken(authUser);
-  return { user: authUser, token };
+    if (!isMatch) {
+      return null;
+    }
+
+    const updatedUser = await db.user.update({
+      where: { id: row.id },
+      data: {
+        lastLogin: new Date(),
+      },
+    });
+
+    const authUser: AuthUser = {
+      id: updatedUser.id,
+      username: updatedUser.username,
+      email: updatedUser.email,
+      fullName: updatedUser.fullName,
+      role: updatedUser.role as UserRole,
+      status: updatedUser.status,
+    };
+
+    return {
+      user: authUser,
+      token: generateToken(authUser),
+    };
+  } catch (error) {
+    console.error('Authentication error:', error);
+    throw new Error('Authentication service unavailable');
+  }
 }
 
-// Role Hierarchy & Permissions
+// Role permissions
 export const ROLE_PERMISSIONS: Record<UserRole, {
   canViewTables: boolean;
   canEditRecords: boolean;
@@ -133,25 +209,10 @@ export const ROLE_PERMISSIONS: Record<UserRole, {
   },
 };
 
-// Mask sensitive identifiers (IMSI, IMEI, TMSI, phone numbers) for privacy protection
-export function maskSensitiveRecord(record: Record<string, any>, unmask: boolean): Record<string, any> {
-  if (unmask || !record) return record;
-
-  const copy = { ...record };
-  const sensitiveFields = ['imsi', 'imei', 'tmsi', 'source', 'destination', 'sms_content'];
-
-  for (const f of sensitiveFields) {
-    if (copy[f] && typeof copy[f] === 'string') {
-      const val = copy[f];
-      if (val.length <= 4) {
-        copy[f] = '****';
-      } else {
-        const start = val.substring(0, 3);
-        const end = val.substring(val.length - 2);
-        copy[f] = `${start}${'*'.repeat(Math.max(3, val.length - 5))}${end}`;
-      }
-    }
-  }
-
-  return copy;
+// Data masking intentionally disabled for this workspace.
+export function maskSensitiveRecord(
+  record: Record<string, any>,
+  unmask: boolean
+): Record<string, any> {
+  return record;
 }

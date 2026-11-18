@@ -111,6 +111,9 @@ export interface DashboardFilterState {
   hasCoordinates: 'all' | 'available' | 'unavailable';
   // PLMN Lookup
   plmnQuery: string;
+  // Unified MCC/MNC operator filters
+  operator: string[];
+  networkCategory: string[];
 }
 
 export const INITIAL_DASHBOARD_FILTERS: DashboardFilterState = {
@@ -158,6 +161,8 @@ export const INITIAL_DASHBOARD_FILTERS: DashboardFilterState = {
   isPcs1900: 'all',
   hasCoordinates: 'all',
   plmnQuery: '',
+  operator: [],
+  networkCategory: [],
 };
 
 function stringEmpty(): string {

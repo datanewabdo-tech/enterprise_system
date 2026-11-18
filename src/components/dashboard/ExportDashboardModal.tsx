@@ -1,6 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext.js';
 import { DashboardFilterState } from '../../types/index.js';
+import { useAsyncResource } from '../../hooks/useAsyncResource.js';
+import { TableSkeletonRows, ErrorRetryCard } from '../common/LoadingStates.js';
+import { downloadBlob } from '../../utils/chartExporter.js';
 import {
   X,
   FileText,
@@ -8,7 +11,6 @@ import {
   Download,
   RefreshCw,
   CheckCircle2,
-  AlertTriangle,
   ShieldAlert,
   Clock,
 } from 'lucide-react';
@@ -26,7 +28,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
   filters,
   captureChartImages,
 }) => {
-  const { apiFetch, authToken, currentUser, addNotification, language } = useApp();
+  const { apiFetch, authToken, currentUser, addNotification, language, t } = useApp();
 
   const [format, setFormat] = useState<'pdf' | 'xlsx' | 'docx'>('pdf');
   const [reportLang, setReportLang] = useState<'en' | 'ar'>(language);
@@ -34,7 +36,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
   const [progressStage, setProgressStage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastExport, setLastExport] = useState<{ exportId: number; fileName: string; downloadUrl: string } | null>(null);
-  const [history, setHistory] = useState<any[]>([]);
+  const [downloadingHistoryId, setDownloadingHistoryId] = useState<number | null>(null);
 
   const [scope, setScope] = useState({
     kpis: true,
@@ -44,6 +46,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
     networkCellsByMcc: true,
     militaryNetworks: true,
     civilianNetworks: true,
+    mobileNetworksMccMnc: true,
     includeDetailedRecords: false,
     includeSensitiveIdentifiers: false,
   });
@@ -51,22 +54,46 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
   const canUnmask = currentUser?.role === 'SUPER_ADMIN' || currentUser?.role === 'ADMIN';
   const canExport = currentUser?.role !== 'VIEWER';
 
-  const fetchHistory = () => {
-    apiFetch('/api/v1/exports/history')
-      .then(r => (r.ok ? r.json() : []))
-      .then(rows => setHistory(Array.isArray(rows) ? rows : []))
-      .catch(() => {});
-  };
+  const historyRes = useAsyncResource<any[]>(
+    async signal => {
+      const res = await apiFetch('/api/v1/exports/history', { signal });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(json?.error || t('failedToLoadExportHistory'));
+      }
+      return Array.isArray(json) ? json : [];
+    },
+    [isOpen, authToken],
+    {
+      enabled: Boolean(isOpen && authToken),
+      keepPreviousData: true,
+      isEmpty: rows => !rows || rows.length === 0,
+    }
+  );
 
   useEffect(() => {
     if (isOpen) {
       setReportLang(language);
       setError(null);
-      fetchHistory();
     }
   }, [isOpen, language]);
 
   if (!isOpen) return null;
+
+  const history = historyRes.data || [];
+
+  const allChartsScope = {
+    kpis: false,
+    appliedFilters: false,
+    registrationsByCountry: true,
+    btsMap: true,
+    networkCellsByMcc: true,
+    militaryNetworks: true,
+    civilianNetworks: true,
+    mobileNetworksMccMnc: true,
+    includeDetailedRecords: false,
+    includeSensitiveIdentifiers: false,
+  };
 
   const setSelectAll = (checked: boolean) => {
     setScope(prev => ({
@@ -78,101 +105,109 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
       networkCellsByMcc: checked,
       militaryNetworks: checked,
       civilianNetworks: checked,
+      mobileNetworksMccMnc: checked,
     }));
   };
 
-  const triggerDownload = (url: string, fileName: string) => {
-    const sep = url.includes('?') ? '&' : '?';
-    const fullUrl = authToken ? `${url}${sep}token=${encodeURIComponent(authToken)}` : url;
-    const a = document.createElement('a');
-    a.href = fullUrl;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+  const triggerDownload = async (url: string, fileName: string, historyId?: number) => {
+    if (historyId) setDownloadingHistoryId(historyId);
+    try {
+      const res = await apiFetch(url);
+      if (!res.ok) {
+        const json = await res.json().catch(() => null);
+        throw new Error(json?.error || `Failed to download ${fileName}`);
+      }
+      const blob = await res.blob();
+      downloadBlob(blob, fileName);
+    } catch (err: any) {
+      setError(err?.message || t('fileDownloadFailed'));
+    } finally {
+      if (historyId) setDownloadingHistoryId(null);
+    }
   };
 
-  const handleGenerateExport = async () => {
+  const buildExportPayload = (exportFormat: 'pdf' | 'xlsx' | 'docx', exportScope: typeof scope) => ({
+    format: exportFormat,
+    language: reportLang,
+    filters: {
+      missionIds: filters.missionIds,
+      country: filters.country,
+      countryCode: filters.countryCode,
+      imsi: filters.imsi || undefined,
+      imei: filters.imei || undefined,
+      tmsi: filters.tmsi || undefined,
+      btsName: filters.btsName || undefined,
+      bts: filters.bts || undefined,
+      ueModel: filters.ueModel,
+      lastSeenFrom: filters.lastSeenFrom || undefined,
+      lastSeenTo: filters.lastSeenTo || undefined,
+      btsAltitudeMin: filters.btsAltitudeMin || undefined,
+      btsAltitudeMax: filters.btsAltitudeMax || undefined,
+      distanceMinFrom: filters.distanceMinFrom || undefined,
+      distanceMinTo: filters.distanceMinTo || undefined,
+      distanceMaxFrom: filters.distanceMaxFrom || undefined,
+      distanceMaxTo: filters.distanceMaxTo || undefined,
+      hasBtsLocation: filters.hasBtsLocation,
+      btsLocationOutdated: filters.btsLocationOutdated,
+      hasDeviceLocation: filters.hasDeviceLocation,
+      action: filters.action,
+      update: filters.update,
+      rat: filters.rat,
+      mcc: filters.mcc,
+      mnc: filters.mnc,
+      lac: filters.lac || undefined,
+      cellId: filters.cellId || undefined,
+      channel: filters.channel || undefined,
+      bsic: filters.bsic || undefined,
+      pci: filters.pci || undefined,
+      psc: filters.psc || undefined,
+      rxLevMin: filters.rxLevMin || undefined,
+      rxLevMax: filters.rxLevMax || undefined,
+      rxLevDbmMin: filters.rxLevDbmMin || undefined,
+      rxLevDbmMax: filters.rxLevDbmMax || undefined,
+      downlinkMin: filters.downlinkMin || undefined,
+      downlinkMax: filters.downlinkMax || undefined,
+      dlBandwidthMin: filters.dlBandwidthMin || undefined,
+      dlBandwidthMax: filters.dlBandwidthMax || undefined,
+      directionMin: filters.directionMin || undefined,
+      directionMax: filters.directionMax || undefined,
+      isNeighbour: filters.isNeighbour,
+      isPcs1900: filters.isPcs1900,
+      hasCoordinates: filters.hasCoordinates,
+      plmnQuery: filters.plmnQuery || undefined,
+    },
+    scope: exportScope,
+  });
+
+  const runExport = async (exportFormat: 'pdf' | 'xlsx' | 'docx', exportScope: typeof scope) => {
     setExporting(true);
-    setProgressStage('Capturing charts & geographic map snapshots...');
+    setProgressStage(t('capturingChartsSnapshots'));
     setError(null);
     setLastExport(null);
 
     try {
-      const chartImages = format !== 'xlsx' ? await captureChartImages() : {};
-      setProgressStage(`Generating ${format.toUpperCase()} report on server...`);
+      const chartImages = exportFormat !== 'xlsx' ? await captureChartImages() : {};
+      setProgressStage(`Generating ${exportFormat.toUpperCase()} report on server...`);
 
       const res = await apiFetch('/api/v1/exports/dashboard', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          format,
-          language: reportLang,
-          filters: {
-            missionIds: filters.missionIds,
-            country: filters.country,
-            countryCode: filters.countryCode,
-            imsi: filters.imsi || undefined,
-            imei: filters.imei || undefined,
-            tmsi: filters.tmsi || undefined,
-            btsName: filters.btsName || undefined,
-            bts: filters.bts || undefined,
-            ueModel: filters.ueModel,
-            lastSeenFrom: filters.lastSeenFrom || undefined,
-            lastSeenTo: filters.lastSeenTo || undefined,
-            btsAltitudeMin: filters.btsAltitudeMin || undefined,
-            btsAltitudeMax: filters.btsAltitudeMax || undefined,
-            distanceMinFrom: filters.distanceMinFrom || undefined,
-            distanceMinTo: filters.distanceMinTo || undefined,
-            distanceMaxFrom: filters.distanceMaxFrom || undefined,
-            distanceMaxTo: filters.distanceMaxTo || undefined,
-            hasBtsLocation: filters.hasBtsLocation,
-            btsLocationOutdated: filters.btsLocationOutdated,
-            hasDeviceLocation: filters.hasDeviceLocation,
-            action: filters.action,
-            update: filters.update,
-            rat: filters.rat,
-            mcc: filters.mcc,
-            mnc: filters.mnc,
-            lac: filters.lac || undefined,
-            cellId: filters.cellId || undefined,
-            channel: filters.channel || undefined,
-            bsic: filters.bsic || undefined,
-            pci: filters.pci || undefined,
-            psc: filters.psc || undefined,
-            rxLevMin: filters.rxLevMin || undefined,
-            rxLevMax: filters.rxLevMax || undefined,
-            rxLevDbmMin: filters.rxLevDbmMin || undefined,
-            rxLevDbmMax: filters.rxLevDbmMax || undefined,
-            downlinkMin: filters.downlinkMin || undefined,
-            downlinkMax: filters.downlinkMax || undefined,
-            dlBandwidthMin: filters.dlBandwidthMin || undefined,
-            dlBandwidthMax: filters.dlBandwidthMax || undefined,
-            directionMin: filters.directionMin || undefined,
-            directionMax: filters.directionMax || undefined,
-            isNeighbour: filters.isNeighbour,
-            isPcs1900: filters.isPcs1900,
-            hasCoordinates: filters.hasCoordinates,
-            plmnQuery: filters.plmnQuery || undefined,
-          },
-          scope,
-          chartImages,
-        }),
+        body: JSON.stringify({ ...buildExportPayload(exportFormat, exportScope), chartImages }),
       });
 
-      const json = await res.json();
+      const json = await res.json().catch(() => null);
       if (!res.ok) {
-        throw new Error(json.error || 'Export generation failed');
+        throw new Error(json?.error || t('exportGenerationFailed'));
       }
 
-      setProgressStage('Starting file download...');
+      setProgressStage('Downloading generated report...');
       setLastExport(json);
-      fetchHistory();
-      triggerDownload(json.downloadUrl, json.fileName);
+      historyRes.reload({ force: true });
+      await triggerDownload(json.downloadUrl, json.fileName);
 
       addNotification({
         title: 'Dashboard Export Ready',
-        message: `Generated ${json.fileName} (${format.toUpperCase()})`,
+        message: `Generated ${json.fileName} (${exportFormat.toUpperCase()})`,
         type: 'success',
       });
     } catch (err: any) {
@@ -181,6 +216,18 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
       setExporting(false);
       setProgressStage(null);
     }
+  };
+
+  const handleGenerateExport = async () => {
+    setFormat(format);
+    setScope(scope);
+    await runExport(format, scope);
+  };
+
+  const handleExportAllCharts = async (exportFormat: 'pdf' | 'xlsx' | 'docx') => {
+    setFormat(exportFormat);
+    setScope(prev => ({ ...prev, ...allChartsScope }));
+    await runExport(exportFormat, { ...scope, ...allChartsScope });
   };
 
   return (
@@ -194,7 +241,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
               <span>Export Dashboard Report</span>
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Generate filtered, formatted PDF, Excel (.xlsx), or Word (.docx) intelligence reports with RTL Arabic & LTR English support.
+              Generate filtered, formatted PDF, Excel (.xlsx), or Word (.docx) intelligence reports with RTL Arabic &amp; LTR English support.
             </p>
           </div>
           <button
@@ -214,10 +261,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
         )}
 
         {error && (
-          <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-xs text-rose-300 flex items-center gap-2">
-            <AlertTriangle className="w-4 h-4 shrink-0" />
-            <span>{error}</span>
-          </div>
+          <ErrorRetryCard compact message={error} onRetry={handleGenerateExport} />
         )}
 
         {/* Format & Language */}
@@ -251,7 +295,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
           </div>
 
           <div className="space-y-2">
-            <label className="text-xs font-bold text-slate-300 uppercase">Document Language & Direction</label>
+            <label className="text-xs font-bold text-slate-300 uppercase">Document Language &amp; Direction</label>
             <div className="grid grid-cols-2 gap-2">
               <button
                 type="button"
@@ -281,9 +325,9 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
 
         {/* Scope Selection */}
         <div className="p-4 rounded-xl bg-slate-950/70 border border-slate-800 space-y-3">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <span className="text-xs font-bold text-slate-200 uppercase">Included Sections (Export Scope)</span>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <button type="button" onClick={() => setSelectAll(true)} className="text-[11px] text-indigo-400 hover:underline">
                 Select All
               </button>
@@ -291,6 +335,26 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
                 Deselect All
               </button>
             </div>
+          </div>
+
+          <div className="flex flex-col gap-2 p-3 rounded-lg bg-indigo-950/20 border border-indigo-800/40">
+            <span className="text-xs font-semibold text-indigo-200">Export all charts in one go</span>
+            <div className="flex flex-wrap gap-2">
+              {(['pdf', 'xlsx', 'docx'] as const).map(fmt => (
+                <button
+                  key={fmt}
+                  type="button"
+                  onClick={() => handleExportAllCharts(fmt)}
+                  disabled={exporting || !canExport}
+                  className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold disabled:opacity-50"
+                >
+                  {fmt === 'xlsx' ? 'Excel (.xlsx)' : fmt.toUpperCase()}
+                </button>
+              ))}
+            </div>
+            <p className="text-[11px] text-slate-400">
+              Exports all dashboard chart/map visualizations (Registrations by Country, BTS Map, Network Cells by MCC, Military Networks, Civilian Networks) in a single report.
+            </p>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-slate-300">
@@ -360,7 +424,11 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
 
         {/* Staged Progress Banner */}
         {exporting && progressStage && (
-          <div className="p-3 rounded-xl bg-indigo-950/40 border border-indigo-700/50 flex items-center gap-2.5 text-xs text-indigo-200">
+          <div
+            role="status"
+            aria-live="polite"
+            className="p-3 rounded-xl bg-indigo-950/40 border border-indigo-700/50 flex items-center gap-2.5 text-xs text-indigo-200"
+          >
             <RefreshCw className="w-4 h-4 animate-spin text-indigo-400 shrink-0" />
             <span>{progressStage}</span>
           </div>
@@ -373,7 +441,7 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
             onClick={onClose}
             className="px-4 py-2 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
           >
-            Close
+            {t('close')}
           </button>
           <button
             type="button"
@@ -388,10 +456,20 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
 
         {/* Recent Dashboard Export History */}
         <div className="pt-3 border-t border-slate-800 space-y-2">
-          <h3 className="text-xs font-bold text-slate-300 uppercase flex items-center gap-1.5">
-            <Clock className="w-3.5 h-3.5 text-indigo-400" />
-            <span>Recent Dashboard Exports</span>
-          </h3>
+          <div className="flex items-center justify-between">
+            <h3 className="text-xs font-bold text-slate-300 uppercase flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5 text-indigo-400" />
+              <span>Recent Dashboard Exports</span>
+            </h3>
+            <button
+              type="button"
+              disabled={historyRes.isLoading || historyRes.isRefreshing}
+              onClick={() => historyRes.reload({ force: true })}
+              className="text-[11px] text-indigo-400 hover:underline disabled:opacity-50"
+            >
+              {t('refresh')}
+            </button>
+          </div>
           <div className="max-h-40 overflow-y-auto rounded-xl border border-slate-800">
             <table className="w-full text-left rtl:text-right text-[11px]">
               <thead className="bg-slate-950 text-slate-400 border-b border-slate-800">
@@ -404,7 +482,15 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/70 text-slate-300">
-                {history.length === 0 ? (
+                {historyRes.isLoading && !historyRes.data ? (
+                  <TableSkeletonRows columns={5} rows={3} />
+                ) : historyRes.isError && !historyRes.data ? (
+                  <tr>
+                    <td colSpan={5} className="p-3">
+                      <ErrorRetryCard compact message={historyRes.error} onRetry={() => historyRes.reload({ force: true })} />
+                    </td>
+                  </tr>
+                ) : history.length === 0 ? (
                   <tr>
                     <td colSpan={5} className="px-3 py-4 text-center text-slate-500">
                       No dashboard exports yet
@@ -425,10 +511,15 @@ export const ExportDashboardModal: React.FC<ExportDashboardModalProps> = ({
                         {h.status === 'COMPLETED' && h.file_name ? (
                           <button
                             type="button"
-                            onClick={() => triggerDownload(`/api/v1/exports/dashboard/${h.id}/download`, h.file_name)}
-                            className="text-sky-400 hover:underline flex items-center gap-1"
+                            disabled={downloadingHistoryId === h.id}
+                            onClick={() => triggerDownload(`/api/v1/exports/dashboard/${h.id}/download`, h.file_name, h.id)}
+                            className="text-sky-400 hover:underline flex items-center gap-1 disabled:opacity-50"
                           >
-                            <Download className="w-3 h-3" />
+                            {downloadingHistoryId === h.id ? (
+                              <RefreshCw className="w-3 h-3 animate-spin" />
+                            ) : (
+                              <Download className="w-3 h-3" />
+                            )}
                             <span className="truncate max-w-[160px]">{h.file_name}</span>
                           </button>
                         ) : (

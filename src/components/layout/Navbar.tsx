@@ -12,6 +12,9 @@ import {
   ShieldCheck,
   CheckCircle,
   Filter,
+  RefreshCw,
+  RotateCcw,
+  LogOut,
 } from 'lucide-react';
 
 interface NavbarProps {
@@ -29,6 +32,9 @@ export const Navbar: React.FC<NavbarProps> = ({ currentPage, onOpenMobileSidebar
     activeMission,
     setActiveMission,
     missions,
+    missionsLoading,
+    missionsError,
+    refreshMissions,
     globalSearch,
     setGlobalSearch,
     setQuickImportOpen,
@@ -36,10 +42,12 @@ export const Navbar: React.FC<NavbarProps> = ({ currentPage, onOpenMobileSidebar
     markNotificationsAsRead,
     currentUser,
     switchRole,
+    logout,
   } = useApp();
 
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [switchingRole, setSwitchingRole] = useState(false);
 
   const unreadCount = notifications.filter(n => !n.read).length;
 
@@ -62,7 +70,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentPage, onOpenMobileSidebar
         </button>
 
         <nav className="hidden sm:flex items-center gap-2 text-xs text-slate-400">
-          <span className="hover:text-slate-200">System</span>
+          <span className="hover:text-slate-200">{t('systemBreadcrumb')}</span>
           <span>/</span>
           <span className="font-semibold text-indigo-400">{formatPageTitle(currentPage)}</span>
         </nav>
@@ -83,19 +91,38 @@ export const Navbar: React.FC<NavbarProps> = ({ currentPage, onOpenMobileSidebar
 
         {/* Mission Selector (disambiguates duplicate mission labels via ID & Location) */}
         <div className="hidden md:flex items-center gap-1.5 shrink-0">
-          <Filter className="w-3.5 h-3.5 text-indigo-400" />
+          {missionsLoading ? (
+            <RefreshCw className="w-3.5 h-3.5 text-indigo-400 animate-spin motion-reduce:animate-none" />
+          ) : (
+            <Filter className="w-3.5 h-3.5 text-indigo-400" />
+          )}
           <select
+            aria-label={t('filterByMission')}
+            aria-busy={missionsLoading}
+            disabled={missionsLoading && missions.length === 0}
             value={activeMission}
             onChange={e => setActiveMission(e.target.value)}
-            className="h-9 px-2.5 max-w-[230px] text-xs bg-slate-950/70 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
+            className="h-9 px-2.5 max-w-[230px] text-xs bg-slate-950/70 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer disabled:opacity-60"
           >
-            <option value="ALL">{t('allMissions')}</option>
+            <option value="ALL">
+              {missionsLoading && missions.length === 0 ? t('loadingOptions') : t('allMissions')}
+            </option>
             {missions.map(m => (
               <option key={m.id} value={String(m.id)}>
                 {m.mission} — {m.location} (#{m.id})
               </option>
             ))}
           </select>
+          {missionsError && (
+            <button
+              type="button"
+              onClick={refreshMissions}
+              title={`${t('dropdownUnavailable')} — ${t('retry')}`}
+              className="p-1.5 rounded-lg bg-rose-950/50 border border-rose-800/60 text-rose-300 hover:bg-rose-900/60"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
       </div>
 
@@ -161,10 +188,10 @@ export const Navbar: React.FC<NavbarProps> = ({ currentPage, onOpenMobileSidebar
         <button
           onClick={() => setLanguage(language === 'en' ? 'ar' : 'en')}
           className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-slate-300 hover:text-white rounded-lg hover:bg-slate-800 border border-slate-800 transition-colors"
-          title="Switch Language / تبديل اللغة"
+          title={t('languageSwitchTitle')}
         >
           <Globe className="w-3.5 h-3.5 text-indigo-400" />
-          <span>{language === 'en' ? 'العربية' : 'English'}</span>
+          <span>{language === 'en' ? t('languageSwitchToArabic') : t('languageSwitchToEnglish')}</span>
         </button>
 
         {/* Dark/Light Mode Toggle */}
@@ -212,11 +239,17 @@ export const Navbar: React.FC<NavbarProps> = ({ currentPage, onOpenMobileSidebar
                   {(['SUPER_ADMIN', 'DATA_MANAGER', 'DATA_ANALYST', 'VIEWER'] as const).map(r => (
                     <button
                       key={r}
+                      disabled={switchingRole}
                       onClick={async () => {
-                        await switchRole(r);
-                        setProfileOpen(false);
+                        setSwitchingRole(true);
+                        try {
+                          await switchRole(r);
+                          setProfileOpen(false);
+                        } finally {
+                          setSwitchingRole(false);
+                        }
                       }}
-                      className={`px-2 py-1 rounded text-[10px] font-semibold border transition-colors ${
+                      className={`px-2 py-1 rounded text-[10px] font-semibold border transition-colors disabled:opacity-50 ${
                         currentUser?.role === r
                           ? 'bg-indigo-600/30 border-indigo-500 text-indigo-200'
                           : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
@@ -226,6 +259,19 @@ export const Navbar: React.FC<NavbarProps> = ({ currentPage, onOpenMobileSidebar
                     </button>
                   ))}
                 </div>
+              </div>
+              <div className="px-3 pt-2 mt-1 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setProfileOpen(false);
+                    logout();
+                  }}
+                  className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold text-rose-300 hover:text-white hover:bg-rose-600/20 border border-rose-900/50 transition-colors"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span>{t('logout')}</span>
+                </button>
               </div>
             </div>
           )}

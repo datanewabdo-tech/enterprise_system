@@ -1,6 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useApp } from '../context/AppContext.js';
 import { ImportInspection, ColumnMeta, SqliteInspectedTable } from '../types/index.js';
+import { useAsyncResource } from '../hooks/useAsyncResource.js';
+import { requestCache } from '../utils/requestCache.js';
+import {
+  TopProgressBar,
+  RefreshingBadge,
+  TableSkeletonRows,
+  EmptyStateCard,
+  ErrorRetryCard,
+} from '../components/common/LoadingStates.js';
 import {
   FileUp,
   Database,
@@ -8,6 +17,7 @@ import {
   CheckCircle2,
   AlertTriangle,
   FileSpreadsheet,
+  FileDown,
   Sparkles,
   Clock,
   RefreshCw,
@@ -57,7 +67,7 @@ const KNOWN_DEST_TABLES = [
 ];
 
 export const ImportCenter: React.FC = () => {
-  const { t, addNotification, apiFetch, refreshMissions } = useApp();
+  const { t, addNotification, apiFetch, authToken, refreshMissions } = useApp();
 
   // Wizard Step (1 to 7) for Excel/CSV; Multi-table workflow activates automatically for SQLITE
   const [currentStep, setCurrentStep] = useState(1);
@@ -69,7 +79,6 @@ export const ImportCenter: React.FC = () => {
   // Single-Table (Excel / CSV) State
   const [selectedSheetOrTable, setSelectedSheetOrTable] = useState<string>('');
   const [destinationTable, setDestinationTable] = useState<string>('registrations');
-  const [destColumns, setDestColumns] = useState<ColumnMeta[]>([]);
   const [columnMapping, setColumnMapping] = useState<Record<string, string>>({});
   const [importMode, setImportMode] = useState<'INSERT_ONLY' | 'UPDATE_EXISTING' | 'INSERT_OR_UPDATE'>('INSERT_OR_UPDATE');
   const [matchKey] = useState<string>('id');
@@ -84,8 +93,29 @@ export const ImportCenter: React.FC = () => {
   const [importResult, setImportResult] = useState<any | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // Import batches (undo tracking)
+  const [batches, setBatches] = useState<any[]>([]);
+  const [batchesLoading, setBatchesLoading] = useState(false);
+  const [undoTarget, setUndoTarget] = useState<any | null>(null);
+  const [undoing, setUndoing] = useState(false);
+  const [undoError, setUndoError] = useState<string | null>(null);
+
+  const loadBatches = useCallback(async () => {
+    setBatchesLoading(true);
+    try {
+      const res = await apiFetch('/api/v1/imports/batches');
+      const json = await res.json().catch(() => null);
+      if (res.ok && Array.isArray(json)) setBatches(json);
+    } catch { /* ignore */ } finally {
+      setBatchesLoading(false);
+    }
+  }, [apiFetch]);
+
+  useEffect(() => { loadBatches(); }, [loadBatches]);
+
   // Multi-Table SQLite State
   const [multiConfigs, setMultiConfigs] = useState<Record<string, MultiSqliteConfigState>>({});
+  const [loadingDestTables, setLoadingDestTables] = useState<Record<string, boolean>>({});
   const [estimating, setEstimating] = useState(false);
   const [estimates, setEstimates] = useState<any[] | null>(null);
   const [multiExecuting, setMultiExecuting] = useState(false);
@@ -98,28 +128,43 @@ export const ImportCenter: React.FC = () => {
   } | null>(null);
   const [multiResult, setMultiResult] = useState<any | null>(null);
 
-  // Import History
-  const [history, setHistory] = useState<any[]>([]);
+  // Destination columns via useAsyncResource (AbortController-safe)
+  const destColsRes = useAsyncResource<ColumnMeta[]>(
+    async signal => {
+      const res = await apiFetch(`/api/v1/tables/${destinationTable}?pageSize=1`, { signal });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(json?.error || `Failed to inspect ${destinationTable} columns`);
+      }
+      return Array.isArray(json?.columns) ? json.columns : [];
+    },
+    [destinationTable, authToken],
+    {
+      enabled: Boolean(authToken && destinationTable),
+      cacheKey: `table:columns:meta:${destinationTable}`,
+      keepPreviousData: false,
+    }
+  );
+  const destColumns = destColsRes.data || [];
 
-  const fetchHistory = () => {
-    apiFetch('/api/v1/imports/history')
-      .then(res => res.json())
-      .then(data => setHistory(Array.isArray(data) ? data : []))
-      .catch(() => {});
-  };
-
-  useEffect(() => {
-    fetchHistory();
-  }, []);
-
-  useEffect(() => {
-    apiFetch(`/api/v1/tables/${destinationTable}?pageSize=1`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.columns) setDestColumns(data.columns);
-      })
-      .catch(() => {});
-  }, [destinationTable, apiFetch]);
+  // Import History via useAsyncResource
+  const historyRes = useAsyncResource<any[]>(
+    async signal => {
+      const res = await apiFetch('/api/v1/imports/history', { signal });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(json?.error || 'Failed to load import history');
+      }
+      return Array.isArray(json) ? json : [];
+    },
+    [authToken],
+    {
+      enabled: Boolean(authToken),
+      keepPreviousData: true,
+      isEmpty: data => !data || data.length === 0,
+    }
+  );
+  const history = historyRes.data || [];
 
   const initializeMultiSqliteConfigs = (tables: SqliteInspectedTable[]) => {
     const next: Record<string, MultiSqliteConfigState> = {};
@@ -184,40 +229,66 @@ export const ImportCenter: React.FC = () => {
     }
   };
 
-  const autoMap = (sourceCols: string[]) => {
-    const mapping: Record<string, string> = {};
-    const destNames = destColumns.map(c => c.name);
-    sourceCols.forEach(src => {
-      const normalizedSrc = src.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const match = destNames.find(dst => dst.toLowerCase().replace(/[^a-z0-9]/g, '') === normalizedSrc);
-      if (match) mapping[src] = match;
-    });
-    setColumnMapping(mapping);
-  };
+  const autoMap = useCallback(
+    (sourceCols: string[], colsOverride?: ColumnMeta[]) => {
+      const mapping: Record<string, string> = {};
+      const destNames = (colsOverride || destColumns).map(c => c.name);
+      sourceCols.forEach(src => {
+        const normalizedSrc = src.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const match = destNames.find(dst => dst.toLowerCase().replace(/[^a-z0-9]/g, '') === normalizedSrc);
+        if (match) mapping[src] = match;
+      });
+      setColumnMapping(mapping);
+    },
+    [destColumns]
+  );
+
+  // Re-run autoMap cleanly once new destination table columns finish loading
+  useEffect(() => {
+    if (!inspection || inspection.type === 'SQLITE' || destColumns.length === 0) return;
+    if (currentStep === 3 || currentStep === 4) {
+      let srcCols: string[] = [];
+      if (inspection.type === 'EXCEL' && inspection.sheets) {
+        srcCols = inspection.sheets.find(x => x.sheetName === selectedSheetOrTable)?.columns || [];
+      } else if (inspection.columns) {
+        srcCols = inspection.columns;
+      }
+      autoMap(srcCols, destColumns);
+    }
+  }, [destColumns, currentStep, inspection, selectedSheetOrTable, autoMap]);
 
   const handleMultiDestChange = async (sourceTable: string, newDest: string) => {
-    const res = await apiFetch(`/api/v1/tables/${newDest}?pageSize=1`);
-    const json = res.ok ? await res.json() : { columns: [] };
-    const cols: ColumnMeta[] = json.columns || [];
-    const srcCols = inspection?.tables?.find(x => x.tableName === sourceTable)?.columns.map(c => c.name) || [];
+    setLoadingDestTables(prev => ({ ...prev, [sourceTable]: true }));
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch(`/api/v1/tables/${newDest}?pageSize=1`);
+      const json = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(json?.error || `Failed to inspect ${newDest} schema`);
+      const cols: ColumnMeta[] = json?.columns || [];
+      const srcCols = inspection?.tables?.find(x => x.tableName === sourceTable)?.columns.map(c => c.name) || [];
 
-    const mapping: Record<string, string> = {};
-    srcCols.forEach(src => {
-      const n = src.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const found = cols.find(d => d.name.toLowerCase().replace(/[^a-z0-9]/g, '') === n);
-      if (found) mapping[src] = found.name;
-    });
+      const mapping: Record<string, string> = {};
+      srcCols.forEach(src => {
+        const n = src.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const found = cols.find(d => d.name.toLowerCase().replace(/[^a-z0-9]/g, '') === n);
+        if (found) mapping[src] = found.name;
+      });
 
-    setMultiConfigs(prev => ({
-      ...prev,
-      [sourceTable]: {
-        ...prev[sourceTable],
-        destinationTable: newDest,
-        destColumns: cols,
-        columnMapping: mapping,
-      },
-    }));
-    setEstimates(null);
+      setMultiConfigs(prev => ({
+        ...prev,
+        [sourceTable]: {
+          ...prev[sourceTable],
+          destinationTable: newDest,
+          destColumns: cols,
+          columnMapping: mapping,
+        },
+      }));
+      setEstimates(null);
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Failed to load target table schema');
+    } finally {
+      setLoadingDestTables(prev => ({ ...prev, [sourceTable]: false }));
+    }
   };
 
   const setAllMultiSelected = (selected: boolean) => {
@@ -325,11 +396,12 @@ export const ImportCenter: React.FC = () => {
       if (!res.ok) throw new Error(json.error || 'Multi-table SQLite import failed');
 
       setMultiResult(json);
-      fetchHistory();
+      requestCache.clear();
+      historyRes.reload({ force: true });
       refreshMissions();
       const wasCancelled = json.status === 'CANCELLED' || json.tableResults?.some((r: any) => r.status === 'CANCELLED');
       addNotification({
-        title: wasCancelled ? t('importCancelled') : 'Multi-Table SQLite Import Completed',
+        title: wasCancelled ? t('importCancelled') : t('multiTableSqliteImportCompleted'),
         message: `${wasCancelled ? 'Stopped early: ' : 'Imported '}${json.totals.inserted} inserted, ${json.totals.updated} updated across ${json.tableResults.length} tables.`,
         type: wasCancelled || json.totals.errors > 0 ? 'warning' : 'success',
       });
@@ -403,7 +475,8 @@ export const ImportCenter: React.FC = () => {
         message: `Imported ${json.result.inserted} rows to ${destinationTable}`,
         type: 'success',
       });
-      fetchHistory();
+      requestCache.clear();
+      historyRes.reload({ force: true });
       refreshMissions();
     } catch (err: any) {
       setErrorMsg(err.message);
@@ -439,6 +512,29 @@ export const ImportCenter: React.FC = () => {
   };
 
   const selectedCount = Object.values(multiConfigs).filter(c => c.selected).length;
+
+  const handleUndo = async () => {
+    if (!undoTarget) return;
+    if (Number(undoTarget.inserted_count) === 0 && Number(undoTarget.updated_count) === 0) {
+      setUndoError('This import has no tracked changes to undo.');
+      return;
+    }
+    setUndoing(true);
+    setUndoError(null);
+    try {
+      const res = await apiFetch(`/api/v1/imports/${undoTarget.batch_id}/undo`, { method: 'POST' });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(json?.error || 'Undo failed');
+      addNotification({ title: 'Import Undone', message: `Deleted ${json.deleted}, restored ${json.restored}`, type: 'success' });
+      setUndoTarget(null);
+      loadBatches();
+      refreshMissions();
+    } catch (err: any) {
+      setUndoError(err?.message || 'Undo failed');
+    } finally {
+      setUndoing(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -534,9 +630,9 @@ export const ImportCenter: React.FC = () => {
                   )}
                 </div>
                 {uploading && (
-                  <div className="flex items-center gap-2 text-xs text-indigo-400 font-semibold animate-pulse">
+                  <div className="flex items-center gap-2 text-xs text-indigo-400 font-semibold animate-pulse motion-reduce:animate-none">
                     <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Inspecting schema structure and sample rows...</span>
+                    <span>{t('uploadInProgress')} &mdash; Inspecting schema structure and sample rows...</span>
                   </div>
                 )}
               </div>
@@ -721,10 +817,14 @@ export const ImportCenter: React.FC = () => {
                       </div>
 
                       <div className="flex flex-wrap items-center gap-2">
+                        {loadingDestTables[tb.tableName] && (
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                        )}
                         <select
+                          disabled={Boolean(loadingDestTables[tb.tableName])}
                           value={cfg.destinationTable}
                           onChange={e => handleMultiDestChange(tb.tableName, e.target.value)}
-                          className="h-8 px-2 text-xs bg-slate-900 border border-slate-700 rounded-lg text-slate-200"
+                          className="h-8 px-2 text-xs bg-slate-900 border border-slate-700 rounded-lg text-slate-200 disabled:opacity-60"
                         >
                           {KNOWN_DEST_TABLES.map(dt => (
                             <option key={dt} value={dt}>
@@ -1003,13 +1103,18 @@ export const ImportCenter: React.FC = () => {
           <div className="space-y-4">
             <h2 className="text-sm font-bold text-slate-200">{t('step3Target')}</h2>
             <div className="space-y-2">
-              <label className="text-xs text-slate-400 font-semibold uppercase">{t('selectDestinationTable')}</label>
+              <div className="flex items-center justify-between">
+                <label className="text-xs text-slate-400 font-semibold uppercase">{t('selectDestinationTable')}</label>
+                {destColsRes.isLoading && (
+                  <span className="inline-flex items-center gap-1.5 text-[11px] text-indigo-300">
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                    <span>{t('loadingSchema')}</span>
+                  </span>
+                )}
+              </div>
               <select
                 value={destinationTable}
-                onChange={e => {
-                  setDestinationTable(e.target.value);
-                  setTimeout(() => autoMap(getSourceColumns()), 200);
-                }}
+                onChange={e => setDestinationTable(e.target.value)}
                 className="w-full h-10 px-3 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-indigo-500"
               >
                 {KNOWN_DEST_TABLES.map(dt => (
@@ -1020,18 +1125,24 @@ export const ImportCenter: React.FC = () => {
               </select>
             </div>
 
+            {destColsRes.isError && (
+              <ErrorRetryCard compact message={destColsRes.error} onRetry={() => destColsRes.reload({ force: true })} />
+            )}
+
             <div className="flex justify-between pt-4 border-t border-slate-800">
-              <button onClick={() => setCurrentStep(2)} className="px-4 py-2 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">
+              <button type="button" onClick={() => setCurrentStep(2)} className="px-4 py-2 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">
                 Back
               </button>
               <button
+                type="button"
+                disabled={destColsRes.isLoading}
                 onClick={() => {
                   autoMap(getSourceColumns());
                   setCurrentStep(4);
                 }}
-                className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white"
+                className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50"
               >
-                <span>Continue</span>
+                <span>{destColsRes.isLoading ? t('loadingSchema') : 'Continue'}</span>
                 <ArrowRight className="w-4 h-4 rtl:rotate-180" />
               </button>
             </div>
@@ -1062,11 +1173,12 @@ export const ImportCenter: React.FC = () => {
                   </div>
                   <div className="w-1/2">
                     <select
+                      disabled={destColsRes.isLoading}
                       value={columnMapping[srcCol] || ''}
                       onChange={e => setColumnMapping({ ...columnMapping, [srcCol]: e.target.value })}
-                      className="w-full h-8 px-2 text-xs bg-slate-900 border border-slate-700 rounded-lg text-slate-200"
+                      className="w-full h-8 px-2 text-xs bg-slate-900 border border-slate-700 rounded-lg text-slate-200 disabled:opacity-60"
                     >
-                      <option value="">{t('ignoreColumn')}</option>
+                      <option value="">{destColsRes.isLoading ? t('loadingSchema') : t('ignoreColumn')}</option>
                       {destColumns.map(dc => (
                         <option key={dc.name} value={dc.name}>
                           {dc.name} ({dc.type})
@@ -1250,6 +1362,16 @@ export const ImportCenter: React.FC = () => {
                 <span className="block text-xl font-bold text-rose-400 mt-1">{importResult.errors}</span>
               </div>
             </div>
+            {Array.isArray(importResult.errorLog) && importResult.errorLog.length > 0 && (
+              <div className="p-3 bg-rose-950/30 border border-rose-800 rounded-xl space-y-1">
+                <div className="text-xs font-semibold text-rose-300">Import errors (first {importResult.errorLog.length}):</div>
+                <ul className="text-[11px] text-rose-200/90 space-y-0.5 max-h-48 overflow-y-auto font-mono">
+                  {importResult.errorLog.map((e: string, i: number) => (
+                    <li key={i} className="whitespace-pre-wrap break-words">{e}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <div className="flex justify-end pt-4 border-t border-slate-800">
               <button
                 onClick={() => {
@@ -1267,50 +1389,121 @@ export const ImportCenter: React.FC = () => {
         )}
       </div>
 
-      {/* Previous Import History Table */}
-      <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm space-y-3">
-        <h2 className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
-          <Clock className="w-4 h-4 text-indigo-400" />
-          <span>{t('recentImports')}</span>
-        </h2>
-
-        <div className="overflow-x-auto rounded-lg border border-slate-800">
-          <table className="w-full text-left rtl:text-right text-xs">
-            <thead className="bg-slate-950/60 text-slate-400 border-b border-slate-800 text-[11px] uppercase">
-              <tr>
-                <th className="px-4 py-2.5">Date</th>
-                <th className="px-4 py-2.5">Filename</th>
-                <th className="px-4 py-2.5">Destination Table</th>
-                <th className="px-4 py-2.5">Inserted</th>
-                <th className="px-4 py-2.5">Updated</th>
-                <th className="px-4 py-2.5">Skipped</th>
-                <th className="px-4 py-2.5">Errors</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800/60 text-slate-300">
-              {history.length === 0 ? (
-                <tr>
-                  <td colSpan={7} className="px-4 py-6 text-center text-slate-500">
-                    No import history records found
-                  </td>
-                </tr>
-              ) : (
-                history.map((h, i) => (
-                  <tr key={i} className="hover:bg-slate-800/40">
-                    <td className="px-4 py-2.5 font-mono text-[11px]">{new Date(h.created_at).toLocaleString()}</td>
-                    <td className="px-4 py-2.5 font-medium text-slate-200">{h.filename}</td>
-                    <td className="px-4 py-2.5 font-mono text-indigo-400">{h.destination_table}</td>
-                    <td className="px-4 py-2.5 text-emerald-400 font-mono">{h.inserted_count}</td>
-                    <td className="px-4 py-2.5 text-sky-400 font-mono">{h.updated_count}</td>
-                    <td className="px-4 py-2.5 font-mono text-slate-400">{h.skipped_count}</td>
-                    <td className="px-4 py-2.5 text-rose-400 font-mono">{h.error_count}</td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
+      {/* Import History & Undo */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-sm space-y-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-bold text-slate-200 flex items-center gap-2">
+            <FileDown className="w-4 h-4 text-indigo-400" />
+            Import History & Undo
+          </h2>
+          <p className="text-[11px] text-slate-500">Undo is available for imports performed after this feature was added. Legacy imports are shown for reference but cannot be undone.</p>
+          <button
+            type="button"
+            onClick={loadBatches}
+            className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors border border-slate-700/60"
+            title="Refresh"
+          >
+            <RefreshCw className={`w-4 h-4 ${batchesLoading ? 'animate-spin' : ''}`} />
+          </button>
         </div>
+
+        {batches.length === 0 ? (
+          <p className="text-xs text-slate-500">No import batches recorded yet.</p>
+        ) : (
+          <div className="overflow-x-auto rounded-xl border border-slate-800">
+            <table className="w-full text-xs">
+              <thead className="bg-slate-950/60 text-slate-300">
+                <tr>
+                  <th className="px-3 py-2 text-left font-semibold">Batch ID</th>
+                  <th className="px-3 py-2 text-left font-semibold">File</th>
+                  <th className="px-3 py-2 text-left font-semibold">Table</th>
+                  <th className="px-3 py-2 text-left font-semibold">Status</th>
+                  <th className="px-3 py-2 text-left font-semibold">Inserted</th>
+                  <th className="px-3 py-2 text-left font-semibold">Updated</th>
+                  <th className="px-3 py-2 text-left font-semibold">Undo</th>
+                  <th className="px-3 py-2 text-left font-semibold">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {batches.map((b: any) => (
+                  <tr key={b.id} className="border-t border-slate-800/60 hover:bg-slate-800/40">
+                    <td className="px-3 py-2 font-mono text-[10px] text-slate-400">{b.batch_id}</td>
+                    <td className="px-3 py-2 text-slate-200 truncate max-w-[160px]" title={b.filename}>{b.filename}</td>
+                    <td className="px-3 py-2 text-slate-300">{b.destination_table}</td>
+                    <td className="px-3 py-2">
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                        b.status === 'COMPLETED' ? 'bg-emerald-900/40 text-emerald-300' :
+                        b.status === 'COMPLETED_WITH_ERRORS' ? 'bg-amber-900/40 text-amber-300' :
+                        'bg-slate-800 text-slate-300'
+                      }`}>{b.status}</span>
+                    </td>
+                    <td className="px-3 py-2 tabular-nums text-slate-300">{b.inserted_count}</td>
+                    <td className="px-3 py-2 tabular-nums text-slate-300">{b.updated_count}</td>
+                    <td className="px-3 py-2">
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                        b.undo_status === 'UNDONE' ? 'bg-sky-900/40 text-sky-300' :
+                        b.undo_status === 'UNDO_BLOCKED' ? 'bg-rose-900/40 text-rose-300' :
+                        'bg-slate-800 text-slate-400'
+                      }`}>{b.undo_status}</span>
+                    </td>
+                    <td className="px-3 py-2">
+                      {b.undo_status !== 'UNDONE' && (
+                        <button
+                          type="button"
+                          onClick={() => setUndoTarget(b)}
+                          className="px-2 py-1 text-[11px] font-medium rounded border border-rose-800 text-rose-300 hover:bg-rose-900/40 transition-colors"
+                          title={Number(b.inserted_count) === 0 && Number(b.updated_count) === 0 ? 'No tracked changes to undo' : 'Undo this import'}
+                        >
+                          Undo
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
+
+      {/* Undo Confirmation Dialog */}
+      {undoTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl p-6 w-full max-w-md shadow-2xl space-y-4">
+            <h3 className="text-lg font-bold text-slate-100">Confirm Undo Import</h3>
+            <div className="text-xs text-slate-300 space-y-1">
+              <div><span className="text-slate-500">File:</span> {undoTarget.filename}</div>
+              <div><span className="text-slate-500">Table:</span> {undoTarget.destination_table}</div>
+              <div><span className="text-slate-500">Inserted:</span> {undoTarget.inserted_count}</div>
+              <div><span className="text-slate-500">Updated:</span> {undoTarget.updated_count}</div>
+              <div><span className="text-slate-500">Failed:</span> {undoTarget.error_count}</div>
+            </div>
+            <p className="text-xs text-amber-300">This will delete inserted records and restore updated records to their previous values. This action cannot be undone.</p>
+            {undoError && (
+              <div className="p-2 bg-rose-950/40 border border-rose-800 rounded text-xs text-rose-300">{undoError}</div>
+            )}
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => { setUndoTarget(null); setUndoError(null); }}
+                className="px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 transition-colors"
+                disabled={undoing}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleUndo}
+                disabled={undoing}
+                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-rose-600 hover:bg-rose-500 text-white disabled:opacity-50 transition-colors"
+              >
+                {undoing ? 'Undoing...' : 'Confirm Undo'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 };

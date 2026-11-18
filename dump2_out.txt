@@ -1,0 +1,155 @@
+export function getBtsMapData(filters: Partial<DashboardFilters> = {}, targetDb: DatabaseSync = db) {
+  const regWhere = buildRegistrationWhere(filters, targetDb);
+  const registrationCounts = targetDb.prepare(`
+    SELECT COUNT(*) as totalRegistrationRecords,
+           SUM(CASE WHEN bts_location IS NOT NULL AND TRIM(bts_location) != '' THEN 1 ELSE 0 END) as registrationRecordsWithLocation
+    FROM registrations
+    ${regWhere.whereSql}
+  `).get(...regWhere.params) as { totalRegistrationRecords: number; registrationRecordsWithLocation: number };
+  const regRows = targetDb.prepare(`
+    SELECT id, mission_id, mission, bts, bts_name, country, country_code, mcc, mnc, bts_location
+    FROM registrations
+    ${regWhere.whereSql ? `${regWhere.whereSql} AND` : 'WHERE'} bts_location IS NOT NULL AND TRIM(bts_location) != ''
+    ORDER BY id ASC
+  `).all(...regWhere.params) as any[];
+
+  const ncWhere = buildNetworkCellWhere(filters, targetDb);
+  const ncRows = targetDb.prepare(`
+    SELECT id, mission_id, mission, mcc, mnc, lac, cell_id, rat, rx_lev_dbm, latitude, longitude, direction
+    FROM network_cells
+    ${ncWhere.whereSql ? `${ncWhere.whereSql} AND` : 'WHERE'} latitude IS NOT NULL AND longitude IS NOT NULL
+    LIMIT 10000
+  `).all(...ncWhere.params) as any[];
+
+  interface AggLocation {
+    key: string;
+    lat: number;
+    lng: number;
+    sources: Set<'registration' | 'network_cell'>;
+    registrationCount: number;
+    networkCellCount: number;
+    btsNames: Set<string>;
+    btsCodes: Set<string>;
+    countries: Set<string>;
+    rats: Set<string>;
+    mccs: Set<string>;
+    mncs: Set<string>;
+    cellIds: Set<string>;
+    missions: Set<string>;
+    countryCodes: Set<string>;
+    registrationIds: Set<number>;
+  }
+
+  const mapByCoord = new Map<string, AggLocation>();
+  let totalParsedRegistrationCoords = 0;
+  let invalidRegistrationCoords = 0;
+  let invalidSkippedCount = 0;
+
+  const getOrCreateBucket = (lat: number, lng: number): AggLocation => {
+    const key = `${lat},${lng}`;
+    let bucket = mapByCoord.get(key);
+    if (!bucket) {
+      bucket = {
+        key,
+        lat,
+        lng,
+        sources: new Set(),
+        registrationCount: 0,
+        networkCellCount: 0,
+        btsNames: new Set(),
+        btsCodes: new Set(),
+        countries: new Set(),
+        rats: new Set(),
+        mccs: new Set(),
+        mncs: new Set(),
+        cellIds: new Set(),
+        missions: new Set(),
+        countryCodes: new Set(),
+        registrationIds: new Set(),
+      };
+      mapByCoord.set(key, bucket);
+    }
+    return bucket;
+  };
+
+  for (const r of regRows) {
+    const { points, invalidCount } = parseBtsLocationString(r.bts_location);
+    invalidRegistrationCoords += invalidCount;
+    invalidSkippedCount += invalidCount;
+    for (const pt of points) {
+      totalParsedRegistrationCoords++;
+      const b = getOrCreateBucket(pt.lat, pt.lng);
+      b.sources.add('registration');
+      b.registrationCount++;
+      b.registrationIds.add(Number(r.id));
+      if (r.bts_name) b.btsNames.add(String(r.bts_name));
+      if (r.bts) b.btsCodes.add(String(r.bts));
+      if (r.country) b.countries.add(String(r.country));
+      if (r.country_code) b.countryCodes.add(String(r.country_code));
+      if (r.mcc !== null && r.mcc !== undefined && String(r.mcc).trim() !== '') b.mccs.add(String(r.mcc).trim());
+      if (r.mnc !== null && r.mnc !== undefined && String(r.mnc).trim() !== '') b.mncs.add(String(r.mnc).trim());
+      if (r.mission) b.missions.add(String(r.mission));
+    }
+  }
+
+  for (const nc of ncRows) {
+    const lat = Number(nc.latitude);
+    const lng = Number(nc.longitude);
+    if (!isValidCoord(lat, lng)) {
+      invalidSkippedCount++;
+      continue;
+    }
+    const b = getOrCreateBucket(lat, lng);
+    b.sources.add('network_cell');
+    b.networkCellCount++;
+    if (nc.rat) b.rats.add(String(nc.rat));
+    if (nc.mcc !== null && nc.mcc !== undefined && String(nc.mcc).trim() !== '') b.mccs.add(String(nc.mcc).trim());
+    if (nc.mnc !== null && nc.mnc !== undefined && String(nc.mnc).trim() !== '') b.mncs.add(String(nc.mnc).trim());
+    if (nc.cell_id !== null && nc.cell_id !== undefined && String(nc.cell_id).trim() !== '') b.cellIds.add(String(nc.cell_id).trim());
+    if (nc.mission) b.missions.add(String(nc.mission));
+  }
+
+  const locations = Array.from(mapByCoord.values()).map(b => {
+    const source: 'registration' | 'network_cell' | 'both' =
+      b.sources.has('registration') && b.sources.has('network_cell')
+        ? 'both'
+        : b.sources.has('registration')
+        ? 'registration'
+        : 'network_cell';
+
+    return {
+      key: b.key,
+      lat: b.lat,
+      lng: b.lng,
+      source,
+      registrationCount: b.registrationCount,
+      networkCellCount: b.networkCellCount,
+      totalCount: b.registrationCount + b.networkCellCount,
+      btsNames: Array.from(b.btsNames),
+      btsCodes: Array.from(b.btsCodes),
+      countries: Array.from(b.countries),
+      countryCodes: Array.from(b.countryCodes),
+      rats: Array.from(b.rats),
+      mccs: Array.from(b.mccs),
+      mncs: Array.from(b.mncs),
+      cellIds: Array.from(b.cellIds).slice(0, 20),
+      missions: Array.from(b.missions),
+      registrationIds: Array.from(b.registrationIds).sort((a, b) => a - b),
+    };
+  });
+
+  return {
+    locations,
+    stats: {
+      totalRegistrationRecords: Number(registrationCounts.totalRegistrationRecords || 0),
+      registrationRecordsWithLocation: Number(registrationCounts.registrationRecordsWithLocation || 0),
+      totalParsedRegistrationCoords,
+      invalidRegistrationCoords,
+      uniqueLocations: locations.length,
+      registrationLocationsCount: locations.filter(l => l.source === 'registration' || l.source === 'both').length,
+      networkCellLocationsCount: locations.filter(l => l.source === 'network_cell' || l.source === 'both').length,
+      invalidSkippedCount,
+    },
+  };
+}
+

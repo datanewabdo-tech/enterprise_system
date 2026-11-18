@@ -54,7 +54,7 @@ app.use(appRouter);
 async function initializeApp() {
   console.log('[Enterprise Server] Initializing database...');
   const { initDatabase } = await import('./server/db.js');
-  initDatabase();
+  await initDatabase();
   console.log('[Enterprise Server] Database initialized successfully.');
 
   // Mount versioned REST API

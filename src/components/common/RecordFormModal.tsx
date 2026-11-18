@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext.js';
 import { ColumnMeta } from '../../types/index.js';
-import { X, Save, AlertCircle } from 'lucide-react';
+import { ModalContentSkeleton, ErrorRetryCard } from './LoadingStates.js';
+import { X, Save, AlertCircle, RefreshCw } from 'lucide-react';
 
 interface RecordFormModalProps {
   isOpen: boolean;
@@ -9,6 +10,9 @@ interface RecordFormModalProps {
   tableName: string;
   record: Record<string, any> | null; // If null, mode is CREATE, else EDIT
   columns: ColumnMeta[];
+  columnsLoading?: boolean;
+  columnsError?: string | null;
+  onRetryColumns?: () => void;
   onSuccess: () => void;
 }
 
@@ -18,9 +22,12 @@ export const RecordFormModal: React.FC<RecordFormModalProps> = ({
   tableName,
   record,
   columns,
+  columnsLoading = false,
+  columnsError = null,
+  onRetryColumns,
   onSuccess,
 }) => {
-  const { t, activeMission, missions, apiFetch } = useApp();
+  const { t, activeMission, missions, missionsLoading, apiFetch } = useApp();
   const [formData, setFormData] = useState<Record<string, any>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -69,8 +76,8 @@ export const RecordFormModal: React.FC<RecordFormModalProps> = ({
       });
 
       if (!res.ok) {
-        const json = await res.json();
-        throw new Error(json.error || 'Failed to save record');
+        const json = await res.json().catch(() => null);
+        throw new Error(json?.error || 'Failed to save record');
       }
 
       onSuccess();
@@ -91,6 +98,7 @@ export const RecordFormModal: React.FC<RecordFormModalProps> = ({
             {isEdit ? t('editRecord') : t('addNewRecord')}
           </h2>
           <button
+            type="button"
             onClick={onClose}
             className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
           >
@@ -106,81 +114,94 @@ export const RecordFormModal: React.FC<RecordFormModalProps> = ({
           </div>
         )}
 
-        {/* Form */}
-        <form onSubmit={handleSubmit} className="flex-1 overflow-y-auto p-6 space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {editableColumns.map(col => {
-              if (col.name === 'mission_id') {
+        {/* Body */}
+        {columnsLoading && editableColumns.length === 0 ? (
+          <ModalContentSkeleton fields={6} label={t('loadingSchema')} />
+        ) : columnsError && editableColumns.length === 0 ? (
+          <div className="p-6">
+            <ErrorRetryCard message={columnsError} onRetry={onRetryColumns} />
+          </div>
+        ) : (
+          <form onSubmit={handleSubmit} className="flex-1 overflow-y-auto p-6 space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {editableColumns.map(col => {
+                if (col.name === 'mission_id') {
+                  return (
+                    <div key={col.name} className="space-y-1">
+                      <label className="block text-xs font-semibold text-slate-300">
+                        mission_id {col.notnull === 1 && <span className="text-rose-400">*</span>}
+                      </label>
+                      <select
+                        disabled={missionsLoading}
+                        value={formData.mission_id ?? ''}
+                        onChange={e => {
+                          const val = e.target.value ? Number(e.target.value) : '';
+                          const matched = missions.find(m => m.id === Number(val));
+                          setFormData({
+                            ...formData,
+                            mission_id: val,
+                            ...(matched && columns.some(c => c.name === 'mission') ? { mission: matched.mission } : {}),
+                          });
+                        }}
+                        className="w-full h-9 px-3 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-60"
+                      >
+                        <option value="">
+                          {missionsLoading ? t('loadingOptions') : t('selectMissionPlaceholder')}
+                        </option>
+                        {missions.map(m => (
+                          <option key={m.id} value={m.id}>
+                            {m.mission} — {m.location} (#{m.id})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  );
+                }
+                const isNumeric = ['INTEGER', 'REAL', 'FLOAT', 'NUMERIC'].some(type =>
+                  col.type.toUpperCase().includes(type)
+                );
                 return (
                   <div key={col.name} className="space-y-1">
                     <label className="block text-xs font-semibold text-slate-300">
-                      mission_id {col.notnull === 1 && <span className="text-rose-400">*</span>}
+                      {col.name} {col.notnull === 1 && <span className="text-rose-400">*</span>}
                     </label>
-                    <select
-                      value={formData.mission_id ?? ''}
-                      onChange={e => {
-                        const val = e.target.value ? Number(e.target.value) : '';
-                        const matched = missions.find(m => m.id === Number(val));
+                    <input
+                      type={isNumeric ? 'number' : 'text'}
+                      step="any"
+                      value={formData[col.name] ?? ''}
+                      onChange={e =>
                         setFormData({
                           ...formData,
-                          mission_id: val,
-                          ...(matched && columns.some(c => c.name === 'mission') ? { mission: matched.mission } : {}),
-                        });
-                      }}
-                      className="w-full h-9 px-3 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-indigo-500"
-                    >
-                      <option value="">-- Select Mission --</option>
-                      {missions.map(m => (
-                        <option key={m.id} value={m.id}>
-                          {m.mission} — {m.location} (#{m.id})
-                        </option>
-                      ))}
-                    </select>
+                          [col.name]: isNumeric && e.target.value !== '' ? Number(e.target.value) : e.target.value,
+                        })
+                      }
+                      placeholder={`Enter ${col.name}...`}
+                      className="w-full h-9 px-3 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 placeholder-slate-600 focus:outline-none focus:border-indigo-500 transition-colors"
+                    />
                   </div>
                 );
-              }
-              const isNumeric = ['INTEGER', 'REAL', 'FLOAT', 'NUMERIC'].some(t => col.type.toUpperCase().includes(t));
-              return (
-                <div key={col.name} className="space-y-1">
-                  <label className="block text-xs font-semibold text-slate-300">
-                    {col.name} {col.notnull === 1 && <span className="text-rose-400">*</span>}
-                  </label>
-                  <input
-                    type={isNumeric ? 'number' : 'text'}
-                    step="any"
-                    value={formData[col.name] ?? ''}
-                    onChange={e =>
-                      setFormData({
-                        ...formData,
-                        [col.name]: isNumeric && e.target.value !== '' ? Number(e.target.value) : e.target.value,
-                      })
-                    }
-                    placeholder={`Enter ${col.name}...`}
-                    className="w-full h-9 px-3 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 placeholder-slate-600 focus:outline-none focus:border-indigo-500 transition-colors"
-                  />
-                </div>
-              );
-            })}
-          </div>
+              })}
+            </div>
 
-          <div className="flex items-center justify-end gap-2 pt-4 border-t border-slate-800">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
-            >
-              {t('cancel')}
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50 transition-colors"
-            >
-              <Save className="w-4 h-4" />
-              <span>{loading ? 'Saving...' : isEdit ? t('save') : t('create')}</span>
-            </button>
-          </div>
-        </form>
+            <div className="flex items-center justify-end gap-2 pt-4 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-4 py-2 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
+              >
+                {t('cancel')}
+              </button>
+              <button
+                type="submit"
+                disabled={loading}
+                className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-50 transition-colors"
+              >
+                {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                <span>{loading ? t('loading') : isEdit ? t('save') : t('create')}</span>
+              </button>
+            </div>
+          </form>
+        )}
       </div>
     </div>
   );

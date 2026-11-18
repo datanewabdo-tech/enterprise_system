@@ -1,73 +1,206 @@
+import { Prisma, PrismaClient } from '@prisma/client';
 import { db } from './db.js';
 import { DashboardFilters } from './validators.js';
-import { DatabaseSync } from 'node:sqlite';
+import { MCC_COUNTRIES } from './mcc-countries.js';
+
+/**
+ * PostgreSQL / Prisma dashboard analytics.
+ *
+ * All exported database-backed functions are asynchronous.
+ * The database argument supports both PrismaClient and transaction clients.
+ */
+
+type Db = PrismaClient | Prisma.TransactionClient;
+type Params = any[];
 
 export interface ParsedPoint {
   lat: number;
   lng: number;
 }
 
+const q = (name: string) => `"${name.replace(/"/g, '""')}"`;
+
+async function rows<T = any>(
+  targetDb: Db,
+  sql: string,
+  params: Params = [],
+): Promise<T[]> {
+  return targetDb.$queryRawUnsafe<T[]>(sql, ...params);
+}
+
+async function first<T = any>(
+  targetDb: Db,
+  sql: string,
+  params: Params = [],
+): Promise<T | undefined> {
+  const result = await rows<T>(targetDb, sql, params);
+  return result[0];
+}
+
+async function scalar(
+  targetDb: Db,
+  sql: string,
+  params: Params = [],
+): Promise<number> {
+  const result = await first<any>(targetDb, sql, params);
+  return Number(result?.val ?? 0);
+}
+
+function add(
+  clauses: string[],
+  params: Params,
+  sql: string,
+  values: Params = [],
+): void {
+  const start = params.length;
+  clauses.push(
+    sql.replace(/\$(\d+)/g, (_match, number) => `$${Number(number) + start}`),
+  );
+  params.push(...values);
+}
+
+function inClause(
+  column: string,
+  values: unknown[],
+  params: Params,
+  transform?: (value: any) => any,
+): string {
+  if (!values.length) return 'FALSE';
+
+  const placeholders = values.map((value) => {
+    params.push(transform ? transform(value) : value);
+    return `$${params.length}`;
+  });
+
+  return `${column} IN (${placeholders.join(', ')})`;
+}
+
+function stripLeadingZeros(value: unknown): string {
+  const normalized = String(value ?? '').trim();
+  return normalized ? normalized.replace(/^0+(?=\d)/, '') : '';
+}
+
+function uniqueStrings(values: Iterable<unknown>): string[] {
+  return [...new Set(
+    [...values]
+      .map((value) => String(value ?? '').trim())
+      .filter(Boolean),
+  )];
+}
+
+function safeNumber(value: unknown): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+export function isValidCoord(lat: number, lng: number): boolean {
+  return (
+    Number.isFinite(lat) &&
+    Number.isFinite(lng) &&
+    !(lat === 0 && lng === 0) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lng >= -180 &&
+    lng <= 180
+  );
+}
+
 /**
- * Parses bts_location strings supporting:
- * - newline-separated pairs ("31.5017 34.4668\n31.5120 34.4780")
- * - semicolon-separated ("30.0444;31.2357")
- * - comma-separated ("31.2519, 34.2510")
- * - space-separated ("30.0444 31.2357")
- * - WKT POINT(lng lat)
- * Rejects nulls, (0, 0), non-numeric strings, and out-of-range coordinates.
+ * Parse BTS coordinates without silently swapping latitude and longitude.
+ *
+ * Supported formats:
+ * - Latitude and longitude on separate lines.
+ * - Multiple newline-separated coordinate pairs.
+ * - Latitude,longitude pairs separated by commas.
+ * - WKT POINT(longitude latitude).
+ * - Pipe, semicolon, slash, or whitespace-separated numeric pairs.
  */
-export function parseBtsLocationString(raw: string | null | undefined): { points: ParsedPoint[]; invalidCount: number } {
-  if (!raw || typeof raw !== 'string') return { points: [], invalidCount: 0 };
-  const trimmed = raw.trim();
-  if (!trimmed) return { points: [], invalidCount: 0 };
+export function parseBtsLocationString(
+  raw: string | null | undefined,
+): { points: ParsedPoint[]; invalidCount: number } {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return { points: [], invalidCount: 0 };
+  }
 
   const points: ParsedPoint[] = [];
   let invalidCount = 0;
 
-  // Split by newlines or pipe characters if multiple coordinates are stacked
-  const lines = trimmed.split(/[\r\n|]+/).map(l => l.trim()).filter(Boolean);
+  const numeric = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/;
+  const lines = raw
+    .trim()
+    .split(/[\r\n|]+/)
+    .map((value) => value.trim())
+    .filter(Boolean);
 
-  for (const line of lines) {
-    // Check WKT POINT(lng lat)
-    const wktMatch = line.match(/POINT\s*\(\s*([+-]?\d+(?:\.\d+)?)\s+([+-]?\d+(?:\.\d+)?)\s*\)/i);
-    if (wktMatch) {
-      const lng = Number(wktMatch[1]);
-      const lat = Number(wktMatch[2]);
+  // Common source format: latitude on one line, longitude on the next.
+  if (lines.length >= 2 && lines.every((value) => numeric.test(value))) {
+    for (let index = 0; index < lines.length; index += 2) {
+      if (index + 1 >= lines.length) {
+        invalidCount++;
+        continue;
+      }
+
+      const lat = Number(lines[index]);
+      const lng = Number(lines[index + 1]);
+
       if (isValidCoord(lat, lng)) {
         points.push({ lat, lng });
       } else {
         invalidCount++;
       }
+    }
+
+    return { points, invalidCount };
+  }
+
+  for (const line of lines) {
+    const wkt = line.match(
+      /POINT\s*\(\s*([+-]?[\d.]+)\s+([+-]?[\d.]+)\s*\)/i,
+    );
+
+    if (wkt) {
+      // WKT order is longitude, latitude.
+      const lng = Number(wkt[1]);
+      const lat = Number(wkt[2]);
+
+      if (isValidCoord(lat, lng)) {
+        points.push({ lat, lng });
+      } else {
+        invalidCount++;
+      }
+
       continue;
     }
 
-    // Standard pair separated by semicolon, comma, slash, or whitespace
-    let tokens: string[] = [];
-    if (line.includes(';')) {
-      tokens = line.split(';').map(t => t.trim()).filter(Boolean);
-    } else if (line.includes(',')) {
-      tokens = line.split(',').map(t => t.trim()).filter(Boolean);
-    } else if (line.includes('/')) {
-      tokens = line.split('/').map(t => t.trim()).filter(Boolean);
-    } else {
-      tokens = line.split(/\s+/).map(t => t.trim()).filter(Boolean);
-    }
+    const tokens = line
+      .split(/[;,/\s]+/)
+      .map((value) => value.trim())
+      .filter(Boolean);
 
-    // Handle even-length sequence of coordinates on one line (e.g. "lat1 lng1 lat2 lng2")
-    if (tokens.length >= 2 && tokens.length % 2 === 0 && tokens.every(t => /^[+-]?\d+(?:\.\d+)?$/.test(t))) {
-      for (let i = 0; i < tokens.length; i += 2) {
-        const lat = Number(tokens[i]);
-        const lng = Number(tokens[i + 1]);
+    if (
+      tokens.length >= 2 &&
+      tokens.length % 2 === 0 &&
+      tokens.every((value) => numeric.test(value))
+    ) {
+      for (let index = 0; index < tokens.length; index += 2) {
+        const lat = Number(tokens[index]);
+        const lng = Number(tokens[index + 1]);
+
         if (isValidCoord(lat, lng)) {
           points.push({ lat, lng });
         } else {
           invalidCount++;
         }
       }
-    } else if (tokens.length >= 2) {
+    } else if (
+      tokens.length >= 2 &&
+      numeric.test(tokens[0]) &&
+      numeric.test(tokens[1])
+    ) {
       const lat = Number(tokens[0]);
       const lng = Number(tokens[1]);
-      if (/^[+-]?\d+(?:\.\d+)?$/.test(tokens[0]) && /^[+-]?\d+(?:\.\d+)?$/.test(tokens[1]) && isValidCoord(lat, lng)) {
+
+      if (isValidCoord(lat, lng)) {
         points.push({ lat, lng });
       } else {
         invalidCount++;
@@ -80,411 +213,571 @@ export function parseBtsLocationString(raw: string | null | undefined): { points
   return { points, invalidCount };
 }
 
-export function isValidCoord(lat: number, lng: number): boolean {
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
-  if (lat === 0 && lng === 0) return false;
-  if (lat < -90 || lat > 90) return false;
-  if (lng < -180 || lng > 180) return false;
-  return true;
-}
+// -----------------------------------------------------------------------------
+// Operator mappings
+// -----------------------------------------------------------------------------
 
-function stripLeadingZeros(val: unknown): string {
-  const s = String(val ?? '').trim();
-  if (!s) return '';
-  return s.replace(/^0+(?=\d)/, '');
-}
-
-const FALLBACK_MCC_COUNTRIES: Record<string, string> = {
-  '602': 'Egypt',
-  '425': 'Israel / Palestine',
-  '424': 'United Arab Emirates',
-  '420': 'Saudi Arabia',
-  '416': 'Jordan',
-  '208': 'France',
-  '234': 'United Kingdom',
-  '310': 'United States',
-};
-
-const MILITARY_NETWORK_MAP: Array<{ mcc: string; mnc: string; operator: string; country: string; color: string }> = [
-  { mcc: '602', mnc: '10', operator: 'المحمول العسكري المصري', country: 'Egypt', color: '#3498DB' },
-  { mcc: '602', mnc: '11', operator: 'المحمول العسكري المصري', country: 'Egypt', color: '#3498DB' },
-  { mcc: '425', mnc: '25', operator: 'المحمول العسكري الإسرائيلي', country: 'Israel', color: '#27AE60' },
+const MILITARY = [
+  {
+    mcc: '602',
+    mnc: '10',
+    operator: 'الناقل العسكري المصري',
+    country: 'Egypt',
+    color: '#3498DB',
+  },
+  {
+    mcc: '602',
+    mnc: '11',
+    operator: 'الناقل العسكري المصري',
+    country: 'Egypt',
+    color: '#3498DB',
+  },
+  {
+    mcc: '425',
+    mnc: '25',
+    operator: 'الناقل العسكري الإسرائيلي',
+    country: 'Israel',
+    color: '#27AE60',
+  },
 ];
 
-const CIVILIAN_NETWORK_MAP: Array<{ mcc: string; mnc: string; country: string; operator: string; color: string }> = [
-  // Israel (#2980B9)
+const CIVILIAN = [
   { mcc: '425', mnc: '1', country: 'Israel', operator: 'Partner', color: '#2980B9' },
   { mcc: '425', mnc: '2', country: 'Israel', operator: 'Cellcom', color: '#2980B9' },
   { mcc: '425', mnc: '3', country: 'Israel', operator: 'Pelephone', color: '#2980B9' },
   { mcc: '425', mnc: '7', country: 'Israel', operator: 'Hot Mobile', color: '#2980B9' },
   { mcc: '425', mnc: '9', country: 'Israel', operator: 'We4G', color: '#2980B9' },
-  { mcc: '425', mnc: '25', country: 'Israel', operator: 'IMOD', color: '#2980B9' },
   { mcc: '425', mnc: '28', country: 'Israel', operator: 'PHI Networks', color: '#2980B9' },
   { mcc: '425', mnc: '29', country: 'Israel', operator: 'CG Networks', color: '#2980B9' },
-  // Palestine (#27AE60)
   { mcc: '425', mnc: '5', country: 'Palestine', operator: 'Jawwal', color: '#27AE60' },
   { mcc: '425', mnc: '6', country: 'Palestine', operator: 'Wataniya', color: '#27AE60' },
-  // UAE (#E67E22)
-  { mcc: '424', mnc: '2', country: 'United Arab Emirates', operator: 'Etisalat UAE (e&)', color: '#E67E22' },
+  {
+    mcc: '424',
+    mnc: '2',
+    country: 'United Arab Emirates',
+    operator: 'Etisalat UAE (e&)',
+    color: '#E67E22',
+  },
 ];
 
-const CIVILIAN_EXCLUDED_PAIRS = new Set([
-  '602:1', '602:2', '602:3', '602:4', '602:10', '602:11', '425:24',
-]);
+const EGYPT = [
+  { mcc: '602', mnc: '1', country: 'Egypt', operator: 'Orange Egypt', color: '#8E44AD' },
+  { mcc: '602', mnc: '2', country: 'Egypt', operator: 'Vodafone Egypt', color: '#8E44AD' },
+  { mcc: '602', mnc: '3', country: 'Egypt', operator: 'Etisalat Egypt (e&)', color: '#8E44AD' },
+  { mcc: '602', mnc: '4', country: 'Egypt', operator: 'WE (Telecom Egypt)', color: '#8E44AD' },
+];
 
-function resolveMissionWhere(filters: Partial<DashboardFilters>, targetDb: DatabaseSync): { clause: string | null; params: any[] } {
-  if (filters.missionIds && filters.missionIds.length > 0) {
-    const ph = filters.missionIds.map(() => '?').join(', ');
-    return { clause: `mission_id IN (${ph})`, params: [...filters.missionIds] };
+// -----------------------------------------------------------------------------
+// Mission filtering
+// -----------------------------------------------------------------------------
+
+/**
+ * Resolve mission filtering using the authoritative mission IDs.
+ *
+ * A textual label may match multiple missions because mission labels are not
+ * unique. Legacy records that only contain the mission label are also included.
+ */
+async function resolveMissionWhere(
+  filters: Partial<DashboardFilters>,
+  targetDb: Db,
+): Promise<{ sql: string | null; params: Params }> {
+  if (filters.missionIds?.length) {
+    const params: Params = [];
+
+    return {
+      sql: inClause('mission_id', filters.missionIds, params),
+      params,
+    };
   }
+
   if (filters.mission && filters.mission !== 'ALL') {
-    const num = Number(filters.mission);
-    if (!Number.isNaN(num) && Number.isInteger(num) && num > 0) {
-      return { clause: `mission_id = ?`, params: [num] };
+    const missionValue = String(filters.mission);
+    const numericMission = Number(missionValue);
+
+    if (Number.isInteger(numericMission) && numericMission > 0) {
+      return {
+        sql: 'mission_id = $1',
+        params: [numericMission],
+      };
     }
-    const matchingMissions = targetDb.prepare(`SELECT id FROM missions WHERE mission = ?`).all(filters.mission) as Array<{ id: number }>;
-    if (matchingMissions.length > 0) {
-      const ids = matchingMissions.map(m => m.id);
-      const ph = ids.map(() => '?').join(', ');
-      return { clause: `mission_id IN (${ph})`, params: ids };
-    }
-    return { clause: `mission = ?`, params: [filters.mission] };
+
+    const matches = await rows<{ id: number }>(
+      targetDb,
+      'SELECT id FROM missions WHERE mission = $1 ORDER BY id',
+      [missionValue],
+    );
+
+    const params: Params = [];
+    const idCondition = matches.length
+      ? inClause('mission_id', matches.map((item) => item.id), params)
+      : 'FALSE';
+
+    params.push(missionValue);
+
+    return {
+      sql: `(${idCondition} OR mission = $${params.length})`,
+      params,
+    };
   }
-  return { clause: null, params: [] };
+
+  return { sql: null, params: [] };
 }
 
-/**
- * Builds SQL WHERE clause strictly for Registration fields + Mission filter.
- */
-export function buildRegistrationWhere(
-  filters: Partial<DashboardFilters> = {},
-  targetDb: DatabaseSync = db
-): { whereSql: string; params: any[] } {
-  const clauses: string[] = [];
-  const params: any[] = [];
-
-  const missionWhere = resolveMissionWhere(filters, targetDb);
-  if (missionWhere.clause) {
-    clauses.push(missionWhere.clause);
-    params.push(...missionWhere.params);
-  }
-
-  if (filters.country && filters.country.length > 0) {
-    const ph = filters.country.map(() => '?').join(', ');
-    clauses.push(`country IN (${ph})`);
-    params.push(...filters.country);
-  }
-  if (filters.countryCode && filters.countryCode.length > 0) {
-    const ph = filters.countryCode.map(() => '?').join(', ');
-    clauses.push(`UPPER(country_code) IN (${ph})`);
-    params.push(...filters.countryCode.map(c => c.toUpperCase()));
-  }
-  if (filters.imsi) {
-    clauses.push(`imsi LIKE ?`);
-    params.push(`%${filters.imsi}%`);
-  }
-  if (filters.imei) {
-    clauses.push(`imei LIKE ?`);
-    params.push(`%${filters.imei}%`);
-  }
-  if (filters.tmsi) {
-    clauses.push(`tmsi LIKE ?`);
-    params.push(`%${filters.tmsi}%`);
-  }
-  if (filters.btsName) {
-    clauses.push(`bts_name LIKE ?`);
-    params.push(`%${filters.btsName}%`);
-  }
-  if (filters.bts) {
-    clauses.push(`bts LIKE ?`);
-    params.push(`%${filters.bts}%`);
-  }
-  if (filters.ueModel && filters.ueModel.length > 0) {
-    const ph = filters.ueModel.map(() => '?').join(', ');
-    clauses.push(`ue_model IN (${ph})`);
-    params.push(...filters.ueModel);
-  }
-  if (filters.lastSeenFrom) {
-    clauses.push(`last_seen >= ?`);
-    params.push(filters.lastSeenFrom);
-  }
-  if (filters.lastSeenTo) {
-    const toVal = filters.lastSeenTo.length === 10 ? `${filters.lastSeenTo}T23:59:59.999Z` : filters.lastSeenTo;
-    clauses.push(`last_seen <= ?`);
-    params.push(toVal);
-  }
-  if (filters.btsAltitudeMin !== undefined) {
-    clauses.push(`bts_altitude >= ?`);
-    params.push(filters.btsAltitudeMin);
-  }
-  if (filters.btsAltitudeMax !== undefined) {
-    clauses.push(`bts_altitude <= ?`);
-    params.push(filters.btsAltitudeMax);
-  }
-  if (filters.distanceMinFrom !== undefined) {
-    clauses.push(`distance_min >= ?`);
-    params.push(filters.distanceMinFrom);
-  }
-  if (filters.distanceMinTo !== undefined) {
-    clauses.push(`distance_min <= ?`);
-    params.push(filters.distanceMinTo);
-  }
-  if (filters.distanceMaxFrom !== undefined) {
-    clauses.push(`distance_max >= ?`);
-    params.push(filters.distanceMaxFrom);
-  }
-  if (filters.distanceMaxTo !== undefined) {
-    clauses.push(`distance_max <= ?`);
-    params.push(filters.distanceMaxTo);
-  }
-  if (filters.hasBtsLocation === 'available') {
-    clauses.push(`(bts_location IS NOT NULL AND TRIM(bts_location) != '')`);
-  } else if (filters.hasBtsLocation === 'unavailable') {
-    clauses.push(`(bts_location IS NULL OR TRIM(bts_location) = '')`);
-  }
-  if (filters.btsLocationOutdated === 'true') {
-    clauses.push(`bts_location_outdated = 1`);
-  } else if (filters.btsLocationOutdated === 'false') {
-    clauses.push(`(bts_location_outdated = 0 OR bts_location_outdated IS NULL)`);
-  }
-  if (filters.hasDeviceLocation === 'available') {
-    clauses.push(`(device_location IS NOT NULL AND TRIM(device_location) != '')`);
-  } else if (filters.hasDeviceLocation === 'unavailable') {
-    clauses.push(`(device_location IS NULL OR TRIM(device_location) = '')`);
-  }
-  if (filters.action && filters.action.length > 0) {
-    const ph = filters.action.map(() => '?').join(', ');
-    clauses.push(`action IN (${ph})`);
-    params.push(...filters.action);
-  }
-  if (filters.update && filters.update.length > 0) {
-    const ph = filters.update.map(() => '?').join(', ');
-    clauses.push(`"update" IN (${ph})`);
-    params.push(...filters.update);
-  }
-
-  return {
-    whereSql: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '',
-    params,
-  };
+function appendFilter(
+  clauses: string[],
+  params: Params,
+  sql: string,
+  value?: unknown,
+): void {
+  params.push(value);
+  clauses.push(sql.replace('?', `$${params.length}`));
 }
 
-/**
- * Builds SQL WHERE clause strictly for NetworkCell fields + Mission filter + PLMN lookup.
- * NEVER applies date/createdAt filters to NetworkCell.
- */
-export function buildNetworkCellWhere(
-  filters: Partial<DashboardFilters> = {},
-  targetDb: DatabaseSync = db
-): { whereSql: string; params: any[]; clauses: string[] } {
+async function buildWhere(
+  filters: Partial<DashboardFilters>,
+  targetDb: Db,
+  kind: 'registrations' | 'network_cells',
+) {
   const clauses: string[] = [];
-  const params: any[] = [];
+  const params: Params = [];
 
-  const missionWhere = resolveMissionWhere(filters, targetDb);
-  if (missionWhere.clause) {
-    clauses.push(missionWhere.clause);
-    params.push(...missionWhere.params);
-  }
+  const mission = await resolveMissionWhere(filters, targetDb);
 
-  if (filters.rat && filters.rat.length > 0) {
-    const ph = filters.rat.map(() => '?').join(', ');
-    clauses.push(`rat IN (${ph})`);
-    params.push(...filters.rat);
-  }
-  if (filters.mcc && filters.mcc.length > 0) {
-    const ph = filters.mcc.map(() => '?').join(', ');
-    clauses.push(`TRIM(mcc) IN (${ph})`);
-    params.push(...filters.mcc.map(v => String(v).trim()));
-  }
-  if (filters.mnc && filters.mnc.length > 0) {
-    const ph = filters.mnc.map(() => '?').join(', ');
-    clauses.push(`TRIM(mnc) IN (${ph})`);
-    params.push(...filters.mnc.map(v => String(v).trim()));
-  }
-  if (filters.lac !== undefined && filters.lac !== '') {
-    clauses.push(`TRIM(lac) = ?`);
-    params.push(String(filters.lac).trim());
-  }
-  if (filters.cellId !== undefined && filters.cellId !== '') {
-    clauses.push(`TRIM(cell_id) = ?`);
-    params.push(String(filters.cellId).trim());
-  }
-  if (filters.channel !== undefined) {
-    clauses.push(`channel = ?`);
-    params.push(filters.channel);
-  }
-  if (filters.bsic !== undefined && filters.bsic !== '') {
-    clauses.push(`TRIM(bsic) = ?`);
-    params.push(String(filters.bsic).trim());
-  }
-  if (filters.psc !== undefined && filters.psc !== '') {
-    clauses.push(`TRIM(psc) = ?`);
-    params.push(String(filters.psc).trim());
-  }
-  if (filters.pci !== undefined && filters.pci !== '') {
-    clauses.push(`TRIM(pci) = ?`);
-    params.push(String(filters.pci).trim());
-  }
-  if (filters.rxLevMin !== undefined) {
-    clauses.push(`rx_lev >= ?`);
-    params.push(filters.rxLevMin);
-  }
-  if (filters.rxLevMax !== undefined) {
-    clauses.push(`rx_lev <= ?`);
-    params.push(filters.rxLevMax);
-  }
-  if (filters.rxLevDbmMin !== undefined) {
-    clauses.push(`rx_lev_dbm >= ?`);
-    params.push(filters.rxLevDbmMin);
-  }
-  if (filters.rxLevDbmMax !== undefined) {
-    clauses.push(`rx_lev_dbm <= ?`);
-    params.push(filters.rxLevDbmMax);
-  }
-  if (filters.downlinkMin !== undefined) {
-    clauses.push(`downlink >= ?`);
-    params.push(filters.downlinkMin);
-  }
-  if (filters.downlinkMax !== undefined) {
-    clauses.push(`downlink <= ?`);
-    params.push(filters.downlinkMax);
-  }
-  if (filters.dlBandwidthMin !== undefined) {
-    clauses.push(`dl_bandwidth >= ?`);
-    params.push(filters.dlBandwidthMin);
-  }
-  if (filters.dlBandwidthMax !== undefined) {
-    clauses.push(`dl_bandwidth <= ?`);
-    params.push(filters.dlBandwidthMax);
-  }
-  if (filters.directionMin !== undefined) {
-    clauses.push(`direction >= ?`);
-    params.push(filters.directionMin);
-  }
-  if (filters.directionMax !== undefined) {
-    clauses.push(`direction <= ?`);
-    params.push(filters.directionMax);
-  }
-  if (filters.isNeighbour === 'true') {
-    clauses.push(`is_neighbour = 1`);
-  } else if (filters.isNeighbour === 'false') {
-    clauses.push(`(is_neighbour = 0 OR is_neighbour IS NULL)`);
-  }
-  if (filters.isPcs1900 === 'true') {
-    clauses.push(`is_pcs1900 = 1`);
-  } else if (filters.isPcs1900 === 'false') {
-    clauses.push(`(is_pcs1900 = 0 OR is_pcs1900 IS NULL)`);
+  if (mission.sql) {
+    add(clauses, params, mission.sql, mission.params);
   }
 
-  if (filters.hasCoordinates === 'available' || filters.hasLatitude === 'available' || filters.hasLongitude === 'available') {
-    if (filters.hasCoordinates === 'available') {
-      clauses.push(`(latitude IS NOT NULL AND longitude IS NOT NULL AND NOT (latitude = 0 AND longitude = 0))`);
-    } else {
-      if (filters.hasLatitude === 'available') clauses.push(`latitude IS NOT NULL`);
-      if (filters.hasLongitude === 'available') clauses.push(`longitude IS NOT NULL`);
+  const f: any = filters;
+
+  if (kind === 'registrations') {
+    if (f.country?.length) {
+      clauses.push(inClause('country', f.country, params));
     }
-  } else if (filters.hasCoordinates === 'unavailable' || filters.hasLatitude === 'unavailable' || filters.hasLongitude === 'unavailable') {
-    if (filters.hasCoordinates === 'unavailable') {
-      clauses.push(`(latitude IS NULL OR longitude IS NULL)`);
-    } else {
-      if (filters.hasLatitude === 'unavailable') clauses.push(`latitude IS NULL`);
-      if (filters.hasLongitude === 'unavailable') clauses.push(`longitude IS NULL`);
+
+    if (f.countryCode?.length) {
+      clauses.push(
+        inClause(
+          'UPPER(country_code)',
+          f.countryCode,
+          params,
+          (value) => String(value).toUpperCase(),
+        ),
+      );
     }
-  }
 
-  if (filters.plmnQuery) {
-    const term = `%${filters.plmnQuery}%`;
-    const matchedPlmns = targetDb.prepare(`
-      SELECT mcc, mnc FROM plmn_storage
-      WHERE name LIKE ? OR country LIKE ? OR code LIKE ? OR CAST(mcc AS TEXT) LIKE ? OR CAST(mnc AS TEXT) LIKE ?
-    `).all(term, term, term, term, term) as Array<{ mcc: string | number; mnc: string | number }>;
-
-    if (matchedPlmns.length > 0) {
-      const pairClauses = matchedPlmns
-        .map(() => `((TRIM(mcc) = ? AND TRIM(mnc) = ?) OR (LTRIM(TRIM(mcc), '0') = ? AND LTRIM(TRIM(mnc), '0') = ?))`)
-        .join(' OR ');
-      clauses.push(`(${pairClauses})`);
-      for (const p of matchedPlmns) {
-        const mccStr = String(p.mcc).trim();
-        const mncStr = String(p.mnc).trim();
-        params.push(mccStr, mncStr, stripLeadingZeros(mccStr), stripLeadingZeros(mncStr));
+    for (const [key, column] of [
+      ['imsi', 'imsi'],
+      ['imei', 'imei'],
+      ['tmsi', 'tmsi'],
+      ['btsName', 'bts_name'],
+      ['bts', 'bts'],
+    ] as const) {
+      if (f[key]) {
+        appendFilter(
+          clauses,
+          params,
+          `${column} ILIKE ?`,
+          `%${f[key]}%`,
+        );
       }
+    }
+
+    if (f.ueModel?.length) {
+      clauses.push(inClause('ue_model', f.ueModel, params));
+    }
+
+    if (f.lastSeenFrom) {
+      appendFilter(
+        clauses,
+        params,
+        'last_seen >= ?::text::timestamptz',
+        f.lastSeenFrom,
+      );
+    }
+
+    if (f.lastSeenTo) {
+      appendFilter(
+        clauses,
+        params,
+        'last_seen <= ?::text::timestamptz',
+        f.lastSeenTo.length === 10
+          ? `${f.lastSeenTo}T23:59:59.999Z`
+          : f.lastSeenTo,
+      );
+    }
+
+    for (const [key, column, operator] of [
+      ['btsAltitudeMin', 'bts_altitude', '>='],
+      ['btsAltitudeMax', 'bts_altitude', '<='],
+      ['distanceMinFrom', 'distance_min', '>='],
+      ['distanceMinTo', 'distance_min', '<='],
+      ['distanceMaxFrom', 'distance_max', '>='],
+      ['distanceMaxTo', 'distance_max', '<='],
+    ] as const) {
+      if (f[key] !== undefined) {
+        appendFilter(
+          clauses,
+          params,
+          `${column} ${operator} ?`,
+          f[key],
+        );
+      }
+    }
+
+    if (f.hasBtsLocation === 'available') {
+      clauses.push(`NULLIF(BTRIM(bts_location), '') IS NOT NULL`);
+    }
+
+    if (f.hasBtsLocation === 'unavailable') {
+      clauses.push(`NULLIF(BTRIM(bts_location), '') IS NULL`);
+    }
+
+    if (f.btsLocationOutdated === 'true') {
+      clauses.push('bts_location_outdated IS TRUE');
+    }
+
+    if (f.btsLocationOutdated === 'false') {
+      clauses.push(
+        '(bts_location_outdated IS FALSE OR bts_location_outdated IS NULL)',
+      );
+    }
+
+    if (f.hasDeviceLocation === 'available') {
+      clauses.push(`NULLIF(BTRIM(device_location), '') IS NOT NULL`);
+    }
+
+    if (f.hasDeviceLocation === 'unavailable') {
+      clauses.push(`NULLIF(BTRIM(device_location), '') IS NULL`);
+    }
+
+    if (f.action?.length) {
+      clauses.push(inClause('action', f.action, params));
+    }
+
+    if (f.update?.length) {
+      clauses.push(inClause('"update"', f.update, params));
+    }
+  } else {
+    if (f.rat?.length) {
+      clauses.push(inClause('rat', f.rat.map(String), params));
+    }
+
+    if (f.mcc?.length) {
+      clauses.push(
+        inClause('BTRIM(mcc)', f.mcc.map((value: any) => String(value).trim()), params),
+      );
+    }
+
+    if (f.mnc?.length) {
+      clauses.push(
+        inClause('BTRIM(mnc)', f.mnc.map((value: any) => String(value).trim()), params),
+      );
+    }
+
+    for (const [key, column] of [
+      ['lac', 'lac'],
+      ['cellId', 'cell_id'],
+      ['bsic', 'bsic'],
+      ['psc', 'psc'],
+      ['pci', 'pci'],
+    ] as const) {
+      if (f[key] !== undefined && f[key] !== '') {
+        appendFilter(
+          clauses,
+          params,
+          `BTRIM(${column}) = ?`,
+          String(f[key]).trim(),
+        );
+      }
+    }
+
+    for (const [key, column, operator] of [
+      ['channel', 'channel', '='],
+      ['rxLevMin', 'rx_lev', '>='],
+      ['rxLevMax', 'rx_lev', '<='],
+      ['rxLevDbmMin', 'rx_lev_dbm', '>='],
+      ['rxLevDbmMax', 'rx_lev_dbm', '<='],
+      ['downlinkMin', 'downlink', '>='],
+      ['downlinkMax', 'downlink', '<='],
+      ['dlBandwidthMin', 'dl_bandwidth', '>='],
+      ['dlBandwidthMax', 'dl_bandwidth', '<='],
+      ['directionMin', 'direction', '>='],
+      ['directionMax', 'direction', '<='],
+    ] as const) {
+      if (f[key] !== undefined) {
+        appendFilter(
+          clauses,
+          params,
+          `${column} ${operator} ?`,
+          f[key],
+        );
+      }
+    }
+
+    if (f.isNeighbour === 'true') {
+      clauses.push('is_neighbour IS TRUE');
+    }
+
+    if (f.isNeighbour === 'false') {
+      clauses.push('(is_neighbour IS FALSE OR is_neighbour IS NULL)');
+    }
+
+    if (f.isPcs1900 === 'true') {
+      clauses.push('is_pcs1900 IS TRUE');
+    }
+
+    if (f.isPcs1900 === 'false') {
+      clauses.push('(is_pcs1900 IS FALSE OR is_pcs1900 IS NULL)');
+    }
+
+    if (f.hasCoordinates === 'available') {
+      clauses.push(`
+        latitude IS NOT NULL
+        AND longitude IS NOT NULL
+        AND latitude BETWEEN -90 AND 90
+        AND longitude BETWEEN -180 AND 180
+        AND NOT (latitude = 0 AND longitude = 0)
+      `);
+    } else if (f.hasCoordinates === 'unavailable') {
+      clauses.push('(latitude IS NULL OR longitude IS NULL)');
     } else {
-      clauses.push(`1 = 0`);
+      if (f.hasLatitude === 'available') {
+        clauses.push('latitude IS NOT NULL');
+      }
+
+      if (f.hasLatitude === 'unavailable') {
+        clauses.push('latitude IS NULL');
+      }
+
+      if (f.hasLongitude === 'available') {
+        clauses.push('longitude IS NOT NULL');
+      }
+
+      if (f.hasLongitude === 'unavailable') {
+        clauses.push('longitude IS NULL');
+      }
+    }
+
+    if (f.plmnQuery) {
+      const term = `%${f.plmnQuery}%`;
+
+      const plmns = await rows<any>(
+        targetDb,
+        `
+          SELECT mcc, mnc
+          FROM plmn_storage
+          WHERE name ILIKE $1
+             OR country ILIKE $1
+             OR code ILIKE $1
+             OR mcc ILIKE $1
+             OR mnc ILIKE $1
+        `,
+        [term],
+      );
+
+      if (!plmns.length) {
+        clauses.push('FALSE');
+      } else {
+        const pairs = plmns.map((item: any) => {
+          params.push(
+            String(item.mcc).trim(),
+            String(item.mnc).trim(),
+            stripLeadingZeros(item.mcc),
+            stripLeadingZeros(item.mnc),
+          );
+
+          const index = params.length;
+
+          return `
+            (
+              BTRIM(mcc) = $${index - 3}
+              AND BTRIM(mnc) = $${index - 2}
+            )
+            OR
+            (
+              REGEXP_REPLACE(BTRIM(mcc), '^0+', '') = $${index - 1}
+              AND REGEXP_REPLACE(BTRIM(mnc), '^0+', '') = $${index}
+            )
+          `;
+        });
+
+        clauses.push(`(${pairs.map((pair) => `(${pair})`).join(' OR ')})`);
+      }
     }
   }
 
   return {
-    whereSql: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '',
+    whereSql: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '',
     params,
     clauses,
   };
 }
 
-/**
- * 2.1 Registrations by Country (distinct IMSI, excluding null/empty country, zero IMSI, and Egypt)
- */
-export function getRegistrationsByCountry(filters: Partial<DashboardFilters> = {}, targetDb: DatabaseSync = db) {
-  const { whereSql, params } = buildRegistrationWhere(filters, targetDb);
-  const baseClauses = whereSql ? [whereSql.replace(/^WHERE\s+/i, '')] : [];
-  baseClauses.push(`country IS NOT NULL AND TRIM(country) != ''`);
-  baseClauses.push(`imsi IS NOT NULL AND TRIM(imsi) != '' AND TRIM(imsi) != '0'`);
-  baseClauses.push(`UPPER(TRIM(country)) NOT IN ('EG', 'EGY', 'EGYPT')`);
-  baseClauses.push(`(country_code IS NULL OR UPPER(TRIM(country_code)) NOT IN ('EG', 'EGY'))`);
+// -----------------------------------------------------------------------------
+// Filter builders
+// -----------------------------------------------------------------------------
 
-  const finalWhere = `WHERE ${baseClauses.join(' AND ')}`;
-  const rows = targetDb.prepare(`
-    SELECT TRIM(country) as country,
-           COUNT(DISTINCT imsi) as distinctImsiCount,
-           COUNT(*) as totalRecords
-    FROM registrations
-    ${finalWhere}
-    GROUP BY TRIM(country)
-    ORDER BY distinctImsiCount DESC, totalRecords DESC, country ASC
-  `).all(...params) as Array<{ country: string; distinctImsiCount: number; totalRecords: number }>;
+export async function buildRegistrationWhere(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  const result = await buildWhere(filters, targetDb, 'registrations');
 
-  const totalDistinct = rows.reduce((sum, r) => sum + Number(r.distinctImsiCount), 0);
+  return {
+    whereSql: result.whereSql,
+    params: result.params,
+  };
+}
+
+export async function buildNetworkCellWhere(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  return buildWhere(filters, targetDb, 'network_cells');
+}
+
+// -----------------------------------------------------------------------------
+// Registrations by country
+// -----------------------------------------------------------------------------
+
+export async function getRegistrationsByCountry(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  const where = await buildRegistrationWhere(filters, targetDb);
+
+  const conditions = [
+    where.whereSql.replace(/^WHERE\s+/i, ''),
+    `country IS NOT NULL AND BTRIM(country) <> ''`,
+    `imsi IS NOT NULL AND BTRIM(imsi) NOT IN ('', '0')`,
+    `UPPER(BTRIM(country)) NOT IN ('EG', 'EGY', 'EGYPT')`,
+    `(country_code IS NULL OR UPPER(BTRIM(country_code)) NOT IN ('EG', 'EGY'))`,
+  ].filter(Boolean);
+
+  const data = await rows<any>(
+    targetDb,
+    `
+      SELECT
+        BTRIM(country) AS country,
+        COUNT(DISTINCT imsi)::bigint AS "distinctImsiCount",
+        COUNT(*)::bigint AS "totalRecords"
+      FROM registrations
+      WHERE ${conditions.join(' AND ')}
+      GROUP BY BTRIM(country)
+      ORDER BY
+        COUNT(DISTINCT imsi) DESC,
+        COUNT(*) DESC,
+        country ASC
+    `,
+    where.params,
+  );
+
+  const total = data.reduce(
+    (sum, item) => sum + safeNumber(item.distinctImsiCount),
+    0,
+  );
+
   return {
     titleAr: 'أعداد شرائح الاتصال المرصودة لكل دولة',
     titleEn: 'Observed SIM Registrations by Country (Distinct IMSI, Excl. Egypt)',
-    totalDistinctImsis: totalDistinct,
-    items: rows.map((row, idx) => ({
-      rank: idx + 1,
-      country: row.country,
-      distinctImsiCount: Number(row.distinctImsiCount),
-      totalRecords: Number(row.totalRecords),
-      percentageShare: totalDistinct > 0 ? Number(((Number(row.distinctImsiCount) / totalDistinct) * 100).toFixed(2)) : 0,
-      color: idx < 3 ? '#00B894' : '#3977C3',
+    totalDistinctImsis: total,
+    items: data.map((item, index) => ({
+      rank: index + 1,
+      country: item.country,
+      distinctImsiCount: safeNumber(item.distinctImsiCount),
+      totalRecords: safeNumber(item.totalRecords),
+      percentageShare: total
+        ? Number((safeNumber(item.distinctImsiCount) / total * 100).toFixed(2))
+        : 0,
+      color: index < 3 ? '#00B894' : '#3977C3',
     })),
   };
 }
 
-/**
- * 2.2 BTS Locations Map (Registrations.bts_location + NetworkCells.latitude/longitude)
- * Strictly excludes IMSI, IMEI, and TMSI from output.
- */
-export function getBtsMapData(filters: Partial<DashboardFilters> = {}, targetDb: DatabaseSync = db) {
-  const regWhere = buildRegistrationWhere(filters, targetDb);
-  const regRows = targetDb.prepare(`
-    SELECT id, mission_id, mission, bts, bts_name, country, country_code, bts_location, bts_altitude, bts_location_outdated
-    FROM registrations
-    ${regWhere.whereSql ? `${regWhere.whereSql} AND` : 'WHERE'} bts_location IS NOT NULL AND TRIM(bts_location) != ''
-    LIMIT 10000
-  `).all(...regWhere.params) as any[];
+// -----------------------------------------------------------------------------
+// BTS and network-cell map
+// -----------------------------------------------------------------------------
 
-  const ncWhere = buildNetworkCellWhere(filters, targetDb);
-  const ncRows = targetDb.prepare(`
-    SELECT id, mission_id, mission, mcc, mnc, lac, cell_id, rat, rx_lev_dbm, latitude, longitude, direction
-    FROM network_cells
-    ${ncWhere.whereSql ? `${ncWhere.whereSql} AND` : 'WHERE'} latitude IS NOT NULL AND longitude IS NOT NULL
-    LIMIT 10000
-  `).all(...ncWhere.params) as any[];
+export async function getBtsMapData(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  const registrationWhere = await buildRegistrationWhere(filters, targetDb);
 
-  interface AggLocation {
+  const counts = await first<any>(
+    targetDb,
+    `
+      SELECT
+        COUNT(*)::bigint AS total,
+        COUNT(*) FILTER (
+          WHERE NULLIF(BTRIM(bts_location), '') IS NOT NULL
+        )::bigint AS with_location
+      FROM registrations
+      ${registrationWhere.whereSql}
+    `,
+    registrationWhere.params,
+  );
+
+  const registrationSql = registrationWhere.whereSql
+    ? `${registrationWhere.whereSql} AND NULLIF(BTRIM(bts_location), '') IS NOT NULL`
+    : `WHERE NULLIF(BTRIM(bts_location), '') IS NOT NULL`;
+
+  const registrations = await rows<any>(
+    targetDb,
+    `
+      SELECT
+        id,
+        mission_id,
+        mission,
+        bts,
+        bts_name,
+        country,
+        country_code,
+        mcc,
+        mnc,
+        bts_location
+      FROM registrations
+      ${registrationSql}
+      ORDER BY id
+    `,
+    registrationWhere.params,
+  );
+
+  const networkWhere = await buildNetworkCellWhere(filters, targetDb);
+
+  const networkSql = networkWhere.whereSql
+    ? `${networkWhere.whereSql} AND latitude IS NOT NULL AND longitude IS NOT NULL`
+    : 'WHERE latitude IS NOT NULL AND longitude IS NOT NULL';
+
+  const cells = await rows<any>(
+    targetDb,
+    `
+      SELECT
+        id,
+        mission_id,
+        mission,
+        mcc,
+        mnc,
+        lac,
+        cell_id,
+        rat,
+        rx_lev_dbm,
+        latitude,
+        longitude,
+        direction
+      FROM network_cells
+      ${networkSql}
+      ORDER BY id
+      LIMIT 50000
+    `,
+    networkWhere.params,
+  );
+
+  type Bucket = {
     key: string;
     lat: number;
     lng: number;
-    sources: Set<'registration' | 'network_cell'>;
+    sources: Set<string>;
     registrationCount: number;
     networkCellCount: number;
     btsNames: Set<string>;
@@ -495,20 +788,22 @@ export function getBtsMapData(filters: Partial<DashboardFilters> = {}, targetDb:
     mncs: Set<string>;
     cellIds: Set<string>;
     missions: Set<string>;
-  }
+    countryCodes: Set<string>;
+    registrationIds: Set<number>;
+  };
 
-  const mapByCoord = new Map<string, AggLocation>();
-  let totalParsedRegistrationCoords = 0;
-  let invalidSkippedCount = 0;
+  const map = new Map<string, Bucket>();
 
-  const getOrCreateBucket = (lat: number, lng: number): AggLocation => {
-    const key = `${lat.toFixed(5)},${lng.toFixed(5)}`;
-    let bucket = mapByCoord.get(key);
+  const getBucket = (lat: number, lng: number): Bucket => {
+    const key = `${lat.toFixed(6)},${lng.toFixed(6)}`;
+
+    let bucket = map.get(key);
+
     if (!bucket) {
       bucket = {
         key,
-        lat: Number(lat.toFixed(6)),
-        lng: Number(lng.toFixed(6)),
+        lat,
+        lng,
         sources: new Set(),
         registrationCount: 0,
         networkCellCount: 0,
@@ -520,534 +815,1576 @@ export function getBtsMapData(filters: Partial<DashboardFilters> = {}, targetDb:
         mncs: new Set(),
         cellIds: new Set(),
         missions: new Set(),
+        countryCodes: new Set(),
+        registrationIds: new Set(),
       };
-      mapByCoord.set(key, bucket);
+
+      map.set(key, bucket);
     }
+
     return bucket;
   };
 
-  for (const r of regRows) {
-    const { points, invalidCount } = parseBtsLocationString(r.bts_location);
-    invalidSkippedCount += invalidCount;
-    for (const pt of points) {
-      totalParsedRegistrationCoords++;
-      const b = getOrCreateBucket(pt.lat, pt.lng);
-      b.sources.add('registration');
-      b.registrationCount++;
-      if (r.bts_name) b.btsNames.add(String(r.bts_name));
-      if (r.bts) b.btsCodes.add(String(r.bts));
-      if (r.country) b.countries.add(String(r.country));
-      if (r.mission) b.missions.add(String(r.mission));
+  let parsed = 0;
+  let invalidRegistration = 0;
+  let invalidSkipped = 0;
+
+  for (const registration of registrations) {
+    const parsedLocation = parseBtsLocationString(registration.bts_location);
+
+    invalidRegistration += parsedLocation.invalidCount;
+    invalidSkipped += parsedLocation.invalidCount;
+
+    for (const point of parsedLocation.points) {
+      parsed++;
+
+      const bucket = getBucket(point.lat, point.lng);
+
+      bucket.sources.add('registration');
+      bucket.registrationCount++;
+      bucket.registrationIds.add(Number(registration.id));
+
+      if (registration.bts_name) bucket.btsNames.add(String(registration.bts_name));
+      if (registration.bts) bucket.btsCodes.add(String(registration.bts));
+      if (registration.country) bucket.countries.add(String(registration.country));
+      if (registration.country_code) bucket.countryCodes.add(String(registration.country_code));
+      if (registration.mcc) bucket.mccs.add(String(registration.mcc).trim());
+      if (registration.mnc) bucket.mncs.add(String(registration.mnc).trim());
+
+      if (registration.mission) {
+        bucket.missions.add(String(registration.mission));
+      }
     }
   }
 
-  for (const nc of ncRows) {
-    const lat = Number(nc.latitude);
-    const lng = Number(nc.longitude);
+  for (const cell of cells) {
+    const lat = Number(cell.latitude);
+    const lng = Number(cell.longitude);
+
     if (!isValidCoord(lat, lng)) {
-      invalidSkippedCount++;
+      invalidSkipped++;
       continue;
     }
-    const b = getOrCreateBucket(lat, lng);
-    b.sources.add('network_cell');
-    b.networkCellCount++;
-    if (nc.rat) b.rats.add(String(nc.rat));
-    if (nc.mcc !== null && nc.mcc !== undefined && String(nc.mcc).trim() !== '') b.mccs.add(String(nc.mcc).trim());
-    if (nc.mnc !== null && nc.mnc !== undefined && String(nc.mnc).trim() !== '') b.mncs.add(String(nc.mnc).trim());
-    if (nc.cell_id !== null && nc.cell_id !== undefined && String(nc.cell_id).trim() !== '') b.cellIds.add(String(nc.cell_id).trim());
-    if (nc.mission) b.missions.add(String(nc.mission));
+
+    const bucket = getBucket(lat, lng);
+
+    bucket.sources.add('network_cell');
+    bucket.networkCellCount++;
+
+    if (cell.rat) bucket.rats.add(String(cell.rat));
+    if (cell.mcc) bucket.mccs.add(String(cell.mcc).trim());
+    if (cell.mnc) bucket.mncs.add(String(cell.mnc).trim());
+    if (cell.cell_id) bucket.cellIds.add(String(cell.cell_id).trim());
+    if (cell.mission) bucket.missions.add(String(cell.mission));
   }
 
-  const locations = Array.from(mapByCoord.values()).map(b => {
-    const source: 'registration' | 'network_cell' | 'both' =
-      b.sources.has('registration') && b.sources.has('network_cell')
-        ? 'both'
-        : b.sources.has('registration')
-        ? 'registration'
-        : 'network_cell';
-
-    return {
-      key: b.key,
-      lat: b.lat,
-      lng: b.lng,
-      source,
-      registrationCount: b.registrationCount,
-      networkCellCount: b.networkCellCount,
-      totalCount: b.registrationCount + b.networkCellCount,
-      btsNames: Array.from(b.btsNames),
-      btsCodes: Array.from(b.btsCodes),
-      countries: Array.from(b.countries),
-      rats: Array.from(b.rats),
-      mccs: Array.from(b.mccs),
-      mncs: Array.from(b.mncs),
-      cellIds: Array.from(b.cellIds).slice(0, 20),
-      missions: Array.from(b.missions),
-    };
-  });
+  const locations = [...map.values()].map((bucket) => ({
+    key: bucket.key,
+    lat: bucket.lat,
+    lng: bucket.lng,
+    source: bucket.sources.size > 1
+      ? 'both'
+      : [...bucket.sources][0],
+    registrationCount: bucket.registrationCount,
+    networkCellCount: bucket.networkCellCount,
+    totalCount: bucket.registrationCount + bucket.networkCellCount,
+    btsNames: [...bucket.btsNames],
+    btsCodes: [...bucket.btsCodes],
+    countries: [...bucket.countries],
+    countryCodes: [...bucket.countryCodes],
+    rats: [...bucket.rats],
+    mccs: [...bucket.mccs],
+    mncs: [...bucket.mncs],
+    cellIds: [...bucket.cellIds].slice(0, 20),
+    missions: [...bucket.missions],
+    registrationIds: [...bucket.registrationIds].sort((a, b) => a - b),
+  }));
 
   return {
     locations,
     stats: {
-      totalParsedRegistrationCoords,
+      totalRegistrationRecords: safeNumber(counts?.total),
+      registrationRecordsWithLocation: safeNumber(counts?.with_location),
+      totalParsedRegistrationCoords: parsed,
+      invalidRegistrationCoords: invalidRegistration,
       uniqueLocations: locations.length,
-      registrationLocationsCount: locations.filter(l => l.source === 'registration' || l.source === 'both').length,
-      networkCellLocationsCount: locations.filter(l => l.source === 'network_cell' || l.source === 'both').length,
-      invalidSkippedCount,
+      registrationLocationsCount: locations.filter(
+        (item) => item.source === 'registration' || item.source === 'both',
+      ).length,
+      networkCellLocationsCount: locations.filter(
+        (item) => item.source === 'network_cell' || item.source === 'both',
+      ).length,
+      invalidSkippedCount: invalidSkipped,
     },
   };
 }
 
-/**
- * 2.3 Network Cells by MCC (distinct non-null cellId per non-null mcc, preserving leading zeros)
- */
-export function getNetworkCellsByMcc(filters: Partial<DashboardFilters> = {}, targetDb: DatabaseSync = db) {
-  const { whereSql, params } = buildNetworkCellWhere(filters, targetDb);
-  const baseClauses = whereSql ? [whereSql.replace(/^WHERE\s+/i, '')] : [];
-  baseClauses.push(`mcc IS NOT NULL AND TRIM(mcc) != ''`);
-  baseClauses.push(`cell_id IS NOT NULL AND TRIM(cell_id) != ''`);
+// -----------------------------------------------------------------------------
+// Network cells grouped by MCC
+// -----------------------------------------------------------------------------
 
-  const rows = targetDb.prepare(`
-    SELECT TRIM(mcc) as mcc,
-           COUNT(DISTINCT TRIM(cell_id)) as distinctCellCount,
-           COUNT(*) as totalRecords
-    FROM network_cells
-    WHERE ${baseClauses.join(' AND ')}
-    GROUP BY TRIM(mcc)
-    ORDER BY distinctCellCount DESC, totalRecords DESC, mcc ASC
-  `).all(...params) as Array<{ mcc: string; distinctCellCount: number; totalRecords: number }>;
+export async function getNetworkCellsByMcc(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  const where = await buildNetworkCellWhere(filters, targetDb);
 
-  // Resolve MCC -> country via PlmnStorage (supporting exact string & leading-zero-normalized lookup)
-  const plmnCountries = targetDb.prepare(`
-    SELECT TRIM(mcc) as mcc, GROUP_CONCAT(DISTINCT country) as countries
-    FROM plmn_storage
-    GROUP BY TRIM(mcc)
-  `).all() as Array<{ mcc: string; countries: string }>;
-  const countryLookup = new Map<string, string>();
-  const normalizedCountryLookup = new Map<string, string>();
-  for (const p of plmnCountries) {
-    if (p.countries) {
-      const list = p.countries.split(',').map(s => s.trim()).filter(Boolean);
-      const label = list.join(' / ');
-      countryLookup.set(String(p.mcc).trim(), label);
-      normalizedCountryLookup.set(stripLeadingZeros(p.mcc), label);
-    }
-  }
+  const conditions = [
+    where.whereSql.replace(/^WHERE\s+/i, ''),
+    `mcc IS NOT NULL AND BTRIM(mcc) <> ''`,
+    `cell_id IS NOT NULL AND BTRIM(cell_id) <> ''`,
+  ].filter(Boolean);
 
-  const totalDistinct = rows.reduce((sum, r) => sum + Number(r.distinctCellCount), 0);
-  const bluePalette = ['#1D4ED8', '#2563EB', '#3B82F6', '#0284C7', '#0EA5E9', '#38BDF8', '#60A5FA'];
+  const data = await rows<any>(
+    targetDb,
+    `
+      SELECT
+        BTRIM(mcc) AS mcc,
+        COUNT(DISTINCT BTRIM(cell_id))::bigint AS "distinctCellCount",
+        COUNT(*)::bigint AS "totalRecords"
+      FROM network_cells
+      WHERE ${conditions.join(' AND ')}
+      GROUP BY BTRIM(mcc)
+      ORDER BY
+        COUNT(DISTINCT BTRIM(cell_id)) DESC,
+        COUNT(*) DESC,
+        mcc
+    `,
+    where.params,
+  );
+
+  const total = data.reduce(
+    (sum, item) => sum + safeNumber(item.distinctCellCount),
+    0,
+  );
+
+  const palette = [
+    '#1D4ED8',
+    '#2563EB',
+    '#3B82F6',
+    '#0284C7',
+    '#0EA5E9',
+    '#38BDF8',
+    '#60A5FA',
+  ];
 
   return {
     titleAr: 'إجمالي الخلايا المرصودة لكل دولة',
     titleEn: 'Total Observed Network Cells by Country (MCC)',
-    totalDistinctCells: totalDistinct,
-    items: rows.map((r, idx) => {
-      const mccStr = String(r.mcc).trim();
-      const mccNorm = stripLeadingZeros(mccStr);
+    totalDistinctCells: total,
+    items: data.map((item, index) => {
+      const mcc = String(item.mcc).trim();
       const country =
-        countryLookup.get(mccStr) ||
-        normalizedCountryLookup.get(mccNorm) ||
-        FALLBACK_MCC_COUNTRIES[mccStr] ||
-        FALLBACK_MCC_COUNTRIES[mccNorm] ||
-        `MCC ${mccStr}`;
+        MCC_COUNTRIES[mcc] ||
+        MCC_COUNTRIES[stripLeadingZeros(mcc)] ||
+        `MCC ${mcc}`;
+
       return {
-        rank: idx + 1,
-        mcc: mccStr,
+        rank: index + 1,
+        mcc,
         country,
-        label: `${country} (${mccStr})`,
-        distinctCellCount: Number(r.distinctCellCount),
-        totalRecords: Number(r.totalRecords),
-        percentageShare: totalDistinct > 0 ? Number(((Number(r.distinctCellCount) / totalDistinct) * 100).toFixed(2)) : 0,
-        color: bluePalette[Math.min(idx, bluePalette.length - 1)],
+        label: `${country} (${mcc})`,
+        distinctCellCount: safeNumber(item.distinctCellCount),
+        totalRecords: safeNumber(item.totalRecords),
+        percentageShare: total
+          ? Number((safeNumber(item.distinctCellCount) / total * 100).toFixed(2))
+          : 0,
+        color: palette[Math.min(index, palette.length - 1)],
       };
     }),
   };
 }
 
-/**
- * 2.4 Military Mobile Networks: ONLY (602,10), (602,11), and (425,25)
- */
-export function getMilitaryNetworks(filters: Partial<DashboardFilters> = {}, targetDb: DatabaseSync = db) {
-  const { whereSql, params } = buildNetworkCellWhere(filters, targetDb);
-  const baseClauses = whereSql ? [whereSql.replace(/^WHERE\s+/i, '')] : [];
-  baseClauses.push(`((LTRIM(TRIM(mcc), '0') = '602' AND LTRIM(TRIM(mnc), '0') IN ('10', '11')) OR (LTRIM(TRIM(mcc), '0') = '425' AND LTRIM(TRIM(mnc), '0') = '25'))`);
+// -----------------------------------------------------------------------------
+// MCC/MNC pair analytics
+// -----------------------------------------------------------------------------
 
-  const rows = targetDb.prepare(`
-    SELECT TRIM(mcc) as mcc, TRIM(mnc) as mnc,
-           COUNT(DISTINCT CASE WHEN cell_id IS NOT NULL AND TRIM(cell_id) != '' THEN TRIM(cell_id) END) as distinctCellCount,
-           COUNT(*) as totalRecords
-    FROM network_cells
-    WHERE ${baseClauses.join(' AND ')}
-    GROUP BY TRIM(mcc), TRIM(mnc)
-    ORDER BY distinctCellCount DESC, totalRecords DESC, mcc ASC, mnc ASC
-  `).all(...params) as Array<{ mcc: string; mnc: string; distinctCellCount: number; totalRecords: number }>;
+async function getNetworkPairRows(
+  filters: Partial<DashboardFilters>,
+  targetDb: Db,
+) {
+  const where = await buildNetworkCellWhere(filters, targetDb);
 
-  const items = rows.map((r, idx) => {
-    const mccStr = String(r.mcc).trim();
-    const mncStr = String(r.mnc).trim();
-    const spec = MILITARY_NETWORK_MAP.find(
-      m => m.mcc === stripLeadingZeros(mccStr) && m.mnc === stripLeadingZeros(mncStr)
+  const conditions = [
+    where.whereSql.replace(/^WHERE\s+/i, ''),
+    `mcc IS NOT NULL AND BTRIM(mcc) <> ''`,
+    `mnc IS NOT NULL AND BTRIM(mnc) <> ''`,
+  ].filter(Boolean);
+
+  return rows<any>(
+    targetDb,
+    `
+      SELECT
+        BTRIM(mcc) AS mcc,
+        BTRIM(mnc) AS mnc,
+        COUNT(DISTINCT NULLIF(BTRIM(cell_id), ''))::bigint AS "distinctCellCount",
+        COUNT(*)::bigint AS "totalRecords"
+      FROM network_cells
+      WHERE ${conditions.join(' AND ')}
+      GROUP BY BTRIM(mcc), BTRIM(mnc)
+      ORDER BY
+        COUNT(DISTINCT NULLIF(BTRIM(cell_id), '')) DESC,
+        COUNT(*) DESC,
+        mcc,
+        mnc
+    `,
+    where.params,
+  );
+}
+
+export async function getMilitaryNetworks(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  const data = await getNetworkPairRows(filters, targetDb);
+
+  const selected = data.filter((item) => {
+    const mcc = stripLeadingZeros(item.mcc);
+    const mnc = stripLeadingZeros(item.mnc);
+
+    return (
+      (mcc === '602' && ['10', '11'].includes(mnc)) ||
+      (mcc === '425' && mnc === '25')
+    );
+  });
+
+  const items = selected.map((item, index) => {
+    const spec = MILITARY.find(
+      (entry) =>
+        entry.mcc === stripLeadingZeros(item.mcc) &&
+        entry.mnc === stripLeadingZeros(item.mnc),
     )!;
+
     return {
-      rank: idx + 1,
-      mcc: mccStr,
-      mnc: mncStr,
-      plmn: `${mccStr}-${mncStr}`,
+      rank: index + 1,
+      mcc: item.mcc,
+      mnc: item.mnc,
+      plmn: `${item.mcc}-${item.mnc}`,
       operator: spec.operator,
       country: spec.country,
-      label: `${spec.operator} (${mccStr}/${mncStr})`,
-      distinctCellCount: Number(r.distinctCellCount),
-      totalRecords: Number(r.totalRecords),
+      label: `${spec.operator} (${item.mcc}/${item.mnc})`,
+      distinctCellCount: safeNumber(item.distinctCellCount),
+      totalRecords: safeNumber(item.totalRecords),
       color: spec.color,
     };
   });
 
   return {
-    titleAr: 'شبكات الاتصال بالهواتف المحمولة العسكرية (الإسرائيلية والمصرية)',
-    titleEn: 'Military Mobile Networks (Israeli & Egyptian)',
-    totalDistinctCells: items.reduce((s, i) => s + i.distinctCellCount, 0),
-    totalRecords: items.reduce((s, i) => s + i.totalRecords, 0),
+    titleAr: 'شبكات الاتصالات بالهواتف المحمولة العسكرية',
+    titleEn: 'Military Mobile Networks',
+    totalDistinctCells: items.reduce((sum, item) => sum + item.distinctCellCount, 0),
+    totalRecords: items.reduce((sum, item) => sum + item.totalRecords, 0),
     items,
   };
 }
 
-/**
- * 2.5 Civilian Mobile Networks (Israel, Palestine, UAE), explicitly excluding 602/1..4,10,11 and 425/24
- */
-export function getCivilianNetworks(filters: Partial<DashboardFilters> = {}, targetDb: DatabaseSync = db) {
-  const { whereSql, params } = buildNetworkCellWhere(filters, targetDb);
-  const baseClauses = whereSql ? [whereSql.replace(/^WHERE\s+/i, '')] : [];
-  const validPairClauses = CIVILIAN_NETWORK_MAP.map(
-    m => `(LTRIM(TRIM(mcc), '0') = '${m.mcc}' AND LTRIM(TRIM(mnc), '0') = '${m.mnc}')`
-  ).join(' OR ');
-  baseClauses.push(`(${validPairClauses})`);
+export async function getCivilianNetworks(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  const data = await getNetworkPairRows(filters, targetDb);
 
-  const rows = targetDb.prepare(`
-    SELECT TRIM(mcc) as mcc, TRIM(mnc) as mnc,
-           COUNT(DISTINCT CASE WHEN cell_id IS NOT NULL AND TRIM(cell_id) != '' THEN TRIM(cell_id) END) as distinctCellCount,
-           COUNT(*) as totalRecords
-    FROM network_cells
-    WHERE ${baseClauses.join(' AND ')}
-    GROUP BY TRIM(mcc), TRIM(mnc)
-  `).all(...params) as Array<{ mcc: string; mnc: string; distinctCellCount: number; totalRecords: number }>;
+  const mapped = data.flatMap((item) => {
+    const spec = CIVILIAN.find(
+      (entry) =>
+        entry.mcc === stripLeadingZeros(item.mcc) &&
+        entry.mnc === stripLeadingZeros(item.mnc),
+    );
 
-  const mapped = rows
-    .filter(r => !CIVILIAN_EXCLUDED_PAIRS.has(`${stripLeadingZeros(r.mcc)}:${stripLeadingZeros(r.mnc)}`))
-    .map(r => {
-      const mccStr = String(r.mcc).trim();
-      const mncStr = String(r.mnc).trim();
-      const spec = CIVILIAN_NETWORK_MAP.find(
-        m => m.mcc === stripLeadingZeros(mccStr) && m.mnc === stripLeadingZeros(mncStr)
-      )!;
-      return {
-        mcc: mccStr,
-        mnc: mncStr,
-        plmn: `${mccStr}/${mncStr}`,
-        country: spec.country,
-        operator: spec.operator,
-        distinctCellCount: Number(r.distinctCellCount),
-        totalRecords: Number(r.totalRecords),
-        color: spec.color,
-      };
-    });
-
-  // Sort by country then distinctCellCount descending, compute per-country rank (1 = largest in country group)
-  const countryOrder: Record<string, number> = { Israel: 1, Palestine: 2, 'United Arab Emirates': 3 };
-  mapped.sort((a, b) => {
-    const ca = countryOrder[a.country] || 99;
-    const cb = countryOrder[b.country] || 99;
-    if (ca !== cb) return ca - cb;
-    if (b.distinctCellCount !== a.distinctCellCount) return b.distinctCellCount - a.distinctCellCount;
-    return b.totalRecords - a.totalRecords;
+    return spec
+      ? [{
+          mcc: item.mcc,
+          mnc: item.mnc,
+          plmn: `${item.mcc}/${item.mnc}`,
+          country: spec.country,
+          operator: spec.operator,
+          distinctCellCount: safeNumber(item.distinctCellCount),
+          totalRecords: safeNumber(item.totalRecords),
+          color: spec.color,
+        }]
+      : [];
   });
 
-  const rankCounters = new Map<string, number>();
-  const items = mapped.map(item => {
-    const nextRank = (rankCounters.get(item.country) || 0) + 1;
-    rankCounters.set(item.country, nextRank);
+  const order: Record<string, number> = {
+    Israel: 1,
+    Palestine: 2,
+    'United Arab Emirates': 3,
+  };
+
+  mapped.sort(
+    (a, b) =>
+      (order[a.country] || 99) - (order[b.country] || 99) ||
+      b.distinctCellCount - a.distinctCellCount ||
+      b.totalRecords - a.totalRecords,
+  );
+
+  const ranks = new Map<string, number>();
+
+  const items = mapped.map((item) => {
+    const rank = (ranks.get(item.country) || 0) + 1;
+    ranks.set(item.country, rank);
+
     return {
       ...item,
-      rank: nextRank,
+      rank,
       label: `${item.operator} (${item.plmn})`,
     };
   });
 
   return {
-    titleAr: 'شبكات اتصالات الهواتف المحمولة المدنية (الإسرائيلية والفلسطينية والإماراتية)',
-    titleEn: 'Civilian Mobile Networks (Israeli, Palestinian & UAE)',
-    totalDistinctCells: items.reduce((s, i) => s + i.distinctCellCount, 0),
-    totalRecords: items.reduce((s, i) => s + i.totalRecords, 0),
+    titleAr: 'شبكات اتصالات الهواتف المحمولة المدنية',
+    titleEn: 'Civilian Mobile Networks',
+    totalDistinctCells: items.reduce((sum, item) => sum + item.distinctCellCount, 0),
+    totalRecords: items.reduce((sum, item) => sum + item.totalRecords, 0),
     items,
   };
 }
 
 /**
- * Computes all 11 enhanced Phase 2 KPIs + legacy compatibility KPIs + 5 analytics sections + BTS map summary.
+ * Unified mobile-network chart.
+ *
+ * The supplied Prisma schema does not define an editable operator-mapping
+ * table. Therefore, this implementation uses the static mappings above.
  */
-export function getDashboardKPIs(filters: Partial<DashboardFilters> | string = {}, targetDb: DatabaseSync = db) {
-  const normalizedFilters: Partial<DashboardFilters> =
-    typeof filters === 'string' ? { mission: filters } : (filters || {});
+export async function getMobileNetworks(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  const data = await getNetworkPairRows(filters, targetDb);
 
-  const regWhere = buildRegistrationWhere(normalizedFilters, targetDb);
-  const ncWhere = buildNetworkCellWhere(normalizedFilters, targetDb);
-  const missionWhere = resolveMissionWhere(normalizedFilters, targetDb);
+  const palette = ['#64748B', '#7C8798', '#94A3B8', '#A8B3C4', '#B8C2D0'];
+  const identifiedOperators = new Set<string>();
 
-  const safeScalar = (sql: string, params: any[] = []): number => {
-    try {
-      const row = targetDb.prepare(sql).get(...params) as { val?: number } | undefined;
-      return row && row.val !== undefined && row.val !== null ? Number(row.val) : 0;
-    } catch {
-      return 0;
+  const items = data.map((item, index) => {
+    const mcc = String(item.mcc).trim();
+    const mnc = String(item.mnc).trim();
+
+    const normalizedMcc = stripLeadingZeros(mcc);
+    const normalizedMnc = stripLeadingZeros(mnc);
+
+    const military = MILITARY.find(
+      (entry) => entry.mcc === normalizedMcc && entry.mnc === normalizedMnc,
+    );
+
+    const civilian = CIVILIAN.find(
+      (entry) => entry.mcc === normalizedMcc && entry.mnc === normalizedMnc,
+    );
+
+    const egyptian = EGYPT.find(
+      (entry) => entry.mcc === normalizedMcc && entry.mnc === normalizedMnc,
+    );
+
+    const known = military || civilian || egyptian;
+    const identified = Boolean(known);
+
+    const operator = known?.operator || 'Unknown Operator';
+
+    const country =
+      known?.country ||
+      MCC_COUNTRIES[mcc] ||
+      MCC_COUNTRIES[normalizedMcc] ||
+      `MCC ${mcc}`;
+
+    const isMilitary = Boolean(military);
+
+    if (identified) {
+      identifiedOperators.add(operator);
     }
+
+    return {
+      rank: index + 1,
+      mcc,
+      mnc,
+      plmn: `${mcc}/${mnc}`,
+      operator,
+      operatorLabel: identified
+        ? `${operator} (${mcc}/${mnc})`
+        : `Unknown (${mcc}/${mnc})`,
+      country,
+      networkCategory: isMilitary
+        ? 'military'
+        : identified
+          ? 'civilian'
+          : 'unknown',
+      isMilitary,
+      identified,
+      distinctCellCount: safeNumber(item.distinctCellCount),
+      totalRecords: safeNumber(item.totalRecords),
+      color: isMilitary
+        ? '#DC2626'
+        : civilian?.color ||
+          egyptian?.color ||
+          (identified ? '#2563EB' : palette[Math.min(index, palette.length - 1)]),
+    };
+  });
+
+  return {
+    titleAr: 'تحليل شبكات المحمول حسب MCC وMNC',
+    titleEn: 'Mobile Networks — MCC/MNC Analysis',
+    totalDistinctCells: items.reduce((sum, item) => sum + item.distinctCellCount, 0),
+    totalRecords: items.reduce((sum, item) => sum + item.totalRecords, 0),
+    totalMccGroups: new Set(items.map((item) => item.mcc)).size,
+    totalMccMncCombinations: items.length,
+    totalIdentifiedOperators: identifiedOperators.size,
+    items,
   };
+}
 
-  // Core Registration KPIs (strictly filtered by Registration + Mission filters)
-  const totalRegistrations = safeScalar(`SELECT COUNT(*) as val FROM registrations ${regWhere.whereSql}`, regWhere.params);
-  const distinctImsis = safeScalar(
-    `SELECT COUNT(DISTINCT imsi) as val FROM registrations ${regWhere.whereSql ? `${regWhere.whereSql} AND` : 'WHERE'} imsi IS NOT NULL AND TRIM(imsi) != '' AND TRIM(imsi) != '0'`,
-    regWhere.params
-  );
-  const distinctImeis = safeScalar(
-    `SELECT COUNT(DISTINCT imei) as val FROM registrations ${regWhere.whereSql ? `${regWhere.whereSql} AND` : 'WHERE'} imei IS NOT NULL AND TRIM(imei) != '' AND TRIM(imei) != '0'`,
-    regWhere.params
-  );
-  const countriesRepresented = safeScalar(
-    `SELECT COUNT(DISTINCT TRIM(country)) as val FROM registrations ${regWhere.whereSql ? `${regWhere.whereSql} AND` : 'WHERE'} country IS NOT NULL AND TRIM(country) != ''`,
-    regWhere.params
-  );
+// -----------------------------------------------------------------------------
+// Data quality statistics
+// -----------------------------------------------------------------------------
 
-  // Core NetworkCell KPIs (strictly filtered by NetworkCell + Mission + PLMN filters)
-  const totalNetworkCells = safeScalar(`SELECT COUNT(*) as val FROM network_cells ${ncWhere.whereSql}`, ncWhere.params);
-  const distinctNetworkCells = safeScalar(
-    `SELECT COUNT(DISTINCT TRIM(cell_id)) as val FROM network_cells ${ncWhere.whereSql ? `${ncWhere.whereSql} AND` : 'WHERE'} cell_id IS NOT NULL AND TRIM(cell_id) != ''`,
-    ncWhere.params
-  );
-  const networkCellsWithValidCoords = safeScalar(
-    `SELECT COUNT(*) as val FROM network_cells ${ncWhere.whereSql ? `${ncWhere.whereSql} AND` : 'WHERE'} latitude IS NOT NULL AND longitude IS NOT NULL AND NOT (latitude = 0 AND longitude = 0) AND latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180`,
-    ncWhere.params
+export async function getDashboardQualityStats(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  const registrationWhere = await buildRegistrationWhere(filters, targetDb);
+  const mission = await resolveMissionWhere(filters, targetDb);
+
+  const registrationAnd = (condition: string) =>
+    `${registrationWhere.whereSql ? `${registrationWhere.whereSql} AND` : 'WHERE'} ${condition}`;
+
+  const missionWhere = mission.sql ? `WHERE ${mission.sql}` : '';
+
+  const totalRegistrations = await scalar(
+    targetDb,
+    `SELECT COUNT(*)::bigint AS val FROM registrations ${registrationWhere.whereSql}`,
+    registrationWhere.params,
   );
 
-  // Mission count (respects selected missionIds if provided)
-  const totalMissions = normalizedFilters.missionIds && normalizedFilters.missionIds.length > 0
-    ? safeScalar(
-        `SELECT COUNT(*) as val FROM missions WHERE id IN (${normalizedFilters.missionIds.map(() => '?').join(', ')})`,
-        normalizedFilters.missionIds
+  const gps = await scalar(
+    targetDb,
+    `SELECT COUNT(*)::bigint AS val FROM gps_history ${missionWhere}`,
+    mission.params,
+  );
+
+  const missingRegistrationId = await scalar(
+    targetDb,
+    `
+      SELECT COUNT(*)::bigint AS val
+      FROM registrations
+      ${registrationAnd(`(reg_id IS NULL OR BTRIM(reg_id) = '')`)}
+    `,
+    registrationWhere.params,
+  );
+
+  const missingImsi = await scalar(
+    targetDb,
+    `
+      SELECT COUNT(*)::bigint AS val
+      FROM registrations
+      ${registrationAnd(`(imsi IS NULL OR BTRIM(imsi) = '')`)}
+    `,
+    registrationWhere.params,
+  );
+
+  const invalidGps = await scalar(
+    targetDb,
+    `
+      SELECT COUNT(*)::bigint AS val
+      FROM gps_history
+      ${mission.sql ? `WHERE ${mission.sql} AND` : 'WHERE'}
+      (
+        latitude < -90 OR latitude > 90
+        OR longitude < -180 OR longitude > 180
       )
-    : safeScalar(`SELECT COUNT(*) as val FROM missions`);
+    `,
+    mission.params,
+  );
 
-  // Phase 2 Analytics Sections
-  const registrationsByCountry = getRegistrationsByCountry(normalizedFilters, targetDb);
-  const btsMap = getBtsMapData(normalizedFilters, targetDb);
-  const networkCellsByMcc = getNetworkCellsByMcc(normalizedFilters, targetDb);
-  const militaryNetworks = getMilitaryNetworks(normalizedFilters, targetDb);
-  const civilianNetworks = getCivilianNetworks(normalizedFilters, targetDb);
+  const ambiguities = await scalar(
+    targetDb,
+    `
+      SELECT COUNT(*)::bigint AS val
+      FROM migration_ambiguities
+      WHERE status = 'PENDING'
+    `,
+  );
 
-  const totalBtsLocations = btsMap.stats.registrationLocationsCount;
-  const militaryNetworkCells = militaryNetworks.totalDistinctCells;
-  const civilianNetworkCells = civilianNetworks.totalDistinctCells;
+  return {
+    totalChecked: totalRegistrations + gps,
+    validRecords: Math.max(
+      0,
+      totalRegistrations + gps - missingRegistrationId - missingImsi - invalidGps,
+    ),
+    issuesFound: missingRegistrationId + missingImsi + invalidGps + ambiguities,
+    pendingAmbiguities: ambiguities,
+    breakdown: [
+      {
+        issue: 'Missing Device Identifier (IMSI/RegID)',
+        count: missingRegistrationId + missingImsi,
+      },
+      {
+        issue: 'Out-of-bound GPS Coordinates',
+        count: invalidGps,
+      },
+      {
+        issue: 'Ambiguous Mission Links Pending Review',
+        count: ambiguities,
+      },
+    ],
+  };
+}
 
-  // Legacy / auxiliary KPIs
-  const mFilterSql = missionWhere.clause ? `WHERE ${missionWhere.clause}` : '';
-  const totalTargets = safeScalar(`SELECT COUNT(*) as val FROM targets ${mFilterSql}`, missionWhere.params);
-  const totalGpsHistory = safeScalar(`SELECT COUNT(*) as val FROM gps_history ${mFilterSql}`, missionWhere.params);
-  const totalWifiPoints = safeScalar(`SELECT COUNT(*) as val FROM wifi_access_points ${mFilterSql}`, missionWhere.params);
-  const totalMapCells = safeScalar(`SELECT COUNT(*) as val FROM map_cells`);
-  const totalFiles = safeScalar(`SELECT COUNT(*) as val FROM mission_files`) + safeScalar(`SELECT COUNT(*) as val FROM location_files`) + safeScalar(`SELECT COUNT(*) as val FROM target_files`);
-  const totalImports = safeScalar(`SELECT COUNT(*) as val FROM import_history`);
-  const totalOperationalRecords = totalRegistrations + totalTargets + totalNetworkCells + totalGpsHistory + totalWifiPoints + totalMapCells;
+// -----------------------------------------------------------------------------
+// Dashboard KPIs
+// -----------------------------------------------------------------------------
 
-  // Records by Mission (using mission_id join)
+export async function getDashboardKpiSummary(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  const registrationWhere = await buildRegistrationWhere(filters, targetDb);
+  const networkWhere = await buildNetworkCellWhere(filters, targetDb);
+  const mission = await resolveMissionWhere(filters, targetDb);
+
+  const registrationAnd = (condition: string) =>
+    `${registrationWhere.whereSql ? `${registrationWhere.whereSql} AND` : 'WHERE'} ${condition}`;
+
+  const networkAnd = (condition: string) =>
+    `${networkWhere.whereSql ? `${networkWhere.whereSql} AND` : 'WHERE'} ${condition}`;
+
+  const totalRegistrations = await scalar(
+    targetDb,
+    `SELECT COUNT(*)::bigint AS val FROM registrations ${registrationWhere.whereSql}`,
+    registrationWhere.params,
+  );
+
+  const distinctImsis = await scalar(
+    targetDb,
+    `
+      SELECT COUNT(DISTINCT imsi)::bigint AS val
+      FROM registrations
+      ${registrationAnd(`imsi IS NOT NULL AND BTRIM(imsi) NOT IN ('', '0')`)}
+    `,
+    registrationWhere.params,
+  );
+
+  const distinctImeis = await scalar(
+    targetDb,
+    `
+      SELECT COUNT(DISTINCT imei)::bigint AS val
+      FROM registrations
+      ${registrationAnd(`imei IS NOT NULL AND BTRIM(imei) NOT IN ('', '0')`)}
+    `,
+    registrationWhere.params,
+  );
+
+  const countriesRepresented = await scalar(
+    targetDb,
+    `
+      SELECT COUNT(DISTINCT BTRIM(country))::bigint AS val
+      FROM registrations
+      ${registrationAnd(`country IS NOT NULL AND BTRIM(country) <> ''`)}
+    `,
+    registrationWhere.params,
+  );
+
+  const totalNetworkCells = await scalar(
+    targetDb,
+    `SELECT COUNT(*)::bigint AS val FROM network_cells ${networkWhere.whereSql}`,
+    networkWhere.params,
+  );
+
+  const distinctNetworkCells = await scalar(
+    targetDb,
+    `
+      SELECT COUNT(DISTINCT BTRIM(cell_id))::bigint AS val
+      FROM network_cells
+      ${networkAnd(`cell_id IS NOT NULL AND BTRIM(cell_id) <> ''`)}
+    `,
+    networkWhere.params,
+  );
+
+  const networkCellsWithValidCoords = await scalar(
+    targetDb,
+    `
+      SELECT COUNT(*)::bigint AS val
+      FROM network_cells
+      ${networkAnd(`
+        latitude BETWEEN -90 AND 90
+        AND longitude BETWEEN -180 AND 180
+        AND NOT (latitude = 0 AND longitude = 0)
+      `)}
+    `,
+    networkWhere.params,
+  );
+
+  let totalMissions: number;
+
+  if (filters.missionIds?.length) {
+    const params: Params = [];
+    const condition = inClause('id', filters.missionIds, params);
+
+    totalMissions = await scalar(
+      targetDb,
+      `SELECT COUNT(*)::bigint AS val FROM missions WHERE ${condition}`,
+      params,
+    );
+  } else if (filters.mission && filters.mission !== 'ALL') {
+    const numericMission = Number(filters.mission);
+
+    if (Number.isInteger(numericMission) && numericMission > 0) {
+      totalMissions = await scalar(
+        targetDb,
+        'SELECT COUNT(*)::bigint AS val FROM missions WHERE id = $1',
+        [numericMission],
+      );
+    } else {
+      totalMissions = await scalar(
+        targetDb,
+        'SELECT COUNT(*)::bigint AS val FROM missions WHERE mission = $1',
+        [filters.mission],
+      );
+    }
+  } else {
+    totalMissions = await scalar(
+      targetDb,
+      'SELECT COUNT(*)::bigint AS val FROM missions',
+    );
+  }
+
+  const [bts, military, civilian] = await Promise.all([
+    getBtsMapData(filters, targetDb),
+    getMilitaryNetworks(filters, targetDb),
+    getCivilianNetworks(filters, targetDb),
+  ]);
+
+  const missionWhere = mission.sql ? `WHERE ${mission.sql}` : '';
+
+  const countMissionTable = (table: string) =>
+    scalar(
+      targetDb,
+      `SELECT COUNT(*)::bigint AS val FROM ${q(table)} ${missionWhere}`,
+      mission.params,
+    );
+
+  // File tables do not have mission_id. Filter through their parent records.
+  const missionFiles = scalar(
+    targetDb,
+    `
+      SELECT COUNT(*)::bigint AS val
+      FROM mission_files mf
+      INNER JOIN mission_extras me ON me.id = mf.mission_extra_id
+      ${mission.sql ? `WHERE ${mission.sql.replace(/\bmission_id\b/g, 'me.mission_id').replace(/\bmission\b/g, 'me.mission')}` : ''}
+    `,
+    mission.params,
+  );
+
+  const locationFiles = scalar(
+    targetDb,
+    `
+      SELECT COUNT(*)::bigint AS val
+      FROM location_files lf
+      INNER JOIN location_extras le ON le.id = lf.location_extra_id
+      ${mission.sql ? `WHERE ${mission.sql.replace(/\bmission_id\b/g, 'le.mission_id').replace(/\bmission\b/g, 'le.mission')}` : ''}
+    `,
+    mission.params,
+  );
+
+  const targetFiles = scalar(
+    targetDb,
+    `
+      SELECT COUNT(*)::bigint AS val
+      FROM target_files tf
+      INNER JOIN targets t ON t.id = tf.target_id
+      ${mission.sql ? `WHERE ${mission.sql.replace(/\bmission_id\b/g, 't.mission_id').replace(/\bmission\b/g, 't.mission')}` : ''}
+    `,
+    mission.params,
+  );
+
+  const mapCells = scalar(
+    targetDb,
+    `
+      SELECT COUNT(*)::bigint AS val
+      FROM map_cells mc
+      INNER JOIN map_cell_databases mcd ON mcd.id = mc.db_id
+      ${mission.sql ? `WHERE ${mission.sql.replace(/\bmission_id\b/g, 'mcd.mission_id').replace(/\bmission\b/g, 'mcd.mission')}` : ''}
+    `,
+    mission.params,
+  );
+
+  const [
+    targets,
+    gps,
+    wifi,
+    missionFileCount,
+    locationFileCount,
+    targetFileCount,
+    mapCellCount,
+    imports,
+  ] = await Promise.all([
+    countMissionTable('targets'),
+    countMissionTable('gps_history'),
+    countMissionTable('wifi_access_points'),
+    missionFiles,
+    locationFiles,
+    targetFiles,
+    mapCells,
+    scalar(
+      targetDb,
+      'SELECT COUNT(*)::bigint AS val FROM import_history',
+    ),
+  ]);
+
+  const totalFiles =
+    missionFileCount + locationFileCount + targetFileCount;
+
+  return {
+    totalRegistrations,
+    distinctImsis,
+    distinctImeis,
+    totalNetworkCells,
+    distinctNetworkCells,
+    totalMissions,
+    countriesRepresented,
+    totalBtsLocations: bts.stats.registrationLocationsCount,
+    networkCellsWithValidCoords,
+    militaryNetworkCells: military.totalDistinctCells,
+    civilianNetworkCells: civilian.totalDistinctCells,
+    totalTargets: targets,
+    totalGpsHistory: gps,
+    totalWifiPoints: wifi,
+    totalMapCells: mapCellCount,
+    totalFiles,
+    totalImports: imports,
+    totalOperationalRecords:
+      totalRegistrations +
+      targets +
+      totalNetworkCells +
+      gps +
+      wifi +
+      mapCellCount,
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Operational dashboard panels
+// -----------------------------------------------------------------------------
+
+export async function getDashboardOperationalPanels(
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  const registrationWhere = await buildRegistrationWhere(filters, targetDb);
+  const networkWhere = await buildNetworkCellWhere(filters, targetDb);
+  const mission = await resolveMissionWhere(filters, targetDb);
+
   let recordsByMission: any[] = [];
+
   try {
-    const mClause = normalizedFilters.missionIds && normalizedFilters.missionIds.length > 0
-      ? `WHERE m.id IN (${normalizedFilters.missionIds.map(() => '?').join(', ')})`
-      : '';
-    const mParams = normalizedFilters.missionIds && normalizedFilters.missionIds.length > 0 ? normalizedFilters.missionIds : [];
-    recordsByMission = targetDb.prepare(`
-      SELECT m.id as missionId,
-             m.mission,
-             m.location,
-             (SELECT COUNT(*) FROM registrations WHERE mission_id = m.id) as registrations,
-             (SELECT COUNT(*) FROM network_cells WHERE mission_id = m.id) as networkCells,
-             (SELECT COUNT(*) FROM targets WHERE mission_id = m.id) as targets
-      FROM missions m
-      ${mClause}
-      ORDER BY registrations DESC, m.id ASC
-      LIMIT 12
-    `).all(...mParams);
+    const missionConditions: string[] = [];
+    const missionParams: Params = [];
+
+    if (filters.missionIds?.length) {
+      missionConditions.push(inClause('m.id', filters.missionIds, missionParams));
+    } else if (filters.mission && filters.mission !== 'ALL') {
+      const numericMission = Number(filters.mission);
+
+      if (Number.isInteger(numericMission) && numericMission > 0) {
+        missionParams.push(numericMission);
+        missionConditions.push(`m.id = $${missionParams.length}`);
+      } else {
+        missionParams.push(filters.mission);
+        missionConditions.push(`m.mission = $${missionParams.length}`);
+      }
+    }
+
+    recordsByMission = await rows<any>(
+      targetDb,
+      `
+        SELECT
+          m.id AS "missionId",
+          m.mission,
+          m.location,
+          (
+            SELECT COUNT(*)::int
+            FROM registrations r
+            WHERE r.mission_id = m.id
+          ) AS registrations,
+          (
+            SELECT COUNT(*)::int
+            FROM network_cells n
+            WHERE n.mission_id = m.id
+          ) AS "networkCells",
+          (
+            SELECT COUNT(*)::int
+            FROM targets t
+            WHERE t.mission_id = m.id
+          ) AS targets
+        FROM missions m
+        ${missionConditions.length ? `WHERE ${missionConditions.join(' AND ')}` : ''}
+        ORDER BY registrations DESC, m.id ASC
+        LIMIT 12
+      `,
+      missionParams,
+    );
   } catch {
     recordsByMission = [];
   }
 
-  // Network Cells by RAT (filtered)
   let cellsByRat: any[] = [];
+
   try {
-    cellsByRat = targetDb.prepare(`
-      SELECT COALESCE(rat, 'Unknown') as rat, COUNT(DISTINCT COALESCE(cell_id, id)) as count, COUNT(*) as totalRecords
-      FROM network_cells
-      ${ncWhere.whereSql}
-      GROUP BY rat
-      ORDER BY count DESC
-    `).all(...ncWhere.params);
+    cellsByRat = await rows<any>(
+      targetDb,
+      `
+        SELECT
+          COALESCE(rat, 'Unknown') AS rat,
+          COUNT(DISTINCT COALESCE(NULLIF(BTRIM(cell_id), ''), id::text))::int AS count,
+          COUNT(*)::int AS "totalRecords"
+        FROM network_cells
+        ${networkWhere.whereSql}
+        GROUP BY rat
+        ORDER BY count DESC
+      `,
+      networkWhere.params,
+    );
   } catch {
     cellsByRat = [];
   }
 
-  // Activity Timeline (filtered by Registration filters)
   let activityTimeline: any[] = [];
+
   try {
-    activityTimeline = targetDb.prepare(`
-      SELECT strftime('%Y-%m-%d %H:00', last_seen) as hour_slot, COUNT(*) as registrations
-      FROM registrations
-      ${regWhere.whereSql ? `${regWhere.whereSql} AND` : 'WHERE'} last_seen IS NOT NULL
-      GROUP BY hour_slot
-      ORDER BY hour_slot ASC
-      LIMIT 24
-    `).all(...regWhere.params);
+    activityTimeline = await rows<any>(
+      targetDb,
+      `
+        SELECT
+          TO_CHAR(DATE_TRUNC('hour', last_seen), 'YYYY-MM-DD HH24:00') AS hour_slot,
+          COUNT(*)::int AS registrations
+        FROM registrations
+        ${registrationWhere.whereSql
+          ? `${registrationWhere.whereSql} AND`
+          : 'WHERE'}
+          last_seen IS NOT NULL
+        GROUP BY DATE_TRUNC('hour', last_seen)
+        ORDER BY DATE_TRUNC('hour', last_seen) ASC
+        LIMIT 24
+      `,
+      registrationWhere.params,
+    );
   } catch {
     activityTimeline = [];
   }
 
-  // Quality stats
-  const missingRegIds = safeScalar(`SELECT COUNT(*) as val FROM registrations WHERE reg_id IS NULL OR reg_id = ''`);
-  const missingImsi = safeScalar(`SELECT COUNT(*) as val FROM registrations WHERE imsi IS NULL OR imsi = ''`);
-  const invalidGps = safeScalar(`SELECT COUNT(*) as val FROM gps_history WHERE latitude < -90 OR latitude > 90 OR longitude < -180 OR longitude > 180`);
-  const pendingAmbiguities = safeScalar(`SELECT COUNT(*) as val FROM migration_ambiguities WHERE status = 'PENDING'`);
-  const qualityStats = {
-    totalChecked: totalRegistrations + totalGpsHistory,
-    validRecords: Math.max(0, (totalRegistrations + totalGpsHistory) - (missingRegIds + missingImsi + invalidGps)),
-    issuesFound: missingRegIds + missingImsi + invalidGps + pendingAmbiguities,
-    pendingAmbiguities,
-    breakdown: [
-      { issue: 'Missing Device Identifier (IMSI/RegID)', count: missingRegIds + missingImsi },
-      { issue: 'Out-of-bound GPS Coordinates', count: invalidGps },
-      { issue: 'Ambiguous Mission Links Pending Review', count: pendingAmbiguities },
-    ],
-  };
-
   return {
-    kpis: {
-      totalRegistrations,
-      distinctImsis,
-      distinctImeis,
-      totalNetworkCells,
-      distinctNetworkCells,
-      totalMissions,
-      countriesRepresented,
-      totalBtsLocations,
-      networkCellsWithValidCoords,
-      militaryNetworkCells,
-      civilianNetworkCells,
-      // Legacy compatibility keys
-      totalTargets,
-      totalGpsHistory,
-      totalWifiPoints,
-      totalMapCells,
-      totalFiles,
-      totalImports,
-      totalOperationalRecords,
-    },
+    recordsByMission,
+    cellsByRat,
+    activityTimeline,
+    qualityStats: await getDashboardQualityStats(filters, targetDb),
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Dashboard widget dispatcher
+// -----------------------------------------------------------------------------
+
+export type DashboardWidgetId =
+  | 'kpis'
+  | 'registrationsByCountry'
+  | 'btsMap'
+  | 'networkCellsByMcc'
+  | 'militaryNetworks'
+  | 'civilianNetworks'
+  | 'mobileNetworksMccMnc'
+  | 'operationalSummary'
+  | 'qualityStats';
+
+export async function getDashboardWidget(
+  widgetId: DashboardWidgetId,
+  filters: Partial<DashboardFilters> = {},
+  targetDb: Db = db,
+) {
+  switch (widgetId) {
+    case 'kpis':
+      return getDashboardKpiSummary(filters, targetDb);
+
+    case 'registrationsByCountry':
+      return getRegistrationsByCountry(filters, targetDb);
+
+    case 'btsMap':
+      return getBtsMapData(filters, targetDb);
+
+    case 'networkCellsByMcc':
+      return getNetworkCellsByMcc(filters, targetDb);
+
+    case 'militaryNetworks':
+      return getMilitaryNetworks(filters, targetDb);
+
+    case 'civilianNetworks':
+      return getCivilianNetworks(filters, targetDb);
+
+    case 'mobileNetworksMccMnc':
+      return getMobileNetworks(filters, targetDb);
+
+    case 'operationalSummary':
+      return getDashboardOperationalPanels(filters, targetDb);
+
+    case 'qualityStats':
+      return getDashboardQualityStats(filters, targetDb);
+
+    default:
+      throw new Error(`Unknown dashboard widget: ${widgetId}`);
+  }
+}
+
+export async function getDashboardKPIs(
+  filters: Partial<DashboardFilters> | string = {},
+  targetDb: Db = db,
+) {
+  const normalizedFilters: Partial<DashboardFilters> =
+    typeof filters === 'string'
+      ? { mission: filters }
+      : filters || {};
+
+  const [
+    kpis,
     registrationsByCountry,
     btsMap,
     networkCellsByMcc,
     militaryNetworks,
     civilianNetworks,
-    recordsByMission,
-    recordsByCountry: registrationsByCountry.items.map(i => ({ country: i.country, count: i.distinctImsiCount })),
-    cellsByRat,
-    activityTimeline,
-    qualityStats,
+    mobileNetworksMccMnc,
+    operational,
+  ] = await Promise.all([
+    getDashboardKpiSummary(normalizedFilters, targetDb),
+    getRegistrationsByCountry(normalizedFilters, targetDb),
+    getBtsMapData(normalizedFilters, targetDb),
+    getNetworkCellsByMcc(normalizedFilters, targetDb),
+    getMilitaryNetworks(normalizedFilters, targetDb),
+    getCivilianNetworks(normalizedFilters, targetDb),
+    getMobileNetworks(normalizedFilters, targetDb),
+    getDashboardOperationalPanels(normalizedFilters, targetDb),
+  ]);
+
+  return {
+    kpis,
+    registrationsByCountry,
+    btsMap,
+    networkCellsByMcc,
+    militaryNetworks,
+    civilianNetworks,
+    mobileNetworksMccMnc,
+    recordsByMission: operational.recordsByMission,
+    recordsByCountry: registrationsByCountry.items.map((item: any) => ({
+      country: item.country,
+      count: item.distinctImsiCount,
+    })),
+    cellsByRat: operational.cellsByRat,
+    activityTimeline: operational.activityTimeline,
+    qualityStats: operational.qualityStats,
   };
 }
 
-/**
- * Returns searchable filter dropdown options directly from the live database.
- */
-export function getDashboardFilterOptions(targetDb: DatabaseSync = db) {
-  const distinctStrings = (sql: string): string[] => {
-    try {
-      return (targetDb.prepare(sql).all() as Array<{ val: string }>).map(r => r.val).filter(Boolean);
-    } catch {
-      return [];
-    }
-  };
-  const distinctNums = (sql: string): number[] => {
-    try {
-      return (targetDb.prepare(sql).all() as Array<{ val: number }>).map(r => Number(r.val)).filter(Number.isFinite);
-    } catch {
-      return [];
-    }
+// -----------------------------------------------------------------------------
+// Dashboard filter options
+// -----------------------------------------------------------------------------
+
+export async function getDashboardFilterOptions(targetDb: Db = db) {
+  const distinct = async (sql: string) => {
+    const result = await rows<any>(targetDb, sql);
+
+    return result
+      .map((item) => item.val)
+      .filter(Boolean);
   };
 
-  const missions = targetDb
-    .prepare(`SELECT id, mission, mission_name as missionName, location, created_at as createdAt FROM missions ORDER BY id ASC`)
-    .all();
+  const [
+    missions,
+    countries,
+    countryCodes,
+    ueModels,
+    btsNames,
+    actions,
+    updates,
+    rats,
+    mccs,
+    mncs,
+    plmnEntries,
+  ] = await Promise.all([
+    rows<any>(
+      targetDb,
+      `
+        SELECT
+          id,
+          mission,
+          mission_name AS "missionName",
+          location,
+          created_at AS "createdAt"
+        FROM missions
+        ORDER BY id
+      `,
+    ),
+
+    distinct(`
+      SELECT DISTINCT BTRIM(country) AS val
+      FROM registrations
+      WHERE country IS NOT NULL AND BTRIM(country) <> ''
+      ORDER BY val
+    `),
+
+    distinct(`
+      SELECT DISTINCT UPPER(BTRIM(country_code)) AS val
+      FROM registrations
+      WHERE country_code IS NOT NULL AND BTRIM(country_code) <> ''
+      ORDER BY val
+    `),
+
+    distinct(`
+      SELECT DISTINCT ue_model AS val
+      FROM registrations
+      WHERE ue_model IS NOT NULL AND BTRIM(ue_model) <> ''
+      ORDER BY val
+    `),
+
+    distinct(`
+      SELECT DISTINCT bts_name AS val
+      FROM registrations
+      WHERE bts_name IS NOT NULL AND BTRIM(bts_name) <> ''
+      ORDER BY val
+    `),
+
+    distinct(`
+      SELECT DISTINCT action AS val
+      FROM registrations
+      WHERE action IS NOT NULL AND BTRIM(action) <> ''
+      ORDER BY val
+    `),
+
+    distinct(`
+      SELECT DISTINCT "update" AS val
+      FROM registrations
+      WHERE "update" IS NOT NULL AND BTRIM("update") <> ''
+      ORDER BY val
+    `),
+
+    distinct(`
+      SELECT DISTINCT rat AS val
+      FROM network_cells
+      WHERE rat IS NOT NULL AND BTRIM(rat) <> ''
+      ORDER BY val
+    `),
+
+    distinct(`
+      SELECT DISTINCT BTRIM(mcc) AS val
+      FROM network_cells
+      WHERE mcc IS NOT NULL AND BTRIM(mcc) <> ''
+      ORDER BY val
+    `),
+
+    distinct(`
+      SELECT DISTINCT BTRIM(mnc) AS val
+      FROM network_cells
+      WHERE mnc IS NOT NULL AND BTRIM(mnc) <> ''
+      ORDER BY val
+    `),
+
+    rows<any>(
+      targetDb,
+      `
+        SELECT mcc, mnc, country, code, name
+        FROM plmn_storage
+        ORDER BY mcc, mnc
+      `,
+    ),
+  ]);
 
   return {
     missions,
     registrations: {
-      countries: distinctStrings(`SELECT DISTINCT TRIM(country) as val FROM registrations WHERE country IS NOT NULL AND TRIM(country) != '' ORDER BY val`),
-      countryCodes: distinctStrings(`SELECT DISTINCT UPPER(TRIM(country_code)) as val FROM registrations WHERE country_code IS NOT NULL AND TRIM(country_code) != '' ORDER BY val`),
-      ueModels: distinctStrings(`SELECT DISTINCT ue_model as val FROM registrations WHERE ue_model IS NOT NULL AND TRIM(ue_model) != '' ORDER BY val`),
-      btsNames: distinctStrings(`SELECT DISTINCT bts_name as val FROM registrations WHERE bts_name IS NOT NULL AND TRIM(bts_name) != '' ORDER BY val`),
-      actions: distinctStrings(`SELECT DISTINCT action as val FROM registrations WHERE action IS NOT NULL AND TRIM(action) != '' ORDER BY val`),
-      updates: distinctStrings(`SELECT DISTINCT "update" as val FROM registrations WHERE "update" IS NOT NULL AND TRIM("update") != '' ORDER BY val`),
+      countries,
+      countryCodes,
+      ueModels,
+      btsNames,
+      actions,
+      updates,
     },
     networkCells: {
-      rats: distinctStrings(`SELECT DISTINCT rat as val FROM network_cells WHERE rat IS NOT NULL AND TRIM(rat) != '' ORDER BY val`),
-      mccs: distinctStrings(`SELECT DISTINCT TRIM(mcc) as val FROM network_cells WHERE mcc IS NOT NULL AND TRIM(mcc) != '' ORDER BY val`),
-      mncs: distinctStrings(`SELECT DISTINCT TRIM(mnc) as val FROM network_cells WHERE mnc IS NOT NULL AND TRIM(mnc) != '' ORDER BY val`),
+      rats,
+      mccs,
+      mncs,
     },
-    plmnEntries: targetDb.prepare(`SELECT mcc, mnc, country, code, name FROM plmn_storage ORDER BY mcc, mnc`).all(),
+    plmnEntries,
   };
 }
 
-// Dynamic Custom Analytics Query Builder (preserves Phase 1 /api/v1/analytics/query)
-export function executeDynamicAnalytics(options: {
-  table: string;
-  dimensionCol: string;
-  metricCol?: string;
-  aggregation: 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX';
-  mission?: string;
-  missionIds?: number[];
-  limit?: number;
-}) {
-  const limit = Math.min(100, Math.max(5, options.limit || 20));
-  const whereClauses: string[] = [];
-  const params: any[] = [];
+// -----------------------------------------------------------------------------
+// Generic table statistics
+// -----------------------------------------------------------------------------
 
-  if (options.missionIds && options.missionIds.length > 0) {
-    whereClauses.push(`mission_id IN (${options.missionIds.map(() => '?').join(', ')})`);
-    params.push(...options.missionIds);
+const ANALYTICS_TABLES = new Set([
+  'missions',
+  'registrations',
+  'targets',
+  'mission_extras',
+  'location_extras',
+  'mission_files',
+  'location_files',
+  'target_files',
+  'network_cells',
+  'map_cell_databases',
+  'map_cells',
+  'plmn_storage',
+  'wifi_access_points',
+  'wifi_access_point_clients',
+  'gps_history',
+  'sms_calls',
+  'map_user_markers',
+  'map_user_polygons',
+  'map_user_circles',
+  'scheduled_tasks',
+  'map_layers',
+  'whitelist_targets',
+  'tac_numbers',
+]);
+
+async function getColumnNames(targetDb: Db, table: string): Promise<Set<string>> {
+  const result = await rows<{ name: string }>(
+    targetDb,
+    `
+      SELECT column_name AS name
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+    `,
+    [table],
+  );
+
+  return new Set(result.map((item) => item.name));
+}
+
+export async function getTableStats(
+  options: {
+    table: string;
+    search?: string;
+    mission?: string;
+    missionIds?: number[];
+    filters?: any[];
+  },
+  targetDb: Db = db,
+): Promise<Record<string, any>> {
+  const table = String(options.table || '').trim();
+
+  if (!ANALYTICS_TABLES.has(table)) {
+    throw new Error(`Unsupported analytics table: ${table}`);
+  }
+
+  const columns = await getColumnNames(targetDb, table);
+  const clauses: string[] = [];
+  const params: Params = [];
+
+  if (options.missionIds?.length) {
+    if (table === 'missions' && columns.has('id')) {
+      clauses.push(inClause('id', options.missionIds, params));
+    } else if (columns.has('mission_id')) {
+      clauses.push(inClause('mission_id', options.missionIds, params));
+    }
   } else if (options.mission && options.mission !== 'ALL') {
-    const asId = Number(options.mission);
-    if (!Number.isNaN(asId) && Number.isInteger(asId) && asId > 0) {
-      whereClauses.push('mission_id = ?');
-      params.push(asId);
-    } else {
-      whereClauses.push('mission = ?');
+    const numericMission = Number(options.mission);
+
+    if (table === 'missions') {
+      if (Number.isInteger(numericMission) && numericMission > 0) {
+        params.push(numericMission);
+        clauses.push(`id = $${params.length}`);
+      } else {
+        params.push(options.mission);
+        clauses.push(`mission = $${params.length}`);
+      }
+    } else if (
+      Number.isInteger(numericMission) &&
+      numericMission > 0 &&
+      columns.has('mission_id')
+    ) {
+      params.push(numericMission);
+      clauses.push(`mission_id = $${params.length}`);
+    } else if (columns.has('mission')) {
       params.push(options.mission);
+      clauses.push(`mission = $${params.length}`);
+    } else if (columns.has('mission_id')) {
+      const missions = await rows<{ id: number }>(
+        targetDb,
+        'SELECT id FROM missions WHERE mission = $1',
+        [options.mission],
+      );
+
+      if (missions.length) {
+        clauses.push(
+          inClause('mission_id', missions.map((item) => item.id), params),
+        );
+      } else {
+        clauses.push('FALSE');
+      }
     }
   }
 
-  const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-  let aggExpr = 'COUNT(*)';
-  if (options.metricCol && options.aggregation !== 'COUNT') {
-    aggExpr = `${options.aggregation}("${options.metricCol}")`;
+  if (options.search?.trim()) {
+    const searchableColumns = [
+      'mission',
+      'name',
+      'country',
+      'imsi',
+      'imei',
+      'bts',
+      'bts_name',
+      'mcc',
+      'mnc',
+      'cell_id',
+    ].filter((column) => columns.has(column));
+
+    if (searchableColumns.length) {
+      params.push(`%${options.search.trim()}%`);
+      const placeholder = `$${params.length}`;
+
+      clauses.push(
+        `(${searchableColumns
+          .map((column) => `CAST(${q(column)} AS TEXT) ILIKE ${placeholder}`)
+          .join(' OR ')})`,
+      );
+    }
   }
 
+  const result = await first<any>(
+    targetDb,
+    `
+      SELECT COUNT(*)::bigint AS total
+      FROM ${q(table)}
+      ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+    `,
+    params,
+  );
+
+  return {
+    table,
+    totalRecords: safeNumber(result?.total),
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Dynamic grouped analytics
+// -----------------------------------------------------------------------------
+
+type DynamicMetric = {
+  id?: string;
+  label?: string;
+  aggregation: string;
+  column?: string;
+};
+
+export async function executeDynamicAnalytics(
+  options: {
+    table: string;
+    dimensionCol?: string;
+    dimensions?: string[];
+    dimension?: string[];
+    metrics?: DynamicMetric[];
+    metricCol?: string;
+    aggregation?: string;
+    mission?: string;
+    missionIds?: number[];
+    limit?: number;
+    offset?: number;
+    sortBy?: string;
+    sortOrder?: 'ASC' | 'DESC';
+    filters?: any;
+  },
+  targetDb: Db = db,
+): Promise<{
+  rows: any[];
+  dimensions: string[];
+  metrics: any[];
+}> {
+  const table = String(options.table || '').trim();
+
+  if (!ANALYTICS_TABLES.has(table)) {
+    throw new Error(`Unsupported analytics table: ${table}`);
+  }
+
+  const columnSet = await getColumnNames(targetDb, table);
+
+  let dimensions = Array.isArray(options.dimensions)
+    ? options.dimensions.filter(Boolean).map(String)
+    : Array.isArray(options.dimension)
+      ? options.dimension.filter(Boolean).map(String)
+      : [];
+
+  if (!dimensions.length && options.dimensionCol) {
+    dimensions = [String(options.dimensionCol)];
+  }
+
+  dimensions = [...new Set(dimensions.filter((column) => columnSet.has(column)))];
+
+  if (!dimensions.length) {
+    throw new Error(
+      'Analytics Query Error: no valid grouping dimension columns',
+    );
+  }
+
+  const requestedMetrics =
+    Array.isArray(options.metrics) && options.metrics.length
+      ? options.metrics
+      : [{
+          id: 'value',
+          label: options.aggregation || 'Count',
+          aggregation: options.aggregation || 'COUNT',
+          column: options.metricCol,
+        }];
+
+  const allowedAggregations = new Set([
+    'COUNT',
+    'DISTINCT_COUNT',
+    'SUM',
+    'AVG',
+    'MIN',
+    'MAX',
+    'MEDIAN',
+  ]);
+
+  const metrics = requestedMetrics.map((metric, index) => {
+    const aggregation = String(metric.aggregation || 'COUNT').toUpperCase();
+
+    let id = String(metric.id || `m${index + 1}`);
+
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(id)) {
+      id = `m${index + 1}`;
+    }
+
+    const column = metric.column
+      ? String(metric.column)
+      : undefined;
+
+    if (!allowedAggregations.has(aggregation)) {
+      throw new Error(`Unsupported aggregation: ${aggregation}`);
+    }
+
+    if (aggregation !== 'COUNT' && (!column || !columnSet.has(column))) {
+      throw new Error(
+        `Analytics Query Error: invalid metric column: ${column || '(missing)'}`,
+      );
+    }
+
+    return {
+      id,
+      label: metric.label || `${aggregation}${column ? ` ${column}` : ''}`,
+      aggregation,
+      column,
+    };
+  });
+
+  const params: Params = [];
+  const clauses: string[] = [];
+
+  // Mission IDs are authoritative.
+  if (options.missionIds?.length && columnSet.has('mission_id')) {
+    clauses.push(inClause('mission_id', options.missionIds, params));
+  } else if (options.mission && options.mission !== 'ALL') {
+    const numericMission = Number(options.mission);
+
+    if (
+      Number.isInteger(numericMission) &&
+      numericMission > 0 &&
+      columnSet.has('mission_id')
+    ) {
+      params.push(numericMission);
+      clauses.push(`mission_id = $${params.length}`);
+    } else if (columnSet.has('mission')) {
+      params.push(options.mission);
+      clauses.push(`mission = $${params.length}`);
+    } else if (columnSet.has('mission_id')) {
+      const missions = await rows<{ id: number }>(
+        targetDb,
+        'SELECT id FROM missions WHERE mission = $1',
+        [options.mission],
+      );
+
+      if (missions.length) {
+        clauses.push(
+          inClause('mission_id', missions.map((item) => item.id), params),
+        );
+      } else {
+        clauses.push('FALSE');
+      }
+    }
+  }
+
+  const filters = Array.isArray(options.filters)
+    ? options.filters
+    : [];
+
+  for (const filter of filters) {
+    if (!filter?.column) continue;
+
+    const column = String(filter.column);
+
+    if (!columnSet.has(column)) continue;
+
+    const operator = String(filter.operator || '').toLowerCase();
+    const identifier = q(column);
+
+    if (operator === 'is_empty') {
+      clauses.push(
+        `(${identifier} IS NULL OR BTRIM(${identifier}::text) = '')`,
+      );
+      continue;
+    }
+
+    if (operator === 'is_not_empty') {
+      clauses.push(
+        `(${identifier} IS NOT NULL AND BTRIM(${identifier}::text) <> '')`,
+      );
+      continue;
+    }
+
+    if (filter.value === undefined || filter.value === null) {
+      continue;
+    }
+
+    if (
+      typeof filter.value === 'string' &&
+      filter.value.trim() === '' &&
+      operator !== 'equals'
+    ) {
+      continue;
+    }
+
+    const bind = (value: unknown) => {
+      params.push(value);
+      return `$${params.length}`;
+    };
+
+    switch (operator) {
+      case 'contains':
+        clauses.push(
+          `${identifier}::text ILIKE ${bind(`%${filter.value}%`)}`,
+        );
+        break;
+
+      case 'equals':
+        clauses.push(`${identifier} = ${bind(filter.value)}`);
+        break;
+
+      case 'not_equals':
+        clauses.push(`${identifier} <> ${bind(filter.value)}`);
+        break;
+
+      case 'starts_with':
+        clauses.push(
+          `${identifier}::text ILIKE ${bind(`${filter.value}%`)}`,
+        );
+        break;
+
+      case 'ends_with':
+        clauses.push(
+          `${identifier}::text ILIKE ${bind(`%${filter.value}`)}`,
+        );
+        break;
+
+      case 'greater_than':
+        clauses.push(`${identifier} > ${bind(filter.value)}`);
+        break;
+
+      case 'less_than':
+        clauses.push(`${identifier} < ${bind(filter.value)}`);
+        break;
+
+      case 'between': {
+        if (filter.value2 === undefined || filter.value2 === null) {
+          throw new Error(
+            `Analytics Query Error: second value required for BETWEEN on ${column}`,
+          );
+        }
+
+        const firstValue = bind(filter.value);
+        const secondValue = bind(filter.value2);
+
+        clauses.push(
+          `${identifier} BETWEEN ${firstValue} AND ${secondValue}`,
+        );
+        break;
+      }
+
+      case 'before_date':
+        clauses.push(`${identifier} <= ${bind(filter.value)}`);
+        break;
+
+      case 'after_date':
+        clauses.push(`${identifier} >= ${bind(filter.value)}`);
+        break;
+
+      default:
+        // Ignore unknown filter operators to preserve the existing behavior.
+        break;
+    }
+  }
+
+  const expressions = metrics.map((metric) => {
+    const column = metric.column ? q(metric.column) : '*';
+    const alias = q(metric.id);
+
+    switch (metric.aggregation) {
+      case 'SUM':
+        return `SUM(${column}) AS ${alias}`;
+
+      case 'AVG':
+        return `AVG(${column}) AS ${alias}`;
+
+      case 'MIN':
+        return `MIN(${column}) AS ${alias}`;
+
+      case 'MAX':
+        return `MAX(${column}) AS ${alias}`;
+
+      case 'DISTINCT_COUNT':
+        return `COUNT(DISTINCT ${column}) AS ${alias}`;
+
+      case 'MEDIAN':
+        return `PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ${column}) AS ${alias}`;
+
+      default:
+        return `COUNT(*) AS ${alias}`;
+    }
+  });
+
+  const sortColumn =
+    options.sortBy &&
+    (
+      dimensions.includes(options.sortBy) ||
+      metrics.some((metric) => metric.id === options.sortBy)
+    )
+      ? q(options.sortBy)
+      : q(metrics[0].id);
+
+  const limit = Math.min(
+    100,
+    Math.max(5, Math.trunc(Number(options.limit) || 20)),
+  );
+
+  const offset = Math.max(
+    0,
+    Math.trunc(Number(options.offset) || 0),
+  );
+
+  params.push(limit, offset);
+
   const sql = `
-    SELECT "${options.dimensionCol}" as dimension, ${aggExpr} as value
-    FROM "${options.table}"
-    ${whereSql}
-    GROUP BY "${options.dimensionCol}"
-    ORDER BY value DESC
-    LIMIT ?
+    SELECT
+      ${dimensions.map(q).join(', ')},
+      ${expressions.join(', ')}
+    FROM ${q(table)}
+    ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+    GROUP BY ${dimensions.map(q).join(', ')}
+    ORDER BY ${sortColumn} ${options.sortOrder === 'ASC' ? 'ASC' : 'DESC'}
+    LIMIT $${params.length - 1}
+    OFFSET $${params.length}
   `;
 
   try {
-    const stmt = db.prepare(sql);
-    return stmt.all(...params, limit);
-  } catch (err: any) {
-    throw new Error(`Analytics Query Error: ${err.message}`);
+    return {
+      rows: await rows<any>(targetDb, sql, params),
+      dimensions,
+      metrics,
+    };
+  } catch (error: any) {
+    throw new Error(`Analytics Query Error: ${error.message}`);
   }
 }

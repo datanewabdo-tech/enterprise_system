@@ -13,6 +13,7 @@ import {
   getMilitaryNetworks,
   getCivilianNetworks,
   getDashboardKPIs,
+  getDashboardWidget,
 } from '../server/analytics.js';
 import {
   inspectFile,
@@ -42,11 +43,11 @@ after(() => {
 });
 
 describe('Phase 2: Mission ID Migration & Ambiguity Preservation', () => {
-  test('Preserves duplicate mission labels, backfills unambiguous links, and flags ambiguous links without guessing', () => {
+  test('Preserves duplicate mission labels, backfills unambiguous links, and flags ambiguous links without guessing', async () => {
     const dbPath = createTempDbPath('migration_test');
     const testDb = new DatabaseSync(dbPath);
     try {
-      initDatabase(testDb);
+      await initDatabase();
 
       // Insert 1 unique mission and 2 duplicate-labeled missions
       testDb.prepare(`INSERT INTO missions (id, mission, mission_name, location) VALUES (10, 'UNIQUE_OP', 'Unique Op', 'Sector A')`).run();
@@ -58,7 +59,7 @@ describe('Phase 2: Mission ID Migration & Ambiguity Preservation', () => {
       testDb.prepare(`INSERT INTO registrations (id, reg_id, mission, country, imsi) VALUES (101, 'R2', 'SHARED_OP', 'Jordan', '416011111111111')`).run();
       testDb.prepare(`INSERT INTO network_cells (id, mission, mcc, mnc, cell_id) VALUES (200, 'SHARED_OP', 425, 25, 9001)`).run();
 
-      runMissionIdMigration(testDb);
+      await runMissionIdMigration();
 
       const r1 = testDb.prepare(`SELECT mission_id, mission FROM registrations WHERE id = 100`).get() as any;
       const r2 = testDb.prepare(`SELECT mission_id, mission FROM registrations WHERE id = 101`).get() as any;
@@ -90,13 +91,56 @@ describe('Phase 2: Analytical Queries, Country Exclusion, BTS Parsing & Filter I
     assert.equal(res2.points.length, 1);
     assert.equal(res2.invalidCount, 3);
     assert.deepEqual(res2.points[0], { lat: 31.9, lng: 35.2 });
+
+    const storedFormat = parseBtsLocationString(' 30.060535 \r\n 31.331745 ');
+    assert.deepEqual(storedFormat.points, [{ lat: 30.060535, lng: 31.331745 }]);
   });
 
-  test('Aggregations enforce Egypt exclusion, distinct counts, MCC/Military/Civilian rules, BTS privacy, and strict filter isolation', () => {
+  test('BTS map includes every registration, preserves exact nearby coordinates, and exposes collocated record IDs', async () => {
+    const dbPath = createTempDbPath('bts_map_complete');
+    const testDb = new DatabaseSync(dbPath);
+    try {
+      await initDatabase();
+
+      const insert = testDb.prepare(`
+        INSERT INTO registrations (id, reg_id, bts_location, bts_name, country, country_code, mcc, mnc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      testDb.exec('BEGIN');
+      for (let i = 0; i < 10005; i++) {
+        const latitude = (30 + (i + 1) / 1000000).toFixed(6);
+        insert.run(i + 1, `MAP-${i + 1}`, `${latitude}\n31.331745`, 'BTS Test', 'Egypt', 'EG', '602', '1');
+      }
+      insert.run(10006, 'MAP-DUP-1', '30.000001\n31.331745', 'BTS Duplicate', 'Egypt', 'EG', '602', '1');
+      insert.run(10007, 'MAP-DUP-2', '30.000001\n31.331745', 'BTS Duplicate', 'Egypt', 'EG', '602', '1');
+      insert.run(10008, 'MAP-INVALID', '0.0\n0.0', 'Invalid', 'Egypt', 'EG', '602', '1');
+      testDb.exec('COMMIT');
+
+      const result = await getBtsMapData({}, testDb as any);
+      assert.equal(result.stats.totalRegistrationRecords, 10008);
+      assert.equal(result.stats.registrationRecordsWithLocation, 10008);
+      assert.equal(result.stats.totalParsedRegistrationCoords, 10007);
+      assert.equal(result.stats.invalidRegistrationCoords, 1);
+      assert.equal(result.locations.length, 10005);
+
+      const collocated = result.locations.find(location => location.lat === 30.000001);
+      assert.ok(collocated);
+      assert.equal(collocated.registrationCount, 3);
+      assert.deepEqual(collocated.registrationIds, [1, 10006, 10007]);
+      assert.equal(collocated.lng, 31.331745);
+      assert.deepEqual(collocated.countryCodes, ['EG']);
+      assert.deepEqual(collocated.mccs, ['602']);
+      assert.deepEqual(collocated.mncs, ['1']);
+    } finally {
+      testDb.close();
+    }
+  });
+
+  test('Aggregations enforce Egypt exclusion, distinct counts, MCC/Military/Civilian rules, BTS privacy, and strict filter isolation', async () => {
     const dbPath = createTempDbPath('analytics_test');
     const testDb = new DatabaseSync(dbPath);
     try {
-      initDatabase(testDb);
+      await initDatabase();
 
       testDb.prepare(`INSERT INTO missions (id, mission, mission_name, location) VALUES (1, 'M_ALPHA', 'Alpha', 'Site A')`).run();
       testDb.prepare(`INSERT INTO missions (id, mission, mission_name, location) VALUES (2, 'M_BETA', 'Beta', 'Site B')`).run();
@@ -132,14 +176,14 @@ describe('Phase 2: Analytical Queries, Country Exclusion, BTS Parsing & Filter I
       insNc.run(2, 'M_BETA', '425', '24', '7001', 'LTE', null, null); // excluded from civilian
 
       // 2.1 Registrations by Country
-      const regByCountry = getRegistrationsByCountry({}, testDb);
+      const regByCountry = await getRegistrationsByCountry({}, testDb as any);
       assert.equal(regByCountry.items.length, 1, 'Only Palestine should appear (Egypt & zero IMSI excluded)');
       assert.equal(regByCountry.items[0].country, 'Palestine');
       assert.equal(regByCountry.items[0].distinctImsiCount, 2);
       assert.equal(regByCountry.items[0].color, '#00B894');
 
       // 2.2 BTS Map & Privacy Check
-      const btsMap = getBtsMapData({}, testDb);
+      const btsMap = await getBtsMapData({}, testDb as any);
       assert.ok(btsMap.locations.length >= 4);
       const sharedLoc = btsMap.locations.find(l => Math.abs(l.lat - 31.5017) < 0.001);
       assert.ok(sharedLoc, 'Shared location (31.5017, 34.4668) must exist');
@@ -150,11 +194,11 @@ describe('Phase 2: Analytical Queries, Country Exclusion, BTS Parsing & Filter I
       assert.ok(!serializedMap.includes('"T1"'), 'BTS Map must never expose TMSI');
 
       // 2.3 MCC Aggregation
-      const byMcc = getNetworkCellsByMcc({}, testDb);
+      const byMcc = await getNetworkCellsByMcc({}, testDb as any);
       assert.equal(byMcc.totalDistinctCells, 7);
 
       // 2.4 Military Networks
-      const mil = getMilitaryNetworks({}, testDb);
+      const mil = await getMilitaryNetworks({}, testDb as any);
       assert.equal(mil.totalDistinctCells, 2);
       assert.equal(mil.totalRecords, 3);
       assert.ok(
@@ -164,15 +208,24 @@ describe('Phase 2: Analytical Queries, Country Exclusion, BTS Parsing & Filter I
       );
 
       // 2.5 Civilian Networks
-      const civ = getCivilianNetworks({}, testDb);
+      const civ = await getCivilianNetworks({}, testDb as any);
       const pairs = civ.items.map(i => `${i.mcc}/${i.mnc}`);
       assert.ok(!pairs.includes('602/1'), '602/1 must be excluded from civilian');
       assert.ok(!pairs.includes('425/24'), '425/24 must be excluded from civilian');
       assert.ok(pairs.includes('425/1') && pairs.includes('425/5') && pairs.includes('424/2'));
 
+      // 2.6 Unified Mobile Networks — MCC/MNC widget
+      const mobile: any = await getDashboardWidget('mobileNetworksMccMnc', {}, testDb as any);
+      assert.equal(mobile.totalDistinctCells, 7);
+      assert.equal(mobile.totalRecords, 8);
+      assert.equal(mobile.totalMccMncCombinations, 7);
+      assert.equal(mobile.totalMccGroups, 3);
+      assert.ok(mobile.items.every((i: any) => i.operator && i.operatorLabel && i.color));
+      assert.throws(() => { getDashboardWidget('unknownWidget' as any, {}, testDb as any); }, /Unknown dashboard widget/);
       // Filter Isolation: Registration date filter MUST NOT filter NetworkCells
-      const baselineKpis = getDashboardKPIs({}, testDb);
-      const regDateFiltered = getDashboardKPIs({ lastSeenFrom: '2099-01-01', lastSeenTo: '2099-01-02' }, testDb);
+      const baselineKpis = await getDashboardKPIs({}, testDb as any);
+      assert.ok(baselineKpis.mobileNetworksMccMnc, 'getDashboardKPIs must expose the mobileNetworksMccMnc widget');
+      const regDateFiltered = await getDashboardKPIs({ lastSeenFrom: '2099-01-01', lastSeenTo: '2099-01-02' }, testDb as any);
       assert.equal(regDateFiltered.kpis.totalRegistrations, 0, 'Date filter filters registrations');
       assert.equal(
         regDateFiltered.kpis.totalNetworkCells,
@@ -181,7 +234,7 @@ describe('Phase 2: Analytical Queries, Country Exclusion, BTS Parsing & Filter I
       );
 
       // NetworkCell RAT filter MUST NOT alter Registration KPIs
-      const ratFiltered = getDashboardKPIs({ rat: ['UMTS'] }, testDb);
+      const ratFiltered = await getDashboardKPIs({ rat: ['UMTS'] }, testDb as any);
       assert.equal(ratFiltered.kpis.distinctNetworkCells, 1);
       assert.equal(
         ratFiltered.kpis.totalRegistrations,
@@ -221,8 +274,7 @@ describe('Phase 2: Multi-Table SQLite Import', () => {
 
     const targetDb = new DatabaseSync(targetDbPath);
     try {
-      initDatabase(targetDb);
-
+      await initDatabase();
       const configs: MultiSqliteTableConfig[] = [
         {
           sourceTable: 'network_cells',
@@ -244,7 +296,7 @@ describe('Phase 2: Multi-Table SQLite Import', () => {
         },
       ];
 
-      const est = estimateMultiSqliteImport(extSqlitePath, configs, targetDb);
+      const est = await estimateMultiSqliteImport(extSqlitePath, configs, targetDb as any);
       assert.equal(est.estimates[0].sourceTable, 'missions', 'Estimator should order missions before child tables');
       assert.equal(est.estimates[0].estimatedInsert, 2);
 
@@ -301,6 +353,7 @@ describe('Phase 2: RBAC Permissions & PDF/Excel/Word Export Generation', () => {
       networkCellsByMcc: true,
       militaryNetworks: true,
       civilianNetworks: true,
+      mobileNetworksMccMnc: true,
       includeDetailedRecords: false,
       includeSensitiveIdentifiers: false,
     };
@@ -346,3 +399,5 @@ describe('Phase 2: RBAC Permissions & PDF/Excel/Word Export Generation', () => {
     }
   });
 });
+
+
