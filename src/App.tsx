@@ -16,6 +16,9 @@ import { BackupRecovery } from './pages/BackupRecovery.js';
 import { SystemHealth } from './pages/SystemHealth.js';
 import { Settings } from './pages/Settings.js';
 import { TableView } from './pages/TableView.js';
+import { Cronologs } from './pages/Cronologs.js';
+import { ActivityLogs } from './pages/ActivityLogs.js';
+import { GlobalSearch } from './pages/GlobalSearch.js';
 import { LoginPage } from './pages/LoginPage.js';
 import { PageLoadingScreen, ErrorRetryCard } from './components/common/LoadingStates.js';
 
@@ -84,6 +87,12 @@ const MainLayout: React.FC = () => {
         return <ImportCenter />;
       case 'export-center':
         return <ExportCenter />;
+      case 'cronologs':
+        return <Cronologs />;
+      case 'activity-logs':
+        return <ActivityLogs />;
+      case 'global-search':
+        return <GlobalSearch />;
       case 'data-quality':
         return <DataQuality />;
       case 'data-dictionary':

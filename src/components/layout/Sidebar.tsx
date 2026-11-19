@@ -34,6 +34,7 @@ import {
   Shapes,
   FolderArchive,
   Cpu,
+  Globe,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -65,6 +66,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         { id: 'dashboard', label: t('navDashboard'), icon: LayoutDashboard },
         { id: 'interactive-map', label: t('navInteractiveMap'), icon: MapPin },
         { id: 'analytics', label: t('navAnalytics'), icon: BarChart3 },
+        { id: 'global-search', label: t('navGlobalSearch'), icon: Globe },
       ],
     },
     {
@@ -126,6 +128,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
       items: [
         { id: 'import-center', label: t('navImportCenter'), icon: FileUp },
         { id: 'export-center', label: t('navExportCenter'), icon: FileDown },
+        { id: 'cronologs', label: t('cronologs'), icon: Database },
+        { id: 'activity-logs', label: t('navActivityLogs'), icon: FileText },
         { id: 'data-quality', label: t('navDataQuality'), icon: CheckCircle2 },
         { id: 'data-dictionary', label: t('navDataDictionary'), icon: BookOpen },
       ],

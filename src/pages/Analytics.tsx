@@ -253,7 +253,18 @@ function AnalysisPanel({
   const dimCols = result?.dimensions || config.dimensions;
 
   // Table columns
-  const tableColumns = [...dimCols, ...metricDefs.map((m: any) => m.label || m.id)];
+// Keep the database/API key separate from the visible column label.
+// Metric values are returned under their IDs (for example: m1).
+const tableColumns = [
+  ...dimCols.map((col: string) => ({
+    key: col,
+    label: col,
+  })),
+  ...metricDefs.map((m: any) => ({
+    key: m.id,
+    label: m.label || m.id,
+  })),
+];
 
   const handleSort = (key: string) => {
     if (config.sortBy === key) {
@@ -311,17 +322,40 @@ function AnalysisPanel({
     onChange({ metrics: next });
   };
 
-  const addFilterRow = () => {
-    const col = availableColumns[0] || '';
-    onChange({ filters: [...config.filters, { column: col, operator: 'contains', value: '' } as FilterCondition] });
-  };
-  const updateFilter = (idx: number, patch: Partial<FilterCondition>) => {
-    const next = config.filters.map((f, i) => i === idx ? { ...f, ...patch } : f);
-    onChange({ filters: next });
-  };
-  const removeFilter = (idx: number) => {
-    onChange({ filters: config.filters.filter((_, i) => i !== idx) });
-  };
+const addFilterRow = () => {
+  const col = availableColumns[0] || '';
+
+  onChange({
+    filters: [
+      ...config.filters,
+      {
+        column: col,
+        operator: 'contains',
+        value: '',
+      } as FilterCondition,
+    ],
+    offset: 0,
+  });
+};
+const updateFilter = (
+  idx: number,
+  patch: Partial<FilterCondition>
+) => {
+  const next = config.filters.map((f, i) =>
+    i === idx ? { ...f, ...patch } : f
+  );
+
+  onChange({
+    filters: next,
+    offset: 0,
+  });
+};
+const removeFilter = (idx: number) => {
+  onChange({
+    filters: config.filters.filter((_, i) => i !== idx),
+    offset: 0,
+  });
+};
 
   const collectOne = () => ({
     title: config.title,
@@ -335,22 +369,41 @@ function AnalysisPanel({
     sortOrder: config.sortOrder,
   });
 
-  const exportCsv = () => {
-    if (rows.length === 0) return;
-    const header = tableColumns.join(',');
-    const body = rows.map((r: any) => tableColumns.map(c => {
-      const v = r[c] ?? r[c];
-      const s = v === null || v === undefined ? '' : String(v);
+const exportCsv = () => {
+  if (rows.length === 0) return;
+
+  const header = tableColumns
+    .map(col => `"${col.label.replace(/"/g, '""')}"`)
+    .join(',');
+
+  const body = rows.map((r: any) =>
+    tableColumns.map(col => {
+      const value = r[col.key];
+      const s = value === null || value === undefined
+        ? ''
+        : String(value);
+
       return `"${s.replace(/"/g, '""')}"`;
-    }).join(',')).join('\n');
-    const blob = new Blob([header + '\n' + body], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${config.title.replace(/\s+/g, '_')}.csv`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
+    }).join(',')
+  ).join('\n');
+
+  const blob = new Blob(
+    ['\uFEFF' + header + '\n' + body],
+    { type: 'text/csv;charset=utf-8;' }
+  );
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+
+  a.href = url;
+  a.download = `${config.title.replace(/\s+/g, '_')}.csv`;
+
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
 
   const exportOne = async (format: 'xlsx' | 'pdf' | 'docx') => {
     setExportingFormat(format);
@@ -548,7 +601,7 @@ function AnalysisPanel({
                   {config.filters.length > 0 && (
                     <button
                       type="button"
-                      onClick={() => onChange({ filters: [] })}
+                     onClick={() => onChange({ filters: [], offset: 0 })}
                       className="text-xs text-rose-400 hover:text-rose-300"
                     >
                       Clear
@@ -712,28 +765,39 @@ function AnalysisPanel({
                   <table className="w-full text-xs">
                     <thead className="bg-slate-950/60 text-slate-300">
                       <tr>
-                        {tableColumns.map(col => (
-                          <th
-                            key={col}
-                            onClick={() => handleSort(col)}
-                            className="px-3 py-2 text-left font-semibold cursor-pointer hover:text-white whitespace-nowrap"
-                          >
-                            {col}
-                            {config.sortBy === col && (
-                              <span className="ml-1">{config.sortOrder === 'ASC' ? '▲' : '▼'}</span>
-                            )}
-                          </th>
-                        ))}
+                   {tableColumns.map(col => (
+  <th
+    key={col.key}
+    onClick={() => handleSort(col.key)}
+    className="px-3 py-2 text-left font-semibold cursor-pointer hover:text-white whitespace-nowrap"
+  >
+    {col.label}
+    {config.sortBy === col.key && (
+      <span className="ml-1">
+        {config.sortOrder === 'ASC' ? '▲' : '▼'}
+      </span>
+    )}
+  </th>
+))}
                       </tr>
                     </thead>
                     <tbody>
                       {rows.map((r: any, i: number) => (
                         <tr key={i} className="border-t border-slate-800/60 hover:bg-slate-800/40">
-                          {tableColumns.map(col => (
-                            <td key={col} className="px-3 py-2 tabular-nums whitespace-nowrap">
-                              {r[col] === null || r[col] === undefined ? '—' : String(r[col])}
-                            </td>
-                          ))}
+                       {tableColumns.map(col => {
+  const value = r[col.key];
+
+  return (
+    <td
+      key={col.key}
+      className="px-3 py-2 tabular-nums whitespace-nowrap"
+    >
+      {value === null || value === undefined
+        ? '—'
+        : String(value)}
+    </td>
+  );
+})}
                         </tr>
                       ))}
                     </tbody>

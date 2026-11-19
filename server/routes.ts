@@ -1,9 +1,10 @@
-
+﻿
 import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import path from 'node:path';
 import fs from 'node:fs';
 import zlib from 'node:zlib';
+import { z } from 'zod';
 import bcrypt from 'bcryptjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -3071,3 +3072,877 @@ apiRouter.post(
     }
   },
 );
+
+// -----------------------------------------------------------------------------
+// Cronologs
+// -----------------------------------------------------------------------------
+
+apiRouter.get('/cronologs/statistics', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to view cronologs' });
+  }
+
+  try {
+    const { getCronologStatistics } = await import('./cronologs.js');
+    const stats = await getCronologStatistics();
+    return res.json(stats);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load cronolog statistics' });
+  }
+});
+
+apiRouter.post(
+  '/cronologs/import/preview',
+  upload.single('file'),
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    if (!auth.perms.canImport) {
+      return res.status(403).json({ error: 'Insufficient permissions to import cronologs' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    try {
+      const safePath = assertUploadPathSafe(req.file.path);
+      const { previewCronologFile } = await import('./cronologs.js');
+      const preview = await previewCronologFile({
+        filePath: safePath,
+        filename: req.file.originalname,
+        size: req.file.size,
+      });
+
+      try {
+        await writeAuditLog({
+          userId: auth.user.id,
+          username: auth.user.username,
+          action: 'CRONOLOGS_IMPORT_PREVIEW',
+          module: 'Cronologs',
+          recordId: req.file.originalname,
+          ipAddress: req.ip || '127.0.0.1',
+          details: `Previewed cronolog file: ${preview.totalRecords} records (${preview.validRecords} valid, ${preview.invalidRecords} invalid)`,
+        });
+      } catch {
+        // ignore
+      }
+
+      return res.json({
+        ...preview,
+        filePath: safePath,
+        originalName: req.file.originalname,
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message || 'Failed to preview cronolog file' });
+    }
+  },
+);
+
+apiRouter.post('/cronologs/import/confirm', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canImport) {
+    return res.status(403).json({ error: 'Insufficient permissions to import cronologs' });
+  }
+
+  const { filePath, originalName, forceDuplicate } = req.body || {};
+  if (!filePath || typeof filePath !== 'string') {
+    return res.status(400).json({ error: 'filePath is required' });
+  }
+
+  let safePath: string;
+  try {
+    safePath = assertUploadPathSafe(filePath);
+  } catch (err: any) {
+    return res.status(403).json({ error: err.message });
+  }
+
+  if (!fs.existsSync(safePath)) {
+    return res.status(400).json({ error: 'Uploaded file not found. Please preview/upload again.' });
+  }
+
+  try {
+    const { startCronologImport } = await import('./cronologs.js');
+    const result = await startCronologImport({
+      filePath: safePath,
+      filename: typeof originalName === 'string' && originalName.trim() ? originalName.trim() : path.basename(safePath),
+      userId: auth.user.id,
+      username: auth.user.username,
+      forceDuplicate: Boolean(forceDuplicate),
+    });
+
+    try {
+      await writeAuditLog({
+        userId: auth.user.id,
+        username: auth.user.username,
+        action: 'CRONOLOGS_IMPORT_START',
+        module: 'Cronologs',
+        recordId: String(result.batchId),
+        ipAddress: req.ip || '127.0.0.1',
+        details: `Started cronolog import batch #${result.batchId}`,
+      });
+    } catch {
+      // ignore
+    }
+
+    return res.status(202).json({
+      success: true,
+      jobId: result.jobId,
+      batchId: result.batchId,
+      status: 'PROCESSING',
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Failed to start cronolog import' });
+  }
+});
+
+apiRouter.get('/cronologs/imports', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables && !auth.perms.canImport) {
+    return res.status(403).json({ error: 'Insufficient permissions to view cronolog import history' });
+  }
+
+  try {
+    const { listCronologImportBatches } = await import('./cronologs.js');
+    const batches = await listCronologImportBatches();
+    return res.json(batches);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load cronolog import history' });
+  }
+});
+
+apiRouter.get('/cronologs/imports/:batchId', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables && !auth.perms.canImport) {
+    return res.status(403).json({ error: 'Insufficient permissions to view cronolog import batch' });
+  }
+
+  const batchId = Number(req.params.batchId);
+  if (!Number.isInteger(batchId) || batchId <= 0) {
+    return res.status(400).json({ error: 'Invalid batch id' });
+  }
+
+  try {
+    const { getCronologImportBatch } = await import('./cronologs.js');
+    const batch = await getCronologImportBatch(batchId);
+    if (!batch) return res.status(404).json({ error: 'Cronolog import batch not found' });
+    return res.json(batch);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load cronolog import batch' });
+  }
+});
+
+apiRouter.delete('/cronologs/imports/:batchId', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canImport) {
+    return res.status(403).json({ error: 'Insufficient permissions to undo cronolog imports' });
+  }
+
+  const batchId = Number(req.params.batchId);
+  if (!Number.isInteger(batchId) || batchId <= 0) {
+    return res.status(400).json({ error: 'Invalid batch id' });
+  }
+
+  try {
+    const { undoCronologImportBatch } = await import('./cronologs.js');
+    const result = await undoCronologImportBatch(batchId, auth.user.username);
+    return res.json({ success: true, ...result });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Failed to undo cronolog import batch' });
+  }
+});
+
+apiRouter.get('/cronologs/export', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canExport) {
+    return res.status(403).json({ error: 'Insufficient permissions to export cronologs' });
+  }
+
+  try {
+    const formatRaw = String(req.query.format || 'csv').toLowerCase();
+    if (!['csv', 'xlsx', 'pdf', 'docx'].includes(formatRaw)) {
+      return res.status(400).json({ error: 'Unsupported export format. Use csv, xlsx, pdf, or docx.' });
+    }
+    const format = formatRaw as 'csv' | 'xlsx' | 'pdf' | 'docx';
+    const language = req.query.lang === 'ar' ? 'ar' : 'en';
+
+    let selectedColumns: string[] | undefined;
+    if (typeof req.query.columns === 'string' && req.query.columns.trim()) {
+      selectedColumns = req.query.columns.split(',').map((s) => s.trim()).filter(Boolean);
+    }
+
+    const { parseCronologListQuery, exportCronologs } = await import('./cronologs.js');
+    const params = parseCronologListQuery(req.query);
+    const exported = await exportCronologs({ format, params, selectedColumns, language });
+
+    try {
+      await writeAuditLog({
+        userId: auth.user.id,
+        username: auth.user.username,
+        action: 'CRONOLOGS_EXPORT',
+        module: 'Cronologs',
+        recordId: format.toUpperCase(),
+        ipAddress: req.ip || '127.0.0.1',
+        details: `Exported cronologs as ${format.toUpperCase()} (${selectedColumns?.length ? selectedColumns.length + ' selected columns' : 'all columns'})`,
+      });
+    } catch {
+      // ignore
+    }
+
+    res.setHeader('Content-Type', exported.contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${exported.filename}"`);
+    res.setHeader('X-Export-Filename', exported.filename);
+    return res.send(exported.content);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to export cronologs' });
+  }
+});
+
+apiRouter.get('/cronologs', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to view cronologs' });
+  }
+
+  try {
+    const { parseCronologListQuery, listCronologs } = await import('./cronologs.js');
+    const params = parseCronologListQuery(req.query);
+    const result = await listCronologs(params);
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load cronologs' });
+  }
+});
+
+apiRouter.get('/cronologs/:id', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to view cronologs' });
+  }
+
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'Invalid cronolog id' });
+  }
+
+  try {
+    const { getCronologById } = await import('./cronologs.js');
+    const row = await getCronologById(id);
+    if (!row) return res.status(404).json({ error: 'Cronolog record not found' });
+    return res.json(row);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load cronolog record' });
+  }
+});
+
+apiRouter.get('/activity-logs/statistics', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to view activity logs' });
+  }
+
+  try {
+    const { parseActivityLogListQuery, getActivityLogsStatistics } = await import('./activityLogs.js');
+    const params = parseActivityLogListQuery(req.query);
+    const stats = await getActivityLogsStatistics({
+      search: params.search,
+      recordType: params.recordType,
+      sourceFile: params.sourceFile,
+      lineNumber: params.lineNumber,
+      importBatchId: params.importBatchId,
+    });
+    return res.json(stats);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load activity logs statistics' });
+  }
+});
+
+apiRouter.post(
+  '/activity-logs/import/preview',
+  upload.single('file'),
+  async (req: Request, res: Response) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    if (!auth.perms.canImport) {
+      return res.status(403).json({ error: 'Insufficient permissions to import activity logs' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    try {
+      const safePath = assertUploadPathSafe(req.file.path);
+      const ext = path.extname(req.file.originalname || '').toLowerCase();
+      if (!['.log', '.txt'].includes(ext)) {
+        return res.status(400).json({ error: 'Only .log and .txt files are supported' });
+      }
+      const { previewActivityLogsFile } = await import('./activityLogs.js');
+      const preview = await previewActivityLogsFile({
+        filePath: safePath,
+        filename: req.file.originalname,
+        size: req.file.size,
+      });
+
+      try {
+        await writeAuditLog({
+          userId: auth.user.id,
+          username: auth.user.username,
+          action: 'ACTIVITY_LOGS_IMPORT_PREVIEW',
+          module: 'Activity Logs',
+          recordId: req.file.originalname,
+          ipAddress: req.ip || '127.0.0.1',
+          details: `Previewed activity logs file: ${preview.totalRecords} records (${preview.validRecords} valid, ${preview.invalidRecords} invalid)`,
+        });
+      } catch {
+        // ignore
+      }
+
+      return res.json({
+        ...preview,
+        filePath: safePath,
+        originalName: req.file.originalname,
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err.message || 'Failed to preview activity logs file' });
+    }
+  },
+);
+
+apiRouter.post('/activity-logs/import/confirm', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canImport) {
+    return res.status(403).json({ error: 'Insufficient permissions to import activity logs' });
+  }
+
+  const { filePath, originalName, forceDuplicate } = req.body || {};
+  if (!filePath || typeof filePath !== 'string') {
+    return res.status(400).json({ error: 'filePath is required' });
+  }
+
+  let safePath: string;
+  try {
+    safePath = assertUploadPathSafe(filePath);
+  } catch (err: any) {
+    return res.status(403).json({ error: err.message });
+  }
+
+  if (!fs.existsSync(safePath)) {
+    return res.status(400).json({ error: 'Uploaded file not found. Please preview/upload again.' });
+  }
+
+  const ext = path.extname(String(originalName || safePath)).toLowerCase();
+  if (ext && !['.log', '.txt'].includes(ext)) {
+    return res.status(400).json({ error: 'Only .log and .txt files are supported' });
+  }
+
+  try {
+    const { startActivityLogsImport } = await import('./activityLogs.js');
+    const result = await startActivityLogsImport({
+      filePath: safePath,
+      filename: typeof originalName === 'string' && originalName.trim() ? originalName.trim() : path.basename(safePath),
+      userId: auth.user.id,
+      forceDuplicate: Boolean(forceDuplicate),
+    });
+
+    try {
+      await writeAuditLog({
+        userId: auth.user.id,
+        username: auth.user.username,
+        action: 'ACTIVITY_LOGS_IMPORT_START',
+        module: 'Activity Logs',
+        recordId: String(result.batchId),
+        ipAddress: req.ip || '127.0.0.1',
+        details: `Started activity logs import batch #${result.batchId}`,
+      });
+    } catch {
+      // ignore
+    }
+
+    return res.status(202).json({
+      success: true,
+      jobId: result.jobId,
+      batchId: result.batchId,
+      status: 'PROCESSING',
+    });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Failed to start activity logs import' });
+  }
+});
+
+apiRouter.get('/activity-logs/imports', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables && !auth.perms.canImport) {
+    return res.status(403).json({ error: 'Insufficient permissions to view activity logs import history' });
+  }
+
+  try {
+    const { listActivityLogsImportBatches } = await import('./activityLogs.js');
+    const batches = await listActivityLogsImportBatches();
+    return res.json(batches);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load activity logs import history' });
+  }
+});
+
+apiRouter.get('/activity-logs/imports/:batchId', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables && !auth.perms.canImport) {
+    return res.status(403).json({ error: 'Insufficient permissions to view activity logs import batch' });
+  }
+
+  let batchId: bigint;
+  try {
+    batchId = BigInt(String(req.params.batchId));
+  } catch {
+    return res.status(400).json({ error: 'Invalid batch id' });
+  }
+
+  try {
+    const { getActivityLogsImportBatch } = await import('./activityLogs.js');
+    const batch = await getActivityLogsImportBatch(batchId);
+    if (!batch) return res.status(404).json({ error: 'Activity logs import batch not found' });
+    return res.json(batch);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load activity logs import batch' });
+  }
+});
+
+apiRouter.get('/activity-logs/imports/:batchId/errors', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables && !auth.perms.canImport) {
+    return res.status(403).json({ error: 'Insufficient permissions to view activity logs import errors' });
+  }
+
+  let batchId: bigint;
+  try {
+    batchId = BigInt(String(req.params.batchId));
+  } catch {
+    return res.status(400).json({ error: 'Invalid batch id' });
+  }
+
+  try {
+    const { buildImportErrorReport } = await import('./activityLogs.js');
+    const report = await buildImportErrorReport(batchId);
+    if (!report) return res.status(404).json({ error: 'Activity logs import batch not found' });
+    res.setHeader('Content-Type', report.contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${report.filename}"`);
+    res.setHeader('X-Export-Filename', report.filename);
+    return res.send(report.content);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to generate import error report' });
+  }
+});
+
+apiRouter.delete('/activity-logs/imports/:batchId', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canImport) {
+    return res.status(403).json({ error: 'Insufficient permissions to undo activity logs imports' });
+  }
+
+  let batchId: bigint;
+  try {
+    batchId = BigInt(String(req.params.batchId));
+  } catch {
+    return res.status(400).json({ error: 'Invalid batch id' });
+  }
+
+  try {
+    const { undoActivityLogsImportBatch } = await import('./activityLogs.js');
+    const result = await undoActivityLogsImportBatch({
+      batchId,
+      userId: auth.user.id,
+      username: auth.user.username,
+      ipAddress: req.ip || '127.0.0.1',
+    });
+    return res.json({ success: true, ...result });
+  } catch (err: any) {
+    return res.status(400).json({ error: err.message || 'Failed to undo activity logs import batch' });
+  }
+});
+
+apiRouter.get('/activity-logs/export', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canExport) {
+    return res.status(403).json({ error: 'Insufficient permissions to export activity logs' });
+  }
+
+  try {
+    const formatRaw = String(req.query.format || 'csv').toLowerCase();
+    if (!['csv', 'xlsx', 'pdf'].includes(formatRaw)) {
+      return res.status(400).json({ error: 'Unsupported export format. Use csv, xlsx, or pdf.' });
+    }
+    const format = formatRaw as 'csv' | 'xlsx' | 'pdf';
+    const language = req.query.lang === 'ar' ? 'ar' : 'en';
+
+    let selectedColumns: string[] | undefined;
+    if (typeof req.query.columns === 'string' && req.query.columns.trim()) {
+      selectedColumns = req.query.columns.split(',').map((s) => s.trim()).filter(Boolean);
+    }
+
+    const { parseActivityLogListQuery, exportActivityLogs } = await import('./activityLogs.js');
+    const params = parseActivityLogListQuery(req.query);
+    const exported = await exportActivityLogs({ format, params, selectedColumns, language });
+
+    try {
+      await writeAuditLog({
+        userId: auth.user.id,
+        username: auth.user.username,
+        action: 'ACTIVITY_LOGS_EXPORT',
+        module: 'Activity Logs',
+        recordId: format.toUpperCase(),
+        ipAddress: req.ip || '127.0.0.1',
+        details: `Exported activity logs as ${format.toUpperCase()} (${selectedColumns?.length ? selectedColumns.length + ' selected columns' : 'all columns'})`,
+      });
+    } catch {
+      // ignore
+    }
+
+    res.setHeader('Content-Type', exported.contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${exported.filename}"`);
+    res.setHeader('X-Export-Filename', exported.filename);
+    return res.send(exported.content);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to export activity logs' });
+  }
+});
+
+apiRouter.get('/activity-logs', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to view activity logs' });
+  }
+
+  try {
+    const { parseActivityLogListQuery, listActivityLogs } = await import('./activityLogs.js');
+    const params = parseActivityLogListQuery(req.query);
+    const result = await listActivityLogs(params);
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load activity logs' });
+  }
+});
+
+apiRouter.get('/activity-logs/:id', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to view activity logs' });
+  }
+
+  let id: bigint;
+  try {
+    id = BigInt(String(req.params.id));
+  } catch {
+    return res.status(400).json({ error: 'Invalid activity log id' });
+  }
+
+  try {
+    const { getActivityLogById } = await import('./activityLogs.js');
+    const row = await getActivityLogById(id);
+    if (!row) return res.status(404).json({ error: 'Activity log record not found' });
+    return res.json(row);
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load activity log record' });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Global Search
+// -----------------------------------------------------------------------------
+
+const GlobalSearchTypeSchema = z.enum([
+  'IMSI',
+  'IMEI',
+  'TMSI',
+  'PSTN',
+  'UNIQUE_CALL_ID',
+  'SYSTEM_ID',
+  'MAC_ADDRESS',
+  'BSSID',
+  'GENERAL_TEXT',
+  'MISSION',
+  'MCC',
+  'MNC',
+  'LAC',
+  'CELL_ID',
+]);
+
+const GlobalSearchRequestSchema = z.object({
+  searchType: GlobalSearchTypeSchema,
+  searchValue: z.string().min(1, 'Search value is required'),
+  matchMode: z.enum(['exact', 'partial']).optional().default('exact'),
+  missionSearchField: z.enum(['id', 'label', 'name', 'location', 'mission', 'missionId', 'missionName']).optional(),
+  page: z.coerce.number().int().min(1).optional().default(1),
+  pageSize: z.coerce.number().int().min(1).max(200).optional().default(25),
+  sortBy: z.string().trim().optional(),
+  sortOrder: z.enum(['asc', 'desc']).optional().default('asc'),
+  filters: z.record(z.string(), z.any()).optional().default({}),
+  selectedMissionIds: z.array(z.union([z.string(), z.number()])).optional().default([]),
+  requestedTables: z.array(z.string()).optional().default([]),
+});
+
+const GlobalMissionSearchSchema = z.object({
+  searchValue: z.string().min(1, 'Search value is required'),
+  matchMode: z.enum(['exact', 'partial']).optional().default('exact'),
+  missionSearchField: z.enum(['id', 'label', 'name', 'location', 'mission', 'missionId', 'missionName']).optional(),
+});
+
+function normalizeGlobalSearchInput(body: any) {
+  const parsed = GlobalSearchRequestSchema.parse(body || {});
+  const missionSearchField = parsed.missionSearchField === 'mission' ? 'label'
+    : parsed.missionSearchField === 'missionId' ? 'id'
+    : parsed.missionSearchField === 'missionName' ? 'name'
+    : parsed.missionSearchField;
+  return { ...parsed, missionSearchField } as any;
+}
+
+apiRouter.get('/global-search/sources', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to access global search sources' });
+  }
+  try {
+    const { getRegistry, GLOBAL_SEARCH_TYPES } = await import('./globalSearch.js');
+    const registry = getRegistry();
+    return res.json({ searchTypes: GLOBAL_SEARCH_TYPES, sources: registry });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Failed to load global search sources' });
+  }
+});
+
+apiRouter.post('/global-search', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to use global search' });
+  }
+  try {
+    const payload = normalizeGlobalSearchInput(req.body);
+    const { executeGlobalSearch } = await import('./globalSearch.js');
+    const result = await executeGlobalSearch(payload, auth.perms);
+    try {
+      await writeAuditLog({
+        userId: auth.user.id,
+        username: auth.user.username,
+        action: 'GLOBAL_SEARCH',
+        module: 'GlobalSearch',
+        recordId: payload.searchType,
+        ipAddress: req.ip || '127.0.0.1',
+        result: 'SUCCESS',
+        details: `Global search (${payload.searchType}, ${payload.matchMode}) executed`,
+      });
+    } catch {}
+    return res.json(result);
+  } catch (err: any) {
+    if (err instanceof z.ZodError) {
+      const zerr = err as any;
+      return res.status(400).json({ error: zerr.issues?.[0]?.message || zerr.errors?.[0]?.message || 'Invalid global search request', issues: zerr.issues || zerr.errors });
+    }
+    return res.status(400).json({ error: err.message || 'Failed to execute global search' });
+  }
+});
+
+apiRouter.get('/global-search/statistics', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to view global search statistics' });
+  }
+  try {
+    let filters: any = {};
+    if (typeof req.query.filters === 'string' && req.query.filters.trim()) {
+      try { filters = JSON.parse(req.query.filters); } catch { filters = {}; }
+    }
+    const selectedMissionIds = typeof req.query.selectedMissionIds === 'string' && req.query.selectedMissionIds
+      ? req.query.selectedMissionIds.split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
+    const requestedTables = typeof req.query.requestedTables === 'string' && req.query.requestedTables
+      ? req.query.requestedTables.split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
+    const payload = normalizeGlobalSearchInput({
+      searchType: req.query.searchType,
+      searchValue: req.query.searchValue,
+      matchMode: req.query.matchMode,
+      missionSearchField: req.query.missionSearchField,
+      filters,
+      selectedMissionIds,
+      requestedTables,
+      page: 1,
+      pageSize: 1,
+    });
+    const { getGlobalSearchStatistics } = await import('./globalSearch.js');
+    const result = await getGlobalSearchStatistics(payload, auth.perms);
+    return res.json(result);
+  } catch (err: any) {
+    if (err instanceof z.ZodError) { const zerr = err as any; return res.status(400).json({ error: (zerr.issues?.[0]?.message || zerr.errors?.[0]?.message || 'Invalid request'), issues: zerr.issues || zerr.errors }); }
+    return res.status(400).json({ error: err.message || 'Failed to load global search statistics' });
+  }
+});
+
+apiRouter.post('/global-search/missions', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to search missions' });
+  }
+  try {
+    const parsed = GlobalMissionSearchSchema.parse(req.body || {});
+    const missionSearchField = parsed.missionSearchField === 'mission' ? 'label'
+      : parsed.missionSearchField === 'missionId' ? 'id'
+      : parsed.missionSearchField === 'missionName' ? 'name'
+      : parsed.missionSearchField;
+    const { searchMissions } = await import('./globalSearch.js');
+    const result = await searchMissions({ ...parsed, missionSearchField } as any);
+    return res.json(result);
+  } catch (err: any) {
+    if (err instanceof z.ZodError) { const zerr = err as any; return res.status(400).json({ error: (zerr.issues?.[0]?.message || zerr.errors?.[0]?.message || 'Invalid mission search request'), issues: zerr.issues || zerr.errors }); }
+    return res.status(400).json({ error: err.message || 'Failed to search missions' });
+  }
+});
+
+apiRouter.get('/global-search/missions/:missionId/records', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to view mission records' });
+  }
+  const missionId = Number(req.params.missionId);
+  if (!Number.isInteger(missionId) || missionId <= 0) {
+    return res.status(400).json({ error: 'Invalid mission id' });
+  }
+  try {
+    const { getMissionAssociatedRecords } = await import('./globalSearch.js');
+    const result = await getMissionAssociatedRecords(missionId, {
+      page: req.query.page ? Number(req.query.page) : undefined,
+      pageSize: req.query.pageSize ? Number(req.query.pageSize) : undefined,
+      sortBy: typeof req.query.sortBy === 'string' ? req.query.sortBy : undefined,
+      sortOrder: req.query.sortOrder === 'desc' ? 'desc' : 'asc',
+      sourceTable: typeof req.query.sourceTable === 'string' ? req.query.sourceTable : undefined,
+      dateFrom: typeof req.query.dateFrom === 'string' ? req.query.dateFrom : undefined,
+      dateTo: typeof req.query.dateTo === 'string' ? req.query.dateTo : undefined,
+    }, auth.perms);
+    return res.json(result);
+  } catch (err: any) {
+    if (String(err?.message || '').includes('Mission not found')) {
+      return res.status(404).json({ error: 'Mission not found' });
+    }
+    return res.status(400).json({ error: err.message || 'Failed to load mission records' });
+  }
+});
+
+apiRouter.get('/global-search/record/:tableName/:recordId', async (req: Request, res: Response) => {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canViewTables) {
+    return res.status(403).json({ error: 'Insufficient permissions to view records' });
+  }
+  const { tableName, recordId } = req.params;
+  if (!tableName || !recordId) return res.status(400).json({ error: 'tableName and recordId are required' });
+  try {
+    const { getGlobalSearchRecord } = await import('./globalSearch.js');
+    const record = await getGlobalSearchRecord(tableName, recordId, auth.perms);
+    if (!record) return res.status(404).json({ error: 'Record not found' });
+    try {
+      await writeAuditLog({
+        userId: auth.user.id,
+        username: auth.user.username,
+        action: 'GLOBAL_SEARCH_RECORD_VIEW',
+        module: 'GlobalSearch',
+        recordId: `${tableName}:${recordId}`,
+        ipAddress: req.ip || '127.0.0.1',
+        result: 'SUCCESS',
+      });
+    } catch {}
+    return res.json(record);
+  } catch (err: any) {
+    if (String(err?.message || '').includes('Access denied') || String(err?.message || '').includes('not allowed')) {
+      return res.status(403).json({ error: err.message });
+    }
+    return res.status(400).json({ error: err.message || 'Failed to load record' });
+  }
+});
+
+async function handleGlobalSearchExport(req: Request, res: Response) {
+  const auth = requireAuth(req, res);
+  if (!auth) return;
+  if (!auth.perms.canExport) {
+    return res.status(403).json({ error: 'Insufficient permissions to export global search results' });
+  }
+  try {
+    const source = req.method === 'GET' ? req.query : req.body;
+    let filters: any = {};
+    if (typeof source.filters === 'string' && source.filters.trim()) {
+      try { filters = JSON.parse(source.filters); } catch { filters = {}; }
+    } else if (source.filters && typeof source.filters === 'object') {
+      filters = source.filters;
+    }
+    const payload = normalizeGlobalSearchInput({
+      searchType: source.searchType,
+      searchValue: source.searchValue,
+      matchMode: source.matchMode,
+      missionSearchField: source.missionSearchField,
+      filters,
+      selectedMissionIds: typeof source.selectedMissionIds === 'string' ? source.selectedMissionIds.split(',').filter(Boolean) : (source.selectedMissionIds || []),
+      requestedTables: typeof source.requestedTables === 'string' ? source.requestedTables.split(',').filter(Boolean) : (source.requestedTables || []),
+      page: 1,
+      pageSize: 1000000,
+      sortBy: source.sortBy,
+      sortOrder: source.sortOrder,
+    });
+    const format = String(source.format || 'csv').toLowerCase();
+    if (!['csv', 'xlsx', 'pdf'].includes(format)) {
+      return res.status(400).json({ error: 'Unsupported export format. Use csv, xlsx, or pdf.' });
+    }
+    const { exportGlobalSearch } = await import('./globalSearch.js');
+    const exported = await exportGlobalSearch({
+      ...payload,
+      format: format as 'csv' | 'xlsx' | 'pdf',
+      scope: (source.scope as any) || 'all',
+      selectedTable: typeof source.selectedTable === 'string' ? source.selectedTable : undefined,
+      selectedRecordKeys: Array.isArray(source.selectedRecordKeys) ? source.selectedRecordKeys : (typeof source.selectedRecordKeys === 'string' ? source.selectedRecordKeys.split(',').filter(Boolean) : undefined),
+      selectedMissionIds: typeof source.selectedMissionIds === 'string' ? source.selectedMissionIds.split(',').filter(Boolean) : (source.selectedMissionIds || []),
+      includeMissionSummary: String(source.includeMissionSummary || '').toLowerCase() === 'true' || source.includeMissionSummary === true,
+    }, auth.perms);
+    try {
+      await writeAuditLog({
+        userId: auth.user.id,
+        username: auth.user.username,
+        action: 'GLOBAL_SEARCH_EXPORT',
+        module: 'GlobalSearch',
+        recordId: String(format).toUpperCase(),
+        ipAddress: req.ip || '127.0.0.1',
+        result: 'SUCCESS',
+        details: `Exported global search results as ${String(format).toUpperCase()}`,
+      });
+    } catch {}
+    res.setHeader('Content-Type', exported.contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${exported.filename}"`);
+    res.setHeader('X-Export-Filename', exported.filename);
+    return res.send(exported.content);
+  } catch (err: any) {
+    if (err instanceof z.ZodError) { const zerr = err as any; return res.status(400).json({ error: (zerr.issues?.[0]?.message || zerr.errors?.[0]?.message || 'Invalid export request'), issues: zerr.issues || zerr.errors }); }
+    return res.status(400).json({ error: err.message || 'Failed to export global search results' });
+  }
+}
+
+apiRouter.post('/global-search/export', handleGlobalSearchExport);
+apiRouter.get('/global-search/export', handleGlobalSearchExport);
+
+

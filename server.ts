@@ -17,10 +17,10 @@ function resolvePort(): number {
   const envPort = Number(process.env.PORT);
   // In development, avoid colliding with NGINX_PORT (e.g. 8080) inherited from container env
   if (!isProduction && envPort && process.env.NGINX_PORT && envPort === Number(process.env.NGINX_PORT)) {
-    return Number(process.env.DEFAULT_APP_PORT) || 3000;
+    return Number(process.env.DEFAULT_APP_PORT) || 4001;
   }
 
-  return envPort || Number(process.env.DEFAULT_APP_PORT) || 3000;
+  return envPort || Number(process.env.DEFAULT_APP_PORT) || 4001;
 }
 
 const app = express();

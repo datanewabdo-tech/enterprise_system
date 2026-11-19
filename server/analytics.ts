@@ -2378,13 +2378,38 @@ export async function executeDynamicAnalytics(
     OFFSET $${params.length}
   `;
 
-  try {
-    return {
-      rows: await rows<any>(targetDb, sql, params),
-      dimensions,
-      metrics,
-    };
-  } catch (error: any) {
-    throw new Error(`Analytics Query Error: ${error.message}`);
-  }
+
+try {
+  const resultRows = await rows<any>(targetDb, sql, params);
+
+  // Convert BigInt values into JSON-safe values without losing precision.
+  const normalizedRows = resultRows.map((row) =>
+    Object.fromEntries(
+      Object.entries(row).map(([key, value]) => {
+        if (typeof value !== 'bigint') {
+          return [key, value];
+        }
+
+        const max = BigInt(Number.MAX_SAFE_INTEGER);
+        const min = BigInt(Number.MIN_SAFE_INTEGER);
+
+        return [
+          key,
+          value >= min && value <= max
+            ? Number(value)
+            : value.toString(),
+        ];
+      }),
+    ),
+  );
+
+  return {
+    rows: normalizedRows,
+    dimensions,
+    metrics,
+  };
+} catch (error: any) {
+  throw new Error(`Analytics Query Error: ${error.message}`);
+}
+
 }

@@ -191,4 +191,5 @@ export const MCC_COUNTRIES: Record<string, string> = {
   "548": "Cook Islands",
   "549": "Samoa",
   "550": "Micronesia",
+  "659":"South Sudan"
 };
